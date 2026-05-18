@@ -766,7 +766,6 @@ async fn run_send_keys(
         .context("rpc transport")?
         .map_err(|e| anyhow!("daemon list_sessions: {e}"))?;
 
-    let mut found_session: Option<SessionId> = None;
     let mut found_pane: Option<PaneId> = None;
     'outer: for s in sessions {
         let panes = client
@@ -776,57 +775,23 @@ async fn run_send_keys(
             .map_err(|e| anyhow!("daemon list_panes: {e}"))?;
         for p in panes {
             if p.id.0.to_string().starts_with(&pane_prefix) {
-                found_session = Some(s.id);
                 found_pane = Some(p.id);
                 break 'outer;
             }
         }
     }
-    let session = found_session.ok_or_else(|| anyhow!("no pane matches prefix '{pane_prefix}'"))?;
-    let pane_id = found_pane.expect("set together with session");
-
-    // Open a stream connection and write the keys then close.
-    let mut stream_sock = tokio::net::UnixStream::connect(&socket)
-        .await
-        .with_context(|| format!("connect stream {}", socket.display()))?;
-    stream_sock.write_all(&[MODE_STREAM]).await?;
-    stream_sock.write_all(session.0.as_bytes()).await?;
-    stream_sock.write_all(pane_id.0.as_bytes()).await?;
-
-    use futures::SinkExt;
-    let (rd, wr) = stream_sock.into_split();
-    let frame_read =
-        tokio_util::codec::FramedRead::new(rd, tokio_util::codec::LengthDelimitedCodec::new());
-    let frame_write =
-        tokio_util::codec::FramedWrite::new(wr, tokio_util::codec::LengthDelimitedCodec::new());
-    let mut _output_frames: tokio_serde::SymmetricallyFramed<
-        _,
-        OutputFrame,
-        tokio_serde::formats::SymmetricalBincode<OutputFrame>,
-    > = tokio_serde::SymmetricallyFramed::new(
-        frame_read,
-        tokio_serde::formats::SymmetricalBincode::default(),
-    );
-    let mut input_frames: tokio_serde::SymmetricallyFramed<_, InputFrame, _> =
-        tokio_serde::SymmetricallyFramed::new(
-            frame_write,
-            tokio_serde::formats::SymmetricalBincode::default(),
-        );
+    let pane_id = found_pane.ok_or_else(|| anyhow!("no pane matches prefix '{pane_prefix}'"))?;
 
     let mut text = keys.join(" ");
     if append_enter {
-        text.push('\n');
+        text.push('\r');
     }
-    input_frames
-        .send(InputFrame {
-            session,
-            data: bytes::Bytes::from(text.into_bytes()),
-        })
-        .await
-        .map_err(|e| anyhow!("send keys: {e}"))?;
 
-    drop(input_frames);
-    Ok(())
+    client
+        .send_keys(tarpc::context::current(), pane_id, text.into_bytes())
+        .await
+        .context("rpc transport")?
+        .map_err(|e| anyhow!("daemon send_keys: {e}"))
 }
 
 async fn run_split_window(socket: PathBuf, session_prefix: String) -> Result<()> {

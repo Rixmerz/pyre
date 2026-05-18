@@ -13,11 +13,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use bytes::Bytes;
-use futures::SinkExt;
 use pyre_proto::{
-    InputFrame, ListBlocksReq, PaneStateKind, PyreDaemonClient, SearchBlocksReq, SessionId,
-    SpawnReq, MODE_CONTROL, MODE_STREAM,
+    ListBlocksReq, PaneStateKind, PyreDaemonClient, SearchBlocksReq, SessionId, SpawnReq,
+    MODE_CONTROL,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -27,7 +25,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
-use tokio_util::codec::{FramedWrite, LengthDelimitedCodec};
+use tokio_util::codec::LengthDelimitedCodec;
 use tracing::{debug, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -624,53 +622,24 @@ impl Server {
             .ok_or_else(|| anyhow!("missing text"))?;
         let append_enter = args["append_enter"].as_bool().unwrap_or(false);
 
-        let client = self.client().await?;
-
-        // Resolve pane + its session.
-        let all = client
-            .list_all_panes(tarpc::context::current())
-            .await
-            .context("rpc")?
-            .map_err(|e| anyhow!("{e}"))?;
-
-        let pane_info = all
-            .iter()
-            .find(|p| p.id.0.to_string().starts_with(pane_prefix))
-            .ok_or_else(|| anyhow!("no pane matches prefix '{pane_prefix}'"))?;
-
-        let session_id = pane_info.session;
-        let pane_id = pane_info.id;
-
-        // Open a stream connection and inject the keys.
-        let mut stream_sock = UnixStream::connect(&self.socket)
-            .await
-            .with_context(|| format!("connect stream {}", self.socket.display()))?;
-        tokio::io::AsyncWriteExt::write_all(&mut stream_sock, &[MODE_STREAM]).await?;
-        tokio::io::AsyncWriteExt::write_all(&mut stream_sock, session_id.0.as_bytes()).await?;
-        tokio::io::AsyncWriteExt::write_all(&mut stream_sock, pane_id.0.as_bytes()).await?;
-
-        let (_rd, wr) = stream_sock.into_split();
-        let frame_write = FramedWrite::new(wr, LengthDelimitedCodec::new());
-        let mut input_frames: tokio_serde::SymmetricallyFramed<_, InputFrame, _> =
-            tokio_serde::SymmetricallyFramed::new(
-                frame_write,
-                tokio_serde::formats::SymmetricalBincode::default(),
-            );
-
         let mut payload = text.to_owned();
         if append_enter {
             payload.push('\r');
         }
 
-        input_frames
-            .send(InputFrame {
-                session: session_id,
-                data: Bytes::from(payload.into_bytes()),
-            })
-            .await
-            .map_err(|e| anyhow!("send keys: {e}"))?;
+        let client = self.client().await?;
+        let pane_id = self.resolve_pane_id(&client, pane_prefix).await?;
 
-        drop(input_frames);
+        client
+            .send_keys(
+                tarpc::context::current(),
+                pane_id,
+                payload.into_bytes(),
+            )
+            .await
+            .context("rpc")?
+            .map_err(|e| anyhow!("{e}"))?;
+
         Ok(format!("keys sent to pane {}", &pane_id.0.to_string()[..8]))
     }
 
