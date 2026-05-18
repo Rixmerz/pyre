@@ -77,7 +77,7 @@ pub async fn handle_stream(mut sock: UnixStream, registry: Arc<SessionRegistry>)
     // Subscribe *after* the snapshot write.  Any live bytes that arrive after
     // the snapshot was taken will be delivered by the broadcast receiver below.
     let mut sub = pty.subscribe();
-    let close_notify = pty.close_notify.clone();
+    let close_token = pty.close_token.clone();
 
     let input_tx = pty.input_tx.clone();
     let recv_task = tokio::spawn(async move {
@@ -113,8 +113,8 @@ pub async fn handle_stream(mut sock: UnixStream, registry: Arc<SessionRegistry>)
                     }
                     Err(_) => break,
                 },
-                _ = close_notify.notified() => {
-                    tracing::info!("pane close_notify fired; dropping stream socket");
+                _ = close_token.cancelled() => {
+                    tracing::info!("pane close_token cancelled; dropping stream socket");
                     break;
                 }
             }

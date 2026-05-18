@@ -9,7 +9,8 @@ use chrono::{DateTime, Utc};
 use pyre_proto::{BlockEvent, OpenPaneReq, PaneId, PaneInfo, SessionId, SessionInfo, SpawnReq};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
-use tokio::sync::{broadcast, mpsc, Mutex, Notify, RwLock};
+use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
+use tokio_util::sync::CancellationToken;
 
 use crate::pty::spawn_pty;
 use crate::state::PaneStateTracker;
@@ -34,9 +35,10 @@ pub struct PaneState {
     pub ringbuf: Arc<StdMutex<crate::ringbuf::RingBuf>>,
     /// State tracker — updated by output path and parser; polled by state engine.
     pub state_tracker: Arc<StdMutex<PaneStateTracker>>,
-    /// Fired when the child process exits; unblocks stream handlers so they
-    /// drop their sockets and clients receive EOF.
-    pub close_notify: Arc<Notify>,
+    /// Cancelled when the child process exits; unblocks stream handlers so they
+    /// drop their sockets and clients receive EOF.  Sticky: cancelled() resolves
+    /// immediately if already cancelled, eliminating the Notify edge-trigger race.
+    pub close_token: CancellationToken,
 }
 
 impl PaneState {
@@ -55,7 +57,7 @@ impl PaneState {
         child: Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
         ringbuf: Arc<StdMutex<crate::ringbuf::RingBuf>>,
         state_tracker: Arc<StdMutex<PaneStateTracker>>,
-        close_notify: Arc<Notify>,
+        close_token: CancellationToken,
     ) -> Self {
         Self {
             id,
@@ -72,7 +74,7 @@ impl PaneState {
             child,
             ringbuf,
             state_tracker,
-            close_notify,
+            close_token,
         }
     }
 }
