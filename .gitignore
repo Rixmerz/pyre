@@ -2,3 +2,10 @@ target/
 **/*.rs.bk
 *.swp
 .DS_Store
+
+# jig runtime noise
+.claude/hooks/.smart_context_state.json
+.claude/hooks/.dcc_batch.json
+.jig/snapshots.jsonl
+.jig/snapshots.lock
+.claude/workflow/graph.yaml

@@ -2,7 +2,9 @@
 
 use std::sync::Arc;
 
-use pyre_proto::{AttachAck, PyreError, SessionId, SpawnReq};
+use pyre_proto::{
+    AttachAck, Block, BlockHit, ListBlocksReq, PyreError, SearchBlocksReq, SessionId, SpawnReq,
+};
 use tarpc::context;
 
 use crate::pty::{spawn_pty, SessionRegistry};
@@ -10,11 +12,14 @@ use crate::pty::{spawn_pty, SessionRegistry};
 #[derive(Clone)]
 pub struct DaemonImpl {
     pub registry: Arc<SessionRegistry>,
+    pub store: Arc<crate::store::Store>,
 }
 
 impl pyre_proto::service::PyreDaemon for DaemonImpl {
     async fn spawn(self, _ctx: context::Context, req: SpawnReq) -> Result<SessionId, PyreError> {
-        let sess = spawn_pty(req).map_err(|e| PyreError::SpawnFailed(e.to_string()))?;
+        let sess = spawn_pty(req, self.store.clone())
+            .await
+            .map_err(|e| PyreError::SpawnFailed(e.to_string()))?;
         let arc = self.registry.insert(sess).await;
         Ok(arc.id)
     }
@@ -49,5 +54,27 @@ impl pyre_proto::service::PyreDaemon for DaemonImpl {
             .ok_or(PyreError::NoSuchSession(session))?;
         s.kill().await.map_err(|e| PyreError::Io(e.to_string()))?;
         Ok(())
+    }
+
+    async fn list_blocks(
+        self,
+        _ctx: context::Context,
+        req: ListBlocksReq,
+    ) -> Result<Vec<Block>, PyreError> {
+        self.store
+            .list_blocks(req.session, req.limit)
+            .await
+            .map_err(|e| PyreError::Io(e.to_string()))
+    }
+
+    async fn search_blocks(
+        self,
+        _ctx: context::Context,
+        req: SearchBlocksReq,
+    ) -> Result<Vec<BlockHit>, PyreError> {
+        self.store
+            .linear_search(&req.query, req.limit)
+            .await
+            .map_err(|e| PyreError::Io(e.to_string()))
     }
 }
