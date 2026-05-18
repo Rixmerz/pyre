@@ -1,37 +1,49 @@
 //! Stream-mode connection handler: bidirectional PTY I/O over a UDS.
 //!
-//! After the caller writes MODE_STREAM (0x02), it writes a 16-byte
-//! SessionId (Uuid as_bytes), then the connection becomes a
-//! length-delimited bincode channel:
+//! After the caller writes MODE_STREAM (0x02), it writes 16 bytes SessionId
+//! followed by 16 bytes PaneId (32 bytes total).  The connection then becomes
+//! a length-delimited bincode channel:
 //!   daemon -> client: `OutputFrame`
 //!   client -> daemon: `InputFrame`
+//!
+//! Phase 1 stub: the registry is keyed by the PtySession id which was
+//! returned as the pane id in SpawnResp.  We look up by pane id.
 
 use std::sync::Arc;
 
 use anyhow::Result;
 use futures::{SinkExt, StreamExt};
-use pyre_proto::{InputFrame, OutputFrame, SessionId};
+use pyre_proto::{InputFrame, OutputFrame, PaneId, SessionId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio_serde::formats::SymmetricalBincode;
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 use uuid::Uuid;
 
-use crate::pty::SessionRegistry;
+use crate::session::SessionRegistry;
 
 pub async fn handle_stream(mut sock: UnixStream, registry: Arc<SessionRegistry>) -> Result<()> {
-    let mut id_buf = [0u8; 16];
-    sock.read_exact(&mut id_buf).await?;
-    let session = SessionId(Uuid::from_bytes(id_buf));
+    // Read session id (16 bytes) then pane id (16 bytes).
+    let mut session_buf = [0u8; 16];
+    sock.read_exact(&mut session_buf).await?;
+    let _session = SessionId(Uuid::from_bytes(session_buf));
 
-    let pty = match registry.get(session).await {
-        Some(p) => p,
+    let mut pane_buf = [0u8; 16];
+    sock.read_exact(&mut pane_buf).await?;
+    let pane = PaneId(Uuid::from_bytes(pane_buf));
+
+    // TODO(s3-phase4-stream-target): replace with registry.get_pane(pane) once
+    // the client sends a real PaneId. For now look up by pane id directly.
+    let pty = match registry.get_pane(pane).await {
+        Some((_sess, p)) => p,
         None => {
-            tracing::warn!("stream for unknown session {session}");
+            tracing::warn!("stream for unknown pane {pane}");
             let _ = sock.shutdown().await;
             return Ok(());
         }
     };
+    // Use pane id as the session field in frames (matches what the client sent).
+    let session = SessionId(pane.0);
 
     let (rd, wr) = sock.into_split();
 
