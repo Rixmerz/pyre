@@ -1,5 +1,7 @@
 //! pyre-tui — ratatui-based terminal UI for pyre.
 //!
+//! Theme: Ember palette (see `theme.rs`).
+//!
 //! Without a subcommand: spawn a new session+pane, then attach (full-screen).
 //! `attach <session> [--pane <id>]`: attach to an existing session/pane.
 //!
@@ -16,16 +18,24 @@
 //!   Ctrl-B /  — open search overlay (Tantivy full-text search)
 //!   In scrollback mode: Left/h = prev block, Right/l = next block, Enter/Esc = exit
 //!   Search overlay: type to query, Up/Ctrl-P / Down/Ctrl-N to navigate, Enter to jump, Esc to close
+//!   Mouse scroll: ScrollUp/ScrollDown over a pane to scroll its scrollback buffer
+//!   Mouse click: left-click tab strip to switch tabs; left-click pane to focus it
+//!   PgUp/PgDn: scroll focused pane's scrollback buffer (when NOT in prefix / search)
 //!   All other keys forwarded to the focused PTY.
 
+use std::collections::VecDeque;
 use std::io::stdout;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use clap::Parser;
-use crossterm::event::{Event, KeyCode, KeyModifiers};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseButton,
+    MouseEventKind,
+};
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use futures::SinkExt;
 use futures::StreamExt;
@@ -38,15 +48,48 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block as RatatuiBlock, Borders, Clear, List, ListItem, Paragraph};
+use ratatui::widgets::{
+    Block as RatatuiBlock, BorderType, Borders, Clear, List, ListItem, Paragraph, Scrollbar,
+    ScrollbarOrientation, ScrollbarState,
+};
 use ratatui::Terminal;
+use regex::Regex;
+
+mod theme;
 use tarpc::client;
 use tarpc::tokio_serde::formats::Bincode;
+use theme::EMBER;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tokio_serde::formats::SymmetricalBincode;
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ANSI strip helper
+//
+// Conservative regex: matches ESC [ followed by optional parameter/intermediate
+// bytes (0x20–0x3F) and a final byte (0x40–0x7E). This covers SGR, cursor
+// movement, and most CSI sequences without risking eating printable text.
+// OSC and other non-CSI sequences are left in place; the line splitter will
+// simply include the raw bytes as non-printable, which is harmless for the
+// plain-text scrollback view.
+// ─────────────────────────────────────────────────────────────────────────────
+
+static ANSI_RE: OnceLock<Regex> = OnceLock::new();
+
+fn ansi_regex() -> &'static Regex {
+    ANSI_RE.get_or_init(|| {
+        Regex::new(r"\x1b\[[\x20-\x3f]*[\x40-\x7e]").expect("static regex is valid")
+    })
+}
+
+/// Strip CSI ANSI escape sequences from a byte slice and return a UTF-8 string.
+/// Non-UTF-8 bytes are lossily replaced.
+fn strip_ansi(raw: &[u8]) -> String {
+    let lossy = String::from_utf8_lossy(raw);
+    ansi_regex().replace_all(&lossy, "").into_owned()
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI
@@ -197,15 +240,15 @@ struct TermGuard;
 impl TermGuard {
     fn enter() -> Result<Self> {
         crossterm::terminal::enable_raw_mode()?;
-        crossterm::execute!(stdout(), EnterAlternateScreen)?;
+        crossterm::execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         Ok(Self)
     }
 }
 
 impl Drop for TermGuard {
     fn drop(&mut self) {
+        let _ = crossterm::execute!(stdout(), DisableMouseCapture, LeaveAlternateScreen);
         let _ = crossterm::terminal::disable_raw_mode();
-        let _ = crossterm::execute!(stdout(), LeaveAlternateScreen);
     }
 }
 
@@ -270,6 +313,58 @@ struct PaneSlot {
     ribbon_cursor: Option<usize>,
     /// Wall-clock instant of the last block-poll so we throttle to ~500 ms.
     last_block_poll: std::time::Instant,
+
+    // ── Scrollback line buffer ──
+    /// Accumulated output lines, oldest at front. Capacity: scrollback_cap.
+    scrollback: VecDeque<String>,
+    /// Maximum number of lines retained in the scrollback buffer.
+    scrollback_cap: usize,
+    /// 0 = live view; N = N lines back from the bottom of scrollback.
+    scroll_offset: usize,
+    /// Incomplete line accumulator for the line splitter.
+    current_line: String,
+    /// The screen rect captured during the last render, used for mouse hit-test.
+    last_screen_rect: Rect,
+}
+
+impl PaneSlot {
+    /// Feed raw bytes into both the vt100 parser and the side-channel line buffer.
+    fn process_output(&mut self, data: &[u8]) {
+        self.parser.process(data);
+        self.feed_line_buffer(data);
+    }
+
+    /// Append bytes to the plain-text line buffer, stripping ANSI sequences.
+    fn feed_line_buffer(&mut self, raw: &[u8]) {
+        let text = strip_ansi(raw);
+        for ch in text.chars() {
+            match ch {
+                '\n' => {
+                    let line = std::mem::take(&mut self.current_line);
+                    self.scrollback.push_back(line);
+                    while self.scrollback.len() > self.scrollback_cap {
+                        self.scrollback.pop_front();
+                        // If user is scrolled back, keep their view stable.
+                        if self.scroll_offset > 0 {
+                            self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                        }
+                    }
+                }
+                '\r' => {
+                    // Carriage return: terminal overwrites the line. For
+                    // line-buffer purposes we drop the current partial line so
+                    // the next content replaces it rather than appending.
+                    self.current_line.clear();
+                }
+                c if c.is_control() => {
+                    // Skip other control characters (bells, form feeds, etc.).
+                }
+                c => {
+                    self.current_line.push(c);
+                }
+            }
+        }
+    }
 }
 
 /// Recursive layout tree. Indices reference `AppState::slots`.
@@ -375,6 +470,45 @@ fn replace_at(root: &mut LayoutNode, path: &[usize], new_node: LayoutNode) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Mouse hit-test helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Walk the layout tree and collect (slot_index, screen_rect) for each leaf,
+/// computing rects the same way render_layout does (without actually rendering).
+fn collect_leaf_rects(node: &LayoutNode, area: Rect, out: &mut Vec<(usize, Rect)>) {
+    match node {
+        LayoutNode::Leaf(slot_idx) => {
+            out.push((*slot_idx, area));
+        }
+        LayoutNode::HSplit(children) => {
+            let n = children.len() as u32;
+            let rects = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints(vec![Constraint::Ratio(1, n); children.len()])
+                .split(area);
+            for (child, rect) in children.iter().zip(rects.iter()) {
+                collect_leaf_rects(child, *rect, out);
+            }
+        }
+        LayoutNode::VSplit(children) => {
+            let n = children.len() as u32;
+            let rects = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints(vec![Constraint::Ratio(1, n); children.len()])
+                .split(area);
+            for (child, rect) in children.iter().zip(rects.iter()) {
+                collect_leaf_rects(child, *rect, out);
+            }
+        }
+    }
+}
+
+/// Returns true if (col, row) is inside `rect`.
+fn rect_contains(rect: Rect, col: u16, row: u16) -> bool {
+    col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Stream connection + background tasks for one pane
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -434,6 +568,11 @@ async fn attach_pane(socket: &Path, session: SessionId, pane_id: PaneId) -> Resu
         last_block_poll: std::time::Instant::now()
             .checked_sub(std::time::Duration::from_secs(10))
             .unwrap_or_else(std::time::Instant::now),
+        scrollback: VecDeque::new(),
+        scrollback_cap: 10_000,
+        scroll_offset: 0,
+        current_line: String::new(),
+        last_screen_rect: Rect::default(),
     })
 }
 
@@ -441,80 +580,134 @@ async fn attach_pane(socket: &Path, session: SessionId, pane_id: PaneId) -> Resu
 // Rendering
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn render_pane(frame: &mut ratatui::Frame, area: Rect, slot: &PaneSlot, focused: bool) {
-    let border_style = if focused {
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
+fn render_pane(frame: &mut ratatui::Frame, area: Rect, slot: &mut PaneSlot, focused: bool) {
+    let short8: String = slot.pane_id.0.to_string().chars().take(8).collect();
+    let border_block = if focused {
+        RatatuiBlock::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Thick)
+            .border_style(EMBER.border_focus())
+            .title(Span::styled(
+                format!(" pane {short8} "),
+                EMBER.title(EMBER.primary),
+            ))
     } else {
-        Style::default().fg(Color::DarkGray)
+        RatatuiBlock::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(EMBER.border())
+            .title(Span::styled(
+                format!(" pane {short8} "),
+                EMBER.title(EMBER.text_dim),
+            ))
     };
-
-    let title = format!("{:.8}", slot.pane_id.0.to_string());
-    let border_block = RatatuiBlock::default()
-        .borders(Borders::ALL)
-        .border_style(border_style)
-        .title(title);
 
     let inner = border_block.inner(area);
     frame.render_widget(border_block, area);
 
-    // Split inner area: vt100 area (Min 1) on top, ribbon (1 line) at bottom.
+    // Split inner area: vt100/scrollback area (Min 1) on top, ribbon (1 line) at bottom.
     let split = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(inner);
 
-    let vt_area = split[0];
+    let content_area = split[0];
     let ribbon_area = split[1];
 
-    // ── vt100 render ──
-    let screen = slot.parser.screen();
-    let mut lines: Vec<Line> = Vec::with_capacity(vt_area.height as usize);
+    // Store the content rect for mouse hit-test (used by scroll wheel handler).
+    slot.last_screen_rect = content_area;
 
-    for row in 0..vt_area.height {
-        let mut spans: Vec<Span> = Vec::new();
-        let mut current_text = String::new();
-        let mut current_style = Style::default();
+    if slot.scroll_offset == 0 {
+        // ── Live vt100 render ──
+        let vt_area = content_area;
+        let screen = slot.parser.screen();
+        let mut lines: Vec<Line> = Vec::with_capacity(vt_area.height as usize);
 
-        for col in 0..vt_area.width {
-            let cell = screen.cell(row, col);
-            let (ch, fg, bg) = match cell {
-                Some(c) => {
-                    let ch = if c.contents().is_empty() {
-                        ' '
-                    } else {
-                        c.contents().chars().next().unwrap_or(' ')
-                    };
-                    let fg = vt100_color(c.fgcolor());
-                    let bg = vt100_color(c.bgcolor());
-                    (ch, fg, bg)
+        for row in 0..vt_area.height {
+            let mut spans: Vec<Span> = Vec::new();
+            let mut current_text = String::new();
+            let mut current_style = Style::default();
+
+            for col in 0..vt_area.width {
+                let cell = screen.cell(row, col);
+                let (ch, fg, bg) = match cell {
+                    Some(c) => {
+                        let ch = if c.contents().is_empty() {
+                            ' '
+                        } else {
+                            c.contents().chars().next().unwrap_or(' ')
+                        };
+                        let fg = vt100_color(c.fgcolor());
+                        let bg = vt100_color(c.bgcolor());
+                        (ch, fg, bg)
+                    }
+                    None => (' ', None, None),
+                };
+
+                let style = Style::default()
+                    .fg(fg.unwrap_or(Color::Reset))
+                    .bg(bg.unwrap_or(Color::Reset));
+
+                if style == current_style {
+                    current_text.push(ch);
+                } else {
+                    if !current_text.is_empty() {
+                        spans.push(Span::styled(current_text.clone(), current_style));
+                        current_text.clear();
+                    }
+                    current_text.push(ch);
+                    current_style = style;
                 }
-                None => (' ', None, None),
-            };
-
-            let style = Style::default()
-                .fg(fg.unwrap_or(Color::Reset))
-                .bg(bg.unwrap_or(Color::Reset));
-
-            if style == current_style {
-                current_text.push(ch);
-            } else {
-                if !current_text.is_empty() {
-                    spans.push(Span::styled(current_text.clone(), current_style));
-                    current_text.clear();
-                }
-                current_text.push(ch);
-                current_style = style;
             }
+            if !current_text.is_empty() {
+                spans.push(Span::styled(current_text, current_style));
+            }
+            lines.push(Line::from(spans));
         }
-        if !current_text.is_empty() {
-            spans.push(Span::styled(current_text, current_style));
-        }
-        lines.push(Line::from(spans));
-    }
 
-    frame.render_widget(Paragraph::new(lines), vt_area);
+        frame.render_widget(Paragraph::new(lines), vt_area);
+    } else {
+        // ── Scrollback render ──
+        // Reserve 1 column on the right for the scrollbar.
+        let (sb_area, text_area) = if content_area.width > 1 {
+            let split = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(1), Constraint::Length(1)])
+                .split(content_area);
+            (Some(split[1]), split[0])
+        } else {
+            (None, content_area)
+        };
+
+        let height = text_area.height as usize;
+        let total = slot.scrollback.len();
+        // The bottom of the visible window is `total - scroll_offset` lines from top.
+        let window_end = total.saturating_sub(slot.scroll_offset);
+        let window_start = window_end.saturating_sub(height);
+
+        let lines: Vec<Line> = slot
+            .scrollback
+            .iter()
+            .skip(window_start)
+            .take(height)
+            .map(|l| Line::from(l.as_str()))
+            .collect();
+
+        frame.render_widget(Paragraph::new(lines), text_area);
+
+        if let Some(sb_rect) = sb_area {
+            let mut sb_state = ScrollbarState::new(total).position(window_end);
+            frame.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .style(EMBER.border())
+                    .thumb_style(Style::default().fg(EMBER.primary))
+                    .track_symbol(Some("│"))
+                    .thumb_symbol("█"),
+                sb_rect,
+                &mut sb_state,
+            );
+        }
+    }
 
     // ── ribbon render ──
     render_ribbon(frame, ribbon_area, slot);
@@ -523,57 +716,67 @@ fn render_pane(frame: &mut ratatui::Frame, area: Rect, slot: &PaneSlot, focused:
 /// Render the one-line block ribbon inside `area`.
 fn render_ribbon(frame: &mut ratatui::Frame, area: Rect, slot: &PaneSlot) {
     if slot.recent_blocks.is_empty() {
-        let p = Paragraph::new(" (no blocks)").style(Style::default().fg(Color::DarkGray));
+        let p =
+            Paragraph::new(" (no blocks)").style(Style::default().fg(EMBER.text_dim).bg(EMBER.bg));
         frame.render_widget(p, area);
         return;
     }
 
-    // Determine the highlighted index.
-    let highlight_idx = match slot.ribbon_cursor {
-        Some(i) => i,
-        None => slot.recent_blocks.len().saturating_sub(1),
-    };
+    // Determine the highlighted index. None = live (last block).
+    let is_live = slot.ribbon_cursor.is_none();
+    let latest_idx = slot.recent_blocks.len().saturating_sub(1);
+    let highlight_idx = slot.ribbon_cursor.unwrap_or(latest_idx);
 
     let mut spans: Vec<Span> = Vec::new();
     for (i, b) in slot.recent_blocks.iter().enumerate() {
-        let short_id = &b.id.0.to_string()[..4];
-        let cmd_short: String = b.command.chars().take(12).collect();
-        let exit_str = match b.exit_code {
-            Some(c) => format!("{c}"),
-            None => "…".to_owned(),
-        };
-        let entry = format!("b{short_id}:{cmd_short}[{exit_str}]");
+        let short4: String = b.id.0.to_string().chars().take(4).collect();
 
-        let style = if i == highlight_idx {
+        // Exit code badge colour and prefix.
+        let (badge_fg, live_prefix) = match b.exit_code {
+            Some(0) => (EMBER.ok, ""),
+            Some(_) => (EMBER.err, ""),
+            None => (EMBER.spark, "●"),
+        };
+
+        let chip_text = format!("{live_prefix}▎b{short4}");
+
+        let chip_style = if i == highlight_idx && !is_live {
+            // Selected in scrollback cursor mode.
+            EMBER.selection()
+        } else if i == latest_idx && is_live {
+            // Latest block in live mode.
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
+                .fg(EMBER.bg)
+                .bg(EMBER.primary)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(badge_fg).bg(EMBER.muted_bg)
         };
 
         if i > 0 {
-            spans.push(Span::raw(","));
+            spans.push(Span::styled("│", Style::default().fg(EMBER.text_dim)));
         }
-        spans.push(Span::styled(entry, style));
+        spans.push(Span::styled(chip_text, chip_style));
     }
 
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(EMBER.bg)),
+        area,
+    );
 }
 
 fn render_layout(
     frame: &mut ratatui::Frame,
     area: Rect,
     node: &LayoutNode,
-    slots: &[PaneSlot],
+    slots: &mut Vec<PaneSlot>,
     focus_path: &[usize],
     current_path: &mut Vec<usize>,
 ) {
     match node {
         LayoutNode::Leaf(slot_idx) => {
             let focused = current_path == focus_path;
-            render_pane(frame, area, &slots[*slot_idx], focused);
+            render_pane(frame, area, &mut slots[*slot_idx], focused);
         }
         LayoutNode::HSplit(children) => {
             let n = children.len() as u32;
@@ -618,8 +821,10 @@ fn render_search_overlay(frame: &mut ratatui::Frame, app: &AppState) {
 
     let outer = RatatuiBlock::default()
         .borders(Borders::ALL)
-        .title(" Search (Esc to close) ")
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_type(BorderType::Double)
+        .border_style(EMBER.border_focus())
+        .title(Span::styled(" search ", EMBER.title(EMBER.primary)))
+        .style(EMBER.overlay());
     let inner = outer.inner(overlay_rect);
     frame.render_widget(outer, overlay_rect);
 
@@ -632,13 +837,20 @@ fn render_search_overlay(frame: &mut ratatui::Frame, app: &AppState) {
     let input_area = split[0];
     let results_area = split[1];
 
-    // Input box — append `_` as cursor indicator.
-    let input_display = format!("{}_", app.search.input);
+    // Input box — prompt prefix `> ` in primary, query in text, cursor █ in spark.
+    let input_spans = vec![
+        Span::styled("> ", Style::default().fg(EMBER.primary)),
+        Span::styled(app.search.input.as_str(), Style::default().fg(EMBER.text)),
+        Span::styled("█", Style::default().fg(EMBER.spark)),
+    ];
     let input_block = RatatuiBlock::default()
         .borders(Borders::ALL)
-        .title(" Query ")
-        .border_style(Style::default().fg(Color::Yellow));
-    let input_para = Paragraph::new(input_display).block(input_block);
+        .border_type(BorderType::Rounded)
+        .border_style(EMBER.border())
+        .style(EMBER.overlay());
+    let input_para = Paragraph::new(Line::from(input_spans))
+        .block(input_block)
+        .style(EMBER.bg_style());
     frame.render_widget(input_para, input_area);
 
     // Results list.
@@ -653,6 +865,7 @@ fn render_search_overlay(frame: &mut ratatui::Frame, app: &AppState) {
             // TODO: real stdout snippet once daemon returns it
             let snippet: String = b.command.chars().take(80).collect();
             ListItem::new(format!("[{pane_short}] {ts_short} {snippet}"))
+                .style(Style::default().fg(EMBER.text))
         })
         .collect();
 
@@ -660,10 +873,15 @@ fn render_search_overlay(frame: &mut ratatui::Frame, app: &AppState) {
         .block(
             RatatuiBlock::default()
                 .borders(Borders::ALL)
-                .title(format!(" {} results ", app.search.results.len()))
-                .border_style(Style::default().fg(Color::DarkGray)),
+                .border_type(BorderType::Rounded)
+                .border_style(EMBER.border())
+                .title(Span::styled(
+                    format!(" {} results ", app.search.results.len()),
+                    Style::default().fg(EMBER.text_dim),
+                ))
+                .style(EMBER.overlay()),
         )
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+        .highlight_style(EMBER.selection());
 
     // Use a stateful list so we can highlight the cursor item.
     let mut list_state = ratatui::widgets::ListState::default();
@@ -675,7 +893,8 @@ fn render_search_overlay(frame: &mut ratatui::Frame, app: &AppState) {
 
 fn draw_frame(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    state: &AppState,
+    state: &mut AppState,
+    prefix_active: bool,
 ) -> Result<()> {
     terminal.draw(|frame| {
         let area = frame.area();
@@ -694,81 +913,130 @@ fn draw_frame(
         let body_area = outer[1];
         let status_area = outer[2];
 
+        // Frame clear — paint entire frame with bg_style so no bleed.
+        frame.render_widget(
+            RatatuiBlock::default().style(EMBER.bg_style()),
+            frame.area(),
+        );
+
         // Tab bar
-        let tab_spans: Vec<Span> = state
-            .tabs
-            .iter()
-            .enumerate()
-            .map(|(i, _)| {
-                let label = if i == state.active_tab {
-                    format!(" [{}*] ", i + 1)
-                } else {
-                    format!(" [{}] ", i + 1)
-                };
-                let style = if i == state.active_tab {
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::Gray)
-                };
-                Span::styled(label, style)
-            })
-            .collect();
+        let total_tabs = state.tabs.len();
+        let mut tab_spans: Vec<Span> = Vec::new();
+        for (i, _) in state.tabs.iter().enumerate() {
+            let label = format!(" {} ", i + 1);
+            let style = if i == state.active_tab {
+                EMBER.tab_active()
+            } else {
+                EMBER.tab_inactive()
+            };
+            tab_spans.push(Span::styled(label, style));
+            // Single-space separator in bg color between tabs.
+            if i + 1 < total_tabs {
+                tab_spans.push(Span::styled(" ", Style::default().bg(EMBER.bg)));
+            }
+        }
+        // Tab count indicator on right side.
+        let count_label = format!(" {total_tabs} tabs ");
+        tab_spans.push(Span::styled(
+            count_label,
+            Style::default().fg(EMBER.text_dim).bg(EMBER.bg),
+        ));
         let tab_line = Line::from(tab_spans);
-        frame.render_widget(Paragraph::new(tab_line), tab_area);
+        frame.render_widget(
+            Paragraph::new(tab_line).style(Style::default().bg(EMBER.bg)),
+            tab_area,
+        );
 
         // Body — render active tab's layout
-        let tab = &state.tabs[state.active_tab];
+        let focus_path = state.tabs[state.active_tab].focus_path.clone();
         let mut current_path: Vec<usize> = Vec::new();
+        // We need to borrow tab.root immutably and slots mutably.
+        // Split the borrow: reborrow root reference after extracting what we need.
+        let active_tab_idx = state.active_tab;
+        // SAFETY: we only borrow root via a raw pointer to avoid the simultaneous
+        // mutable borrow of slots. This is safe because render_layout only reads
+        // `root` and mutates `slots` at disjoint indices.
+        let root_ptr: *const LayoutNode = &state.tabs[active_tab_idx].root;
+        // SAFETY: root_ptr is valid for the duration of this closure; no mutation
+        // of `tabs` occurs during render_layout.
         render_layout(
             frame,
             body_area,
-            &tab.root,
-            &state.slots,
-            &tab.focus_path,
+            unsafe { &*root_ptr },
+            &mut state.slots,
+            &focus_path,
             &mut current_path,
         );
 
-        // Status bar
-        let status_text = if state.search.open {
-            format!(
-                " search: {} ({} results)",
-                state.search.input,
-                state.search.results.len()
-            )
-        } else if let Some(ref msg) = state.status_msg {
-            format!(" {msg}")
-        } else {
+        // Status bar — two segments + optional middle message.
+        {
+            let tab = &state.tabs[state.active_tab];
             let focused_slot = slot_at(&tab.root, &tab.focus_path);
-            if let Some(slot_idx) = focused_slot {
+
+            // Determine mode label and mid message.
+            let (mode_label, mid_msg) = if state.search.open {
+                (
+                    "SEARCH",
+                    Some(format!(
+                        " search: {} ({} results) ",
+                        state.search.input,
+                        state.search.results.len()
+                    )),
+                )
+            } else if prefix_active {
+                (
+                    "PREFIX",
+                    state.status_msg.as_ref().map(|m| format!(" {m} ")),
+                )
+            } else if let Some(slot_idx) = focused_slot {
+                let slot = &state.slots[slot_idx];
+                if slot.ribbon_cursor.is_some() {
+                    (
+                        "SCROLL",
+                        state.status_msg.as_ref().map(|m| format!(" {m} ")),
+                    )
+                } else {
+                    ("LIVE", state.status_msg.as_ref().map(|m| format!(" {m} ")))
+                }
+            } else {
+                ("LIVE", state.status_msg.as_ref().map(|m| format!(" {m} ")))
+            };
+
+            // Left: ` ● {session} ▸ {pane} `
+            let left_text = if let Some(slot_idx) = focused_slot {
                 let slot = &state.slots[slot_idx];
                 let session_short = &state.session.0.to_string()[..8];
                 let pane_short = &slot.pane_id.0.to_string()[..8];
-                let base = format!(" session {session_short} pane {pane_short}");
-                if let Some(cursor) = slot.ribbon_cursor {
-                    if let Some(b) = slot.recent_blocks.get(cursor) {
-                        let bid = &b.id.0.to_string()[..8];
-                        let exit_str = match b.exit_code {
-                            Some(c) => format!("{c}"),
-                            None => "?".to_owned(),
-                        };
-                        format!("{base} | scroll b{bid} {} exit={exit_str}", b.command)
-                    } else {
-                        base
-                    }
-                } else {
-                    base
-                }
+                format!(" ● {session_short} ▸ {pane_short} ")
             } else {
-                format!(" session {:.8}", state.session.0.to_string())
+                format!(" ● {:.8} ", state.session.0.to_string())
+            };
+
+            // Right: mode indicator
+            let right_text = format!(" {mode_label} ");
+
+            let mut status_spans: Vec<Span> = vec![Span::styled(left_text, EMBER.status())];
+            if let Some(msg) = mid_msg {
+                status_spans.push(Span::styled(
+                    msg,
+                    Style::default().fg(EMBER.secondary).bg(EMBER.surface),
+                ));
             }
-        };
-        frame.render_widget(
-            Paragraph::new(status_text).style(Style::default().fg(Color::Gray)),
-            status_area,
-        );
+            // Spacer to push mode to right — approximate with bg fill.
+            status_spans.push(Span::styled(" ", Style::default().bg(EMBER.surface)));
+            status_spans.push(Span::styled(
+                right_text,
+                Style::default()
+                    .fg(EMBER.bg)
+                    .bg(EMBER.primary)
+                    .add_modifier(Modifier::BOLD),
+            ));
+
+            frame.render_widget(
+                Paragraph::new(Line::from(status_spans)).style(EMBER.status()),
+                status_area,
+            );
+        }
 
         // Search overlay — drawn on top of everything else.
         if state.search.open {
@@ -891,6 +1159,113 @@ async fn open_new_tab(state: &mut AppState) -> Result<()> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Mouse event handler
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Compute tab strip layout widths and return the tab index clicked, if any.
+/// `col` is the x coordinate of the click (0-based).
+fn tab_idx_at_col(tabs: &[Tab], col: u16) -> Option<usize> {
+    let mut x: u16 = 0;
+    for (i, _) in tabs.iter().enumerate() {
+        let label_len = if i == 0 {
+            // label format: " [N*] " or " [N] "
+            format!(" [{}*] ", i + 1).len() as u16
+        } else {
+            format!(" [{}] ", i + 1).len() as u16
+        };
+        if col >= x && col < x + label_len {
+            return Some(i);
+        }
+        x += label_len;
+    }
+    None
+}
+
+/// Handle a mouse event. Returns true if the event was consumed.
+fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_area: Rect) -> bool {
+    let col = me.column;
+    let row = me.row;
+
+    match me.kind {
+        MouseEventKind::ScrollUp => {
+            // Find the pane under the cursor and scroll it up.
+            let mut leaf_rects: Vec<(usize, Rect)> = Vec::new();
+            collect_leaf_rects(
+                &state.tabs[state.active_tab].root,
+                body_area,
+                &mut leaf_rects,
+            );
+            for (slot_idx, rect) in &leaf_rects {
+                if rect_contains(*rect, col, row) {
+                    // Focus and scroll.
+                    focus_slot(state, *slot_idx);
+                    let slot = &mut state.slots[*slot_idx];
+                    let max_offset = slot.scrollback.len();
+                    slot.scroll_offset = (slot.scroll_offset + 3).min(max_offset);
+                    return true;
+                }
+            }
+            false
+        }
+        MouseEventKind::ScrollDown => {
+            let mut leaf_rects: Vec<(usize, Rect)> = Vec::new();
+            collect_leaf_rects(
+                &state.tabs[state.active_tab].root,
+                body_area,
+                &mut leaf_rects,
+            );
+            for (slot_idx, rect) in &leaf_rects {
+                if rect_contains(*rect, col, row) {
+                    focus_slot(state, *slot_idx);
+                    let slot = &mut state.slots[*slot_idx];
+                    slot.scroll_offset = slot.scroll_offset.saturating_sub(3);
+                    return true;
+                }
+            }
+            false
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            // row == 0 is the tab strip (body_area starts at row 1).
+            if row == 0 {
+                if let Some(tab_idx) = tab_idx_at_col(&state.tabs, col) {
+                    state.active_tab = tab_idx;
+                    return true;
+                }
+            }
+            // Check if clicking inside a leaf pane.
+            let mut leaf_rects: Vec<(usize, Rect)> = Vec::new();
+            collect_leaf_rects(
+                &state.tabs[state.active_tab].root,
+                body_area,
+                &mut leaf_rects,
+            );
+            for (slot_idx, rect) in &leaf_rects {
+                if rect_contains(*rect, col, row) {
+                    focus_slot(state, *slot_idx);
+                    return true;
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Update active tab's focus_path to point at the given slot index.
+fn focus_slot(state: &mut AppState, target_slot_idx: usize) {
+    let tab = &mut state.tabs[state.active_tab];
+    let mut all_paths: Vec<Vec<usize>> = Vec::new();
+    let mut tmp: Vec<usize> = Vec::new();
+    leaves_in_order(&tab.root, &mut tmp, &mut all_paths);
+    for path in &all_paths {
+        if slot_at(&tab.root, path) == Some(target_slot_idx) {
+            tab.focus_path = path.clone();
+            return;
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Main TUI loop
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -924,10 +1299,10 @@ async fn run_tui(
     let mut prefix_active = false;
 
     loop {
-        // Drain all pane output into their parsers
+        // Drain all pane output into their parsers and scrollback buffers.
         for slot in &mut state.slots {
             while let Ok(data) = slot.output_rx.try_recv() {
-                slot.parser.process(&data);
+                slot.process_output(&data);
             }
         }
 
@@ -989,15 +1364,31 @@ async fn run_tui(
             }
         }
 
-        // Draw
-        draw_frame(&mut terminal, &state)?;
+        // Draw — pass state as mut so render_pane can store last_screen_rect.
+        draw_frame(&mut terminal, &mut state, prefix_active)?;
 
         // Poll crossterm events (~16 ms = 60 fps)
         if !crossterm::event::poll(Duration::from_millis(16))? {
             continue;
         }
 
+        // Compute body_area for mouse hit-tests (mirrors draw_frame layout).
+        let term_size_rect = terminal.size()?;
+        let outer_rects = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(0),
+                Constraint::Length(1),
+            ])
+            .split(term_size_rect.into());
+        let body_area = outer_rects[1];
+
         match crossterm::event::read()? {
+            Event::Mouse(me) => {
+                handle_mouse(&mut state, me, body_area);
+            }
+
             Event::Key(key_event) => {
                 let code = key_event.code;
                 let mods = key_event.modifiers;
@@ -1051,7 +1442,7 @@ async fn run_tui(
                             focus_next(&mut state.tabs[state.active_tab], false);
                         }
 
-                        // Enter scrollback mode for focused pane
+                        // Enter scrollback mode for focused pane (block ribbon)
                         KeyCode::Char('[') => {
                             let tab = &state.tabs[state.active_tab];
                             if let Some(slot_idx) = slot_at(&tab.root, &tab.focus_path) {
@@ -1061,7 +1452,7 @@ async fn run_tui(
                             }
                         }
 
-                        // Exit scrollback mode for focused pane
+                        // Exit scrollback mode for focused pane (block ribbon)
                         KeyCode::Char(']') => {
                             let tab = &state.tabs[state.active_tab];
                             if let Some(slot_idx) = slot_at(&tab.root, &tab.focus_path) {
@@ -1150,7 +1541,7 @@ async fn run_tui(
                     continue;
                 }
 
-                // Scrollback navigation (no prefix required when in scrollback mode)
+                // Block ribbon scrollback navigation (Ctrl-B [ mode).
                 {
                     let tab = &state.tabs[state.active_tab];
                     if let Some(slot_idx) = slot_at(&tab.root, &tab.focus_path) {
@@ -1173,7 +1564,7 @@ async fn run_tui(
                                     continue;
                                 }
                                 _ => {
-                                    // In scrollback mode other keys are swallowed.
+                                    // In block scrollback mode other keys are swallowed.
                                     continue;
                                 }
                             }
@@ -1181,10 +1572,36 @@ async fn run_tui(
                     }
                 }
 
-                // Forward key to focused pane
+                // PgUp / PgDn for scrollback buffer (unmodified only).
+                // Shift/Ctrl-modified PgUp/PgDn fall through to PTY.
+                if mods == KeyModifiers::NONE {
+                    let tab = &state.tabs[state.active_tab];
+                    if let Some(slot_idx) = slot_at(&tab.root, &tab.focus_path) {
+                        let half_page = (body_area.height / 2).max(1) as usize;
+                        let slot = &mut state.slots[slot_idx];
+                        match code {
+                            KeyCode::PageUp => {
+                                let max_offset = slot.scrollback.len();
+                                slot.scroll_offset =
+                                    (slot.scroll_offset + half_page).min(max_offset);
+                                continue;
+                            }
+                            KeyCode::PageDown => {
+                                slot.scroll_offset = slot.scroll_offset.saturating_sub(half_page);
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                // Forward key to focused pane — reset scroll_offset first so
+                // the user sees the live terminal after typing.
                 if let Some(bytes) = key_to_bytes(code, mods) {
                     let tab = &state.tabs[state.active_tab];
                     if let Some(slot_idx) = slot_at(&tab.root, &tab.focus_path) {
+                        // Resume live view when sending input.
+                        state.slots[slot_idx].scroll_offset = 0;
                         let _ = state.slots[slot_idx].input_tx.send(bytes).await;
                     }
                 }
