@@ -1,0 +1,205 @@
+id: pyre-s1
+name: Pyre S1 Daemon + PTY + tarpc IPC
+version: 1.0.0
+description: |
+  Sprint 1. ADR-001 resolved: tarpc over UDS. Seven phases:
+    1. deps         — add tarpc/portable-pty/tokio/tracing to workspace + crates
+    2. proto-ipc    — pyre-proto tarpc service: Spawn/Attach/Detach/Kill + OutputFrame stream
+    3. pyred-pty    — pyred: spawn PTY via portable-pty, session state
+    4. pyred-uds    — pyred: bind UDS at $XDG_RUNTIME_DIR/pyre.sock (0700), serve tarpc, bridge PTY <-> stream
+    5. pyrec-client — pyrec: connect UDS, Spawn, raw-mode stdio bridge
+    6. smoke        — integration: pyred bg + pyrec `echo hi`, verify output + clean exit
+    7. commit       — `feat: s1 daemon + pty + tarpc ipc over uds`
+
+  Constraints (from CLAUDE.md + ROADMAP):
+    - Linux-first. Windows paths #[cfg]-gated, untested.
+    - No persistence, no parser, no Blocks. Raw bytes both ways only.
+    - No MCP / AI modules — blocked until S5.
+    - rustfmt + `clippy -D warnings` are CI gates — keep clean.
+    - tarpc native Rust types over UDS. No protobuf, no tonic.
+
+nodes:
+  - id: deps
+    name: Wire dependencies
+    is_start: true
+    prompt_injection: |
+      Phase 1 — deps. Edit workspace + crate Cargo.tomls.
+
+      Root /home/rixmerz/Projects/pyre/Cargo.toml [workspace.dependencies]: add
+        tokio = { version = "1", features = ["full"] }
+        tarpc = { version = "0.34", features = ["serde-transport", "tokio1", "unix"] }
+        portable-pty = "0.8"
+        tracing = "0.1"
+        tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+        anyhow = "1"
+        futures = "0.3"
+        bytes = "1"
+
+      crates/pyre-proto/Cargo.toml [dependencies]: add tarpc, serde with derive, bytes, tokio (rt + sync).
+      crates/pyred/Cargo.toml [dependencies]: add pyre-proto (path), tokio, tarpc, portable-pty, tracing, tracing-subscriber, anyhow, futures, bytes.
+      crates/pyrec/Cargo.toml [dependencies]: add pyre-proto (path), tokio, tarpc, tracing, tracing-subscriber, anyhow, futures, bytes, plus `nix = { version = "0.29", features = ["term"] }` for raw mode.
+
+      DELEGATE to @backend-rust with the file list + exact deps. After return, reindex livespec + DCC for each Cargo.toml.
+      MILESTONE: `cd /home/rixmerz/Projects/pyre && cargo check --workspace` exits 0.
+      Then graph_traverse to proto-ipc.
+
+  - id: proto-ipc
+    name: Define tarpc service in pyre-proto
+    prompt_injection: |
+      Phase 2 — proto-ipc. In crates/pyre-proto/src/lib.rs (or new module `service.rs`):
+
+      Define minimal IPC surface:
+        #[tarpc::service]
+        pub trait PyreDaemon {
+            async fn spawn(req: SpawnReq) -> Result<SessionId, PyreError>;
+            async fn attach(session: SessionId) -> Result<AttachAck, PyreError>;
+            async fn detach(session: SessionId) -> Result<(), PyreError>;
+            async fn kill(session: SessionId) -> Result<(), PyreError>;
+        }
+
+      Types:
+        SpawnReq { shell: Option<String>, cwd: Option<PathBuf>, cols: u16, rows: u16, env: Vec<(String,String)> }
+        AttachAck { session: SessionId, cols: u16, rows: u16 }
+        PyreError enum (NoSuchSession, SpawnFailed(String), Io(String)) — derive thiserror + Serialize + Deserialize.
+
+      OutputFrame { session: SessionId, seq: u64, data: Bytes } — Serialize + Deserialize.
+      InputFrame  { session: SessionId, data: Bytes }.
+
+      Output/input streams are sidechannel for S1: keep tarpc service to control-plane only; export `OutputFrame`/`InputFrame` types so pyred/pyrec can multiplex over the same UDS via a length-prefixed framed channel.  Document this split in a `//!` module doc.
+
+      DELEGATE to @backend-rust. After return, reindex.
+      MILESTONE: `cargo check -p pyre-proto` exits 0. `cargo clippy -p pyre-proto -- -D warnings` clean.
+      Then graph_traverse to pyred-pty.
+
+  - id: pyred-pty
+    name: pyred — spawn PTY
+    prompt_injection: |
+      Phase 3 — pyred PTY. Create crates/pyred/src/pty.rs:
+
+      - `PtySession { id: SessionId, master: Box<dyn MasterPty + Send>, child: Box<dyn Child + Send + Sync>, reader: tokio task, writer_tx: mpsc::Sender<Bytes> }`.
+      - `spawn_pty(req: SpawnReq) -> anyhow::Result<PtySession>` using `portable_pty::native_pty_system()`.
+      - Default shell: env SHELL → /bin/bash → /bin/sh fallback.
+      - PtySize from req.cols/rows.
+      - Reader task: blocking read from master in spawn_blocking, send Bytes via broadcast::Sender<Bytes>.
+      - Writer task: mpsc::Receiver<Bytes> → master writer.
+      - `resize(cols, rows)` method (will be used in S2; stub OK if not wired).
+
+      Module wiring: in main.rs add `mod pty;` plus a `SessionRegistry { Mutex<HashMap<SessionId, PtySession>> }`.
+
+      Linux-first: gate windows-specific behavior with `#[cfg(not(unix))]` stubs returning unimplemented.
+
+      DELEGATE to @backend-rust. After return, reindex.
+      MILESTONE: `cargo check -p pyred` exits 0. `cargo clippy -p pyred -- -D warnings` clean.
+      Then graph_traverse to pyred-uds.
+
+  - id: pyred-uds
+    name: pyred — UDS + tarpc server + frame bridge
+    prompt_injection: |
+      Phase 4 — pyred UDS server.
+
+      In crates/pyred/src/main.rs (+ helper modules):
+
+      1. Resolve socket path: `$XDG_RUNTIME_DIR/pyre.sock`; fall back to `/tmp/pyre-$UID.sock`. Unlink stale path on startup.
+      2. Bind `tokio::net::UnixListener`. fchmod the socket to 0o700 (or `std::os::unix::fs::PermissionsExt`).
+      3. Per-connection protocol: client sends a 1-byte mode tag:
+           0x01 = control (tarpc PyreDaemon)
+           0x02 = stream  (followed by SessionId LE bytes; daemon then writes length-prefixed OutputFrame bincode, reads InputFrame).
+         Document in `//!` of main.rs.
+      4. Control: wrap remaining stream with `tarpc::serde_transport::new` + bincode codec. Spawn `BaseChannel::with_defaults(...).execute(server.serve())`.
+      5. Server impl: SpawnReq → registry.spawn_pty → return SessionId. Attach: lookup, return AttachAck. Detach/Kill obvious.
+      6. Stream mode: subscribe to session's broadcast::Receiver<Bytes>; encode `OutputFrame { seq++, data }` with `bincode` length-prefixed (use `tokio_util::codec::LengthDelimitedCodec` + `tokio_serde::Framed`). Read InputFrame, forward bytes to writer_tx.
+      7. Signal handling: SIGTERM/SIGINT → kill all PTYs, unlink socket, exit 0.
+      8. `tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env())` init.
+
+      Add `tokio-util = { version = "0.7", features = ["codec"] }` and `tokio-serde = { version = "0.9", features = ["bincode"] }` to pyred deps + workspace if needed.
+
+      DELEGATE to @backend-rust. Self-contained prompt: file paths + protocol + dep additions.
+      After return, reindex.
+      MILESTONE: `cargo build -p pyred` exits 0. `cargo clippy -p pyred -- -D warnings` clean. Run `./target/debug/pyred &` then `ls -l $XDG_RUNTIME_DIR/pyre.sock` shows mode 0700. Kill it.
+      Then graph_traverse to pyrec-client.
+
+  - id: pyrec-client
+    name: pyrec — UDS client + raw stdio bridge
+    prompt_injection: |
+      Phase 5 — pyrec client.
+
+      In crates/pyrec/src/main.rs:
+
+      1. CLI: `pyrec [--shell SHELL] [--socket PATH]`. Default socket = same resolver as pyred.
+      2. Open two UDS connections:
+           a. control: write 0x01, wrap with tarpc client, call `spawn(SpawnReq{...})` using current TTY size (via `nix::sys::termios` / `rustix::termios::tcgetwinsize` — pick `nix`).
+           b. stream:  write 0x02, write SessionId, then framed bincode in/out.
+      3. Put stdin in raw mode via `nix::sys::termios::tcsetattr` (cfmakeraw). Restore on Drop.
+      4. Spawn three tokio tasks:
+           - stdin → InputFrame writer
+           - OutputFrame reader → stdout (write_all + flush)
+           - signal::ctrl_c() → call control.kill(session) → break
+      5. Exit when PTY closes (OutputFrame stream EOF).
+
+      DELEGATE to @backend-rust. After return, reindex.
+      MILESTONE: `cargo build -p pyrec` exits 0. `cargo clippy -p pyrec -- -D warnings` clean.
+      Then graph_traverse to smoke.
+
+  - id: smoke
+    name: Integration smoke test
+    prompt_injection: |
+      Phase 6 — smoke test.
+
+      DELEGATE to @tester-rust:
+      Write crates/pyred/tests/smoke.rs that:
+        - Spawns `pyred` binary via `assert_cmd` or `Command::new(env!("CARGO_BIN_EXE_pyred"))` into a tempdir-scoped XDG_RUNTIME_DIR.
+        - Waits up to 2s for the socket to appear.
+        - Opens a control connection + stream connection.
+        - Calls `spawn(SpawnReq{ shell: Some("/bin/sh".into()), cols: 80, rows: 24, ... })`.
+        - Writes `echo pyre-smoke\nexit\n` as InputFrame.
+        - Reads OutputFrame stream until EOF or 5s timeout, accumulates bytes.
+        - Asserts `pyre-smoke` appears in output.
+        - Sends SIGTERM to pyred, asserts socket gone.
+
+      Add dev-deps: `assert_cmd = "2"`, `tempfile = "3"`, `tokio` test feature already on.
+
+      MILESTONE: `cargo test -p pyred --test smoke -- --nocapture` passes. Also run `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets -- -D warnings` — both clean.
+      Then graph_traverse to commit.
+
+  - id: commit
+    name: Conventional commit
+    is_end: true
+    prompt_injection: |
+      Phase 7 — commit.
+
+      DELEGATE to @backend-rust (small task) or do directly: stage, commit (no push):
+
+        feat: s1 daemon + pty + tarpc ipc over uds
+
+        Why: S1 lands the wire format. pyred spawns a PTY via portable-pty and
+        serves a tarpc PyreDaemon (Spawn/Attach/Detach/Kill) plus a sidechannel
+        stream of length-prefixed OutputFrame/InputFrame over UDS at
+        $XDG_RUNTIME_DIR/pyre.sock (0700). pyrec connects, puts the TTY in raw
+        mode, and bridges stdio. ADR-001 (tarpc) settled here. Smoke test
+        validates end-to-end `echo` round-trip. No Blocks, no persistence, no
+        parser — those land in S2.
+
+        Co-Authored-By: Claude <noreply@anthropic.com>
+
+      Do NOT push (user uses `!` prefix). MILESTONE: `git log -1 --pretty=%s` equals the subject above.
+      Workflow complete. Next: ROADMAP S2 (Blocks + sqlite + parser).
+
+edges:
+  - id: e_deps_proto
+    from: deps
+    to: proto-ipc
+  - id: e_proto_pty
+    from: proto-ipc
+    to: pyred-pty
+  - id: e_pty_uds
+    from: pyred-pty
+    to: pyred-uds
+  - id: e_uds_client
+    from: pyred-uds
+    to: pyrec-client
+  - id: e_client_smoke
+    from: pyrec-client
+    to: smoke
+  - id: e_smoke_commit
+    from: smoke
+    to: commit

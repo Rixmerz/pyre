@@ -22,3 +22,15 @@ anyhow = "1"
 thiserror = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
+tarpc = { version = "0.34", features = ["serde-transport", "serde-transport-bincode", "tokio1", "unix"] }
+portable-pty = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures = "0.3"
+bytes = "1"
+tokio-util = { version = "0.7", features = ["codec"] }
+tokio-serde = { version = "0.9", features = ["bincode"] }
+bincode = "1"
+serde_bytes = "0.11"
+nix = { version = "0.29", features = ["term", "signal"] }
+libc = "0.2"
