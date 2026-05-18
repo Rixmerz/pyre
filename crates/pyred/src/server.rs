@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use pyre_proto::{
     AttachAck, Block, BlockHit, BlockId, ListBlocksReq, OpenPaneReq, PaneId, PaneInfo,
-    PaneStateKind, PyreError, ReplayBlocks, SearchBlocksReq, SessionId, SessionInfo, SpawnReq,
-    SpawnResp,
+    PaneStateKind, PyreError, ReplayBlocks, ResizePaneReq, ResizePaneRes, SearchBlocksReq,
+    SessionId, SessionInfo, SpawnReq, SpawnResp,
 };
 use tarpc::context;
 
@@ -311,5 +311,29 @@ impl pyre_proto::service::PyreDaemon for DaemonImpl {
             .map(|t| t.root_pid)
             .unwrap_or(0);
         Ok(crate::inspect::inspect_pid(pid))
+    }
+
+    async fn resize_pane(
+        self,
+        _ctx: context::Context,
+        req: ResizePaneReq,
+    ) -> Result<ResizePaneRes, PyreError> {
+        let (_session, pane_state) = self
+            .registry
+            .get_pane(req.pane_id)
+            .await
+            .ok_or(PyreError::NoSuchPane(req.pane_id))?;
+        pane_state
+            .master
+            .lock()
+            .await
+            .resize(portable_pty::PtySize {
+                rows: req.size.rows,
+                cols: req.size.cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| PyreError::Io(format!("resize: {e}")))?;
+        Ok(ResizePaneRes { ok: true })
     }
 }

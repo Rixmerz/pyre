@@ -25,7 +25,6 @@ pub struct PaneState {
     pub created_at: DateTime<Utc>,
     pub closed_at: Mutex<Option<DateTime<Utc>>>,
     // PTY plumbing — same fields that lived in PtySession.
-    #[allow(dead_code)] // phase 6+: resize RPC
     pub master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
     pub output_tx: broadcast::Sender<Bytes>,
     #[allow(dead_code)] // phase 6+: stream connections subscribe to block events
@@ -193,7 +192,27 @@ impl SessionRegistry {
         pane.kill().await?;
         *pane.closed_at.lock().await = Some(Utc::now());
         session.panes.lock().await.remove(&pane_id);
+        self.evict_session_if_empty(session.id).await;
         Ok(())
+    }
+
+    /// Remove `session_id` from the registry if it has no remaining panes.
+    ///
+    /// Must be called after the caller has already released `session.panes`
+    /// (i.e. the panes Mutex guard is dropped). This function then acquires
+    /// `self.sessions` and, while holding it, acquires `session.panes` to
+    /// check for emptiness — preserving the same lock-ordering as `remove_pane`
+    /// (sessions outer, panes inner).
+    async fn evict_session_if_empty(&self, session_id: SessionId) {
+        let mut sessions = self.sessions.lock().await;
+        let is_empty = match sessions.get(&session_id) {
+            Some(s) => s.panes.lock().await.is_empty(),
+            None => return,
+        };
+        if is_empty {
+            sessions.remove(&session_id);
+            tracing::info!("session {session_id} removed (last pane closed via RPC)");
+        }
     }
 
     pub async fn list_sessions(&self) -> Vec<SessionInfo> {
