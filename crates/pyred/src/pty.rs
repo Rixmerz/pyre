@@ -12,7 +12,7 @@ use chrono::Utc;
 use pyre_proto::{BlockEvent, PaneId, SessionId, SpawnReq};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc, Mutex, Notify};
 
 use crate::session::PaneState;
 
@@ -146,6 +146,10 @@ pub async fn spawn_pty(
     // Wrap child in Arc<Mutex<>> now that we've extracted the PID.
     let child = Arc::new(Mutex::new(child));
 
+    // close_notify: fired when the child process exits so stream handlers
+    // can break their recv loop and drop the socket, giving clients EOF.
+    let close_notify = Arc::new(Notify::new());
+
     // Stash the child PID into the state tracker.
     {
         let child_guard = child.lock().await;
@@ -154,6 +158,24 @@ pub async fn spawn_pty(
                 t.root_pid = pid;
             }
         }
+    }
+
+    // Child-wait task: blocks until the shell exits, then fires close_notify
+    // so all stream handlers observing this pane break their loops and drop
+    // their sockets (clients receive EOF → PaneEvent::Closed).
+    {
+        let child_wait = child.clone();
+        let notify = close_notify.clone();
+        tokio::task::spawn_blocking(move || {
+            // Lock briefly to extract the child, then wait outside the lock.
+            // portable_pty::Child::wait() is a blocking syscall.
+            let mut guard = child_wait.blocking_lock();
+            match guard.wait() {
+                Ok(status) => tracing::info!("child exited: {status:?}"),
+                Err(e) => tracing::warn!("child.wait(): {e}"),
+            }
+            notify.notify_waiters();
+        });
     }
 
     // Parser task: feed raw PTY bytes through BlockParser, broadcast BlockEvents,
@@ -315,6 +337,7 @@ pub async fn spawn_pty(
         child,
         ringbuf_arc,
         state_tracker_arc,
+        close_notify,
     ))
 }
 
