@@ -77,6 +77,7 @@ pub async fn handle_stream(mut sock: UnixStream, registry: Arc<SessionRegistry>)
     // Subscribe *after* the snapshot write.  Any live bytes that arrive after
     // the snapshot was taken will be delivered by the broadcast receiver below.
     let mut sub = pty.subscribe();
+    let close_notify = pty.close_notify.clone();
 
     let input_tx = pty.input_tx.clone();
     let recv_task = tokio::spawn(async move {
@@ -98,21 +99,28 @@ pub async fn handle_stream(mut sock: UnixStream, registry: Arc<SessionRegistry>)
     let send_task = tokio::spawn(async move {
         let mut seq: u64 = 0; // seq 0 was the snapshot frame; live frames start at 1
         loop {
-            match sub.recv().await {
-                Ok(data) => {
-                    seq = seq.wrapping_add(1);
-                    let frame = OutputFrame { session, seq, data };
-                    if output_frames.send(frame).await.is_err() {
-                        break;
+            tokio::select! {
+                recv_res = sub.recv() => match recv_res {
+                    Ok(data) => {
+                        seq = seq.wrapping_add(1);
+                        let frame = OutputFrame { session, seq, data };
+                        if output_frames.send(frame).await.is_err() {
+                            break;
+                        }
                     }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("output broadcast lagged {n} messages");
+                    }
+                    Err(_) => break,
+                },
+                _ = close_notify.notified() => {
+                    tracing::info!("pane close_notify fired; dropping stream socket");
+                    break;
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!("output broadcast lagged {n} messages");
-                    continue;
-                }
-                Err(_) => break,
             }
         }
+        // Dropping output_frames here closes the write half of the socket,
+        // giving the client an EOF on its read path.
     });
 
     let _ = tokio::join!(recv_task, send_task);
