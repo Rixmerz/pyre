@@ -12,7 +12,8 @@ use chrono::Utc;
 use pyre_proto::{BlockEvent, PaneId, SessionId, SpawnReq};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc, Mutex, Notify};
+use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio_util::sync::CancellationToken;
 
 use crate::session::PaneState;
 
@@ -146,9 +147,11 @@ pub async fn spawn_pty(
     // Wrap child in Arc<Mutex<>> now that we've extracted the PID.
     let child = Arc::new(Mutex::new(child));
 
-    // close_notify: fired when the child process exits so stream handlers
+    // close_token: cancelled when the child process exits so stream handlers
     // can break their recv loop and drop the socket, giving clients EOF.
-    let close_notify = Arc::new(Notify::new());
+    // CancellationToken is sticky — cancelled() resolves immediately if the
+    // token was already cancelled when a task reaches the select arm.
+    let close_token = CancellationToken::new();
 
     // Stash the child PID into the state tracker.
     {
@@ -165,7 +168,7 @@ pub async fn spawn_pty(
     // their sockets (clients receive EOF → PaneEvent::Closed).
     {
         let child_wait = child.clone();
-        let notify = close_notify.clone();
+        let token = close_token.clone();
         tokio::task::spawn_blocking(move || {
             // Lock briefly to extract the child, then wait outside the lock.
             // portable_pty::Child::wait() is a blocking syscall.
@@ -174,7 +177,8 @@ pub async fn spawn_pty(
                 Ok(status) => tracing::info!("child exited: {status:?}"),
                 Err(e) => tracing::warn!("child.wait(): {e}"),
             }
-            notify.notify_waiters();
+            tracing::info!("pane close_token cancelled");
+            token.cancel();
         });
     }
 
@@ -337,7 +341,7 @@ pub async fn spawn_pty(
         child,
         ringbuf_arc,
         state_tracker_arc,
-        close_notify,
+        close_token,
     ))
 }
 
