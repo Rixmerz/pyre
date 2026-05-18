@@ -134,7 +134,7 @@ impl SessionRegistry {
 
     /// Open a new pane inside an existing session. Spawns the PTY.
     pub async fn open_pane(
-        &self,
+        self: &Arc<Self>,
         session_id: SessionId,
         req: OpenPaneReq,
         store: Arc<Store>,
@@ -159,7 +159,7 @@ impl SessionRegistry {
             name: None,
         };
 
-        let raw = spawn_pty(spawn_req, session_id, store, block_index).await?;
+        let raw = spawn_pty(spawn_req, session_id, store, block_index, Arc::clone(self)).await?;
         let pane = Arc::new(raw);
 
         session.panes.lock().await.insert(pane.id, pane.clone());
@@ -273,6 +273,27 @@ impl SessionRegistry {
             }
         }
         Ok(())
+    }
+
+    /// Remove a pane from its session. If the session has no remaining panes
+    /// after removal it is also dropped from the registry.
+    /// Called by the child-wait task in pty.rs when the shell exits.
+    pub async fn remove_pane(&self, pane_id: PaneId) {
+        let mut sessions = self.sessions.lock().await;
+        let mut session_to_remove: Option<SessionId> = None;
+        for (sid, sess) in sessions.iter() {
+            let mut panes = sess.panes.lock().await;
+            if panes.remove(&pane_id).is_some() {
+                if panes.is_empty() {
+                    session_to_remove = Some(*sid);
+                }
+                break;
+            }
+        }
+        if let Some(sid) = session_to_remove {
+            sessions.remove(&sid);
+            tracing::info!("session {sid} removed (last pane exited)");
+        }
     }
 
     /// Used by shutdown path in main.rs.
