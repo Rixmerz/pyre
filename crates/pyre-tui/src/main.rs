@@ -335,6 +335,9 @@ struct PaneSlot {
     scroll_offset: usize,
     /// Incomplete line accumulator for the line splitter.
     current_line: String,
+    /// One-byte lookahead flag: set when the last byte was `\r`. Cleared on the
+    /// next byte. Allows correct CRLF handling without buffering extra bytes.
+    last_was_cr: bool,
     /// The screen rect captured during the last render, used for mouse hit-test.
     last_screen_rect: Rect,
     /// Ribbon chip rects captured during last render: (block_idx, rect).
@@ -349,11 +352,21 @@ impl PaneSlot {
     }
 
     /// Append bytes to the plain-text line buffer, stripping ANSI sequences.
+    ///
+    /// Uses a one-byte lookahead (`last_was_cr`) to handle CRLF correctly:
+    /// - `\r\n` (CRLF): `\r` sets the flag; `\n` pushes the full line.
+    /// - `\rX` (CR overwrite, progress-bar style): clears `current_line` then
+    ///   collects `X` and subsequent printable bytes.
+    /// - Lone `\r` with no follow-up byte in this chunk: flag stays set and is
+    ///   resolved on the next call.
     fn feed_line_buffer(&mut self, raw: &[u8]) {
-        let text = strip_ansi(raw);
-        for ch in text.chars() {
-            match ch {
-                '\n' => {
+        let stripped = strip_ansi(raw);
+        for &b in stripped.as_bytes() {
+            match b {
+                b'\n' => {
+                    // Either a bare LF or the \n half of CRLF — either way
+                    // push whatever is in current_line (which is the real
+                    // content, since \r only set the flag without clearing).
                     let line = std::mem::take(&mut self.current_line);
                     self.scrollback.push_back(line);
                     while self.scrollback.len() > self.scrollback_cap {
@@ -363,18 +376,27 @@ impl PaneSlot {
                             self.scroll_offset = self.scroll_offset.saturating_sub(1);
                         }
                     }
+                    self.last_was_cr = false;
                 }
-                '\r' => {
-                    // Carriage return: terminal overwrites the line. For
-                    // line-buffer purposes we drop the current partial line so
-                    // the next content replaces it rather than appending.
-                    self.current_line.clear();
+                b'\r' => {
+                    // Defer: just set the flag. If the next byte is \n we
+                    // handle CRLF in the branch above (current_line untouched).
+                    // If the next byte is printable we handle CR-overwrite below.
+                    self.last_was_cr = true;
                 }
-                c if c.is_control() => {
-                    // Skip other control characters (bells, form feeds, etc.).
+                c if c.is_ascii_control() => {
+                    // Skip other control bytes (BEL, FF, etc.).
+                    // Do NOT reset last_was_cr — the flag resolves on next non-control.
                 }
                 c => {
-                    self.current_line.push(c);
+                    if self.last_was_cr {
+                        // A printable byte arrived after a lone \r (no \n followed).
+                        // This is a real carriage-return overwrite (progress bars,
+                        // spinner updates). Clear the line and start fresh.
+                        self.current_line.clear();
+                        self.last_was_cr = false;
+                    }
+                    self.current_line.push(c as char);
                 }
             }
         }
@@ -821,6 +843,7 @@ async fn attach_pane(socket: &Path, session: SessionId, pane_id: PaneId) -> Resu
         scrollback_cap: 10_000,
         scroll_offset: 0,
         current_line: String::new(),
+        last_was_cr: false,
         last_screen_rect: Rect::default(),
         ribbon_chip_rects: Vec::new(),
     })
