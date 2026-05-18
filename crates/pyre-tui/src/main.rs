@@ -706,7 +706,10 @@ async fn attach_pane(socket: &Path, session: SessionId, pane_id: PaneId) -> Resu
     let mut input_frames: tokio_serde::SymmetricallyFramed<_, InputFrame, _> =
         tokio_serde::SymmetricallyFramed::new(frame_write, SymmetricalBincode::default());
 
-    let (net_tx, output_rx) = mpsc::channel::<PaneEvent>(256);
+    // Bug B fix: bumped to 1024 to absorb output bursts without blocking the
+    // net→UI task. The sender uses try_send so a full channel drops the chunk
+    // (output loss) instead of hanging the UI loop (backpressure stall).
+    let (net_tx, output_rx) = mpsc::channel::<PaneEvent>(1024);
     let (input_tx, mut key_rx) = mpsc::channel::<Bytes>(64);
 
     // net → UI
@@ -714,15 +717,21 @@ async fn attach_pane(socket: &Path, session: SessionId, pane_id: PaneId) -> Resu
         while let Some(frame) = output_frames.next().await {
             match frame {
                 Ok(f) => {
-                    if net_tx.send(PaneEvent::Output(f.data)).await.is_err() {
-                        break;
+                    if let Err(e) = net_tx.try_send(PaneEvent::Output(f.data)) {
+                        match e {
+                            mpsc::error::TrySendError::Full(_) => {
+                                // Channel saturated during burst — drop chunk, keep running.
+                                tracing::warn!("net→UI channel full; dropping output chunk");
+                            }
+                            mpsc::error::TrySendError::Closed(_) => break,
+                        }
                     }
                 }
                 Err(_) => break,
             }
         }
         // Stream ended (daemon closed or pane exited) — notify UI.
-        let _ = net_tx.send(PaneEvent::Closed).await;
+        let _ = net_tx.try_send(PaneEvent::Closed);
     });
 
     // UI → net
@@ -820,6 +829,22 @@ fn render_pane(
     } else {
         (None, content_area)
     };
+
+    // Bug A fix: sync parser dimensions to the actual visible area each frame.
+    // If the parser was never resized (e.g. after a split), it still thinks it
+    // is the original full-terminal size and positions output beyond the pane
+    // bounds, producing invisible or overlapping lines.
+    {
+        let target_rows = text_area.height;
+        let target_cols = text_area.width;
+        let (cur_rows, cur_cols) = slot.parser.screen().size();
+        if cur_rows != target_rows || cur_cols != target_cols {
+            slot.parser.set_size(target_rows, target_cols);
+            // TODO: no resize RPC yet — shell still thinks 80x24.
+            // Once a resize_pane control RPC exists in pyre-proto, call it here
+            // (tokio::spawn) so the child pty knows the real viewport dimensions.
+        }
+    }
 
     {
         let screen = slot.parser.screen();
