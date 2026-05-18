@@ -101,4 +101,10 @@ pub trait PyreDaemon {
     async fn open_pane(req: crate::OpenPaneReq) -> Result<PaneId, PyreError>;
     async fn close_pane(pane: PaneId) -> Result<(), PyreError>;
     async fn replay(pane: PaneId, recent_blocks: u32) -> Result<crate::ReplayBlocks, PyreError>;
+    /// Return the decompressed stdout bytes of the last block for a given block id.
+    async fn get_block_stdout(block_id: crate::BlockId) -> Result<Vec<u8>, PyreError>;
+    /// Return the last `lines` lines of a pane's ring buffer with CSI stripped.
+    async fn capture_pane(pane: PaneId, lines: u32) -> Result<Vec<u8>, PyreError>;
+    /// Close all panes in a session and remove it from the registry.
+    async fn close_session(session: SessionId) -> Result<(), PyreError>;
 }

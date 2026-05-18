@@ -55,6 +55,7 @@ use ratatui::widgets::{
 use ratatui::Terminal;
 use regex::Regex;
 
+mod clipboard;
 mod theme;
 use tarpc::client;
 use tarpc::tokio_serde::formats::Bincode;
@@ -368,10 +369,40 @@ impl PaneSlot {
 }
 
 /// Recursive layout tree. Indices reference `AppState::slots`.
+///
+/// HSplit and VSplit children carry a `u16` weight (percentage, summing to 100
+/// across siblings). Initial splits are equal-weight. Drag-resize updates the
+/// weights of neighboring children while clamping each to >=5.
 enum LayoutNode {
     Leaf(usize),
-    HSplit(Vec<LayoutNode>),
-    VSplit(Vec<LayoutNode>),
+    /// Horizontal split (children stacked top-to-bottom). Weights are percentages.
+    HSplit(Vec<(LayoutNode, u16)>),
+    /// Vertical split (children side-by-side). Weights are percentages.
+    VSplit(Vec<(LayoutNode, u16)>),
+}
+
+/// A boundary between two split children — used for drag-resize hit-testing.
+#[derive(Clone)]
+struct SplitBoundary {
+    /// Screen coordinate (column for VSplit, row for HSplit) of the boundary.
+    coord: u16,
+    /// Axis: true = horizontal split (drag row), false = vertical split (drag col).
+    is_hsplit: bool,
+    /// Path to the parent split node.
+    parent_path: Vec<usize>,
+    /// Index of the LEFT/TOP child (the boundary is between child_idx and child_idx+1).
+    child_idx: usize,
+    /// Total size of the parent in the split axis (height for HSplit, width for VSplit).
+    parent_size: u16,
+}
+
+/// Active drag state.
+struct DragState {
+    boundary: SplitBoundary,
+    /// Terminal coordinate (col or row depending on axis) where drag began.
+    start_coord: u16,
+    /// Weights of all children in the parent split at drag start.
+    start_weights: Vec<u16>,
 }
 
 /// One tab, owning a layout tree and a cursor into the focused leaf.
@@ -379,6 +410,12 @@ struct Tab {
     root: LayoutNode,
     /// Path of child indices from `root` down to the active `Leaf`.
     focus_path: Vec<usize>,
+    /// When Some, renders only the leaf at that focus_path filling the body rect.
+    zoomed: Option<Vec<usize>>,
+    /// Boundaries collected during the last render, used for drag-resize hit-test.
+    boundaries: Vec<SplitBoundary>,
+    /// Active drag state (set on mouse-down near a boundary).
+    drag: Option<DragState>,
 }
 
 /// State for the full-text search overlay (Ctrl-B /).
@@ -424,12 +461,12 @@ struct AppState {
 // Layout helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Walk the tree depth-first and collect every (focus_path, slot_index) leaf.
+/// Walk the tree depth-first and collect every focus_path for each leaf.
 fn leaves_in_order(node: &LayoutNode, path: &mut Vec<usize>, out: &mut Vec<Vec<usize>>) {
     match node {
         LayoutNode::Leaf(_) => out.push(path.clone()),
         LayoutNode::HSplit(children) | LayoutNode::VSplit(children) => {
-            for (i, child) in children.iter().enumerate() {
+            for (i, (child, _weight)) in children.iter().enumerate() {
                 path.push(i);
                 leaves_in_order(child, path, out);
                 path.pop();
@@ -444,7 +481,7 @@ fn slot_at(root: &LayoutNode, path: &[usize]) -> Option<usize> {
     for &idx in path {
         match node {
             LayoutNode::HSplit(children) | LayoutNode::VSplit(children) => {
-                node = children.get(idx)?;
+                node = &children.get(idx)?.0;
             }
             LayoutNode::Leaf(_) => return None,
         }
@@ -463,9 +500,29 @@ fn replace_at(root: &mut LayoutNode, path: &[usize], new_node: LayoutNode) {
     }
     match root {
         LayoutNode::HSplit(children) | LayoutNode::VSplit(children) => {
-            replace_at(&mut children[path[0]], &path[1..], new_node);
+            replace_at(&mut children[path[0]].0, &path[1..], new_node);
         }
         LayoutNode::Leaf(_) => {}
+    }
+}
+
+/// Mutably access the children of the split node at `path`.
+fn children_at_mut<'a>(
+    root: &'a mut LayoutNode,
+    path: &[usize],
+) -> Option<&'a mut Vec<(LayoutNode, u16)>> {
+    let mut node = root;
+    for &idx in path {
+        match node {
+            LayoutNode::HSplit(children) | LayoutNode::VSplit(children) => {
+                node = &mut children[idx].0;
+            }
+            LayoutNode::Leaf(_) => return None,
+        }
+    }
+    match node {
+        LayoutNode::HSplit(children) | LayoutNode::VSplit(children) => Some(children),
+        LayoutNode::Leaf(_) => None,
     }
 }
 
@@ -481,22 +538,28 @@ fn collect_leaf_rects(node: &LayoutNode, area: Rect, out: &mut Vec<(usize, Rect)
             out.push((*slot_idx, area));
         }
         LayoutNode::HSplit(children) => {
-            let n = children.len() as u32;
+            let constraints: Vec<Constraint> = children
+                .iter()
+                .map(|(_, w)| Constraint::Percentage(*w))
+                .collect();
             let rects = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints(vec![Constraint::Ratio(1, n); children.len()])
+                .constraints(constraints)
                 .split(area);
-            for (child, rect) in children.iter().zip(rects.iter()) {
+            for ((child, _), rect) in children.iter().zip(rects.iter()) {
                 collect_leaf_rects(child, *rect, out);
             }
         }
         LayoutNode::VSplit(children) => {
-            let n = children.len() as u32;
+            let constraints: Vec<Constraint> = children
+                .iter()
+                .map(|(_, w)| Constraint::Percentage(*w))
+                .collect();
             let rects = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints(vec![Constraint::Ratio(1, n); children.len()])
+                .constraints(constraints)
                 .split(area);
-            for (child, rect) in children.iter().zip(rects.iter()) {
+            for ((child, _), rect) in children.iter().zip(rects.iter()) {
                 collect_leaf_rects(child, *rect, out);
             }
         }
@@ -772,6 +835,7 @@ fn render_layout(
     slots: &mut Vec<PaneSlot>,
     focus_path: &[usize],
     current_path: &mut Vec<usize>,
+    boundaries: &mut Vec<SplitBoundary>,
 ) {
     match node {
         LayoutNode::Leaf(slot_idx) => {
@@ -779,26 +843,70 @@ fn render_layout(
             render_pane(frame, area, &mut slots[*slot_idx], focused);
         }
         LayoutNode::HSplit(children) => {
-            let n = children.len() as u32;
+            let constraints: Vec<Constraint> = children
+                .iter()
+                .map(|(_, w)| Constraint::Percentage(*w))
+                .collect();
             let rects = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints(vec![Constraint::Ratio(1, n); children.len()])
+                .constraints(constraints)
                 .split(area);
-            for (i, (child, rect)) in children.iter().zip(rects.iter()).enumerate() {
+            // Collect horizontal boundaries between children.
+            for i in 0..children.len().saturating_sub(1) {
+                let boundary_row = rects[i].y + rects[i].height;
+                boundaries.push(SplitBoundary {
+                    coord: boundary_row,
+                    is_hsplit: true,
+                    parent_path: current_path.clone(),
+                    child_idx: i,
+                    parent_size: area.height,
+                });
+            }
+            for (i, ((child, _), rect)) in children.iter().zip(rects.iter()).enumerate() {
                 current_path.push(i);
-                render_layout(frame, *rect, child, slots, focus_path, current_path);
+                render_layout(
+                    frame,
+                    *rect,
+                    child,
+                    slots,
+                    focus_path,
+                    current_path,
+                    boundaries,
+                );
                 current_path.pop();
             }
         }
         LayoutNode::VSplit(children) => {
-            let n = children.len() as u32;
+            let constraints: Vec<Constraint> = children
+                .iter()
+                .map(|(_, w)| Constraint::Percentage(*w))
+                .collect();
             let rects = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints(vec![Constraint::Ratio(1, n); children.len()])
+                .constraints(constraints)
                 .split(area);
-            for (i, (child, rect)) in children.iter().zip(rects.iter()).enumerate() {
+            // Collect vertical boundaries between children.
+            for i in 0..children.len().saturating_sub(1) {
+                let boundary_col = rects[i].x + rects[i].width;
+                boundaries.push(SplitBoundary {
+                    coord: boundary_col,
+                    is_hsplit: false,
+                    parent_path: current_path.clone(),
+                    child_idx: i,
+                    parent_size: area.width,
+                });
+            }
+            for (i, ((child, _), rect)) in children.iter().zip(rects.iter()).enumerate() {
                 current_path.push(i);
-                render_layout(frame, *rect, child, slots, focus_path, current_path);
+                render_layout(
+                    frame,
+                    *rect,
+                    child,
+                    slots,
+                    focus_path,
+                    current_path,
+                    boundaries,
+                );
                 current_path.pop();
             }
         }
@@ -948,30 +1056,41 @@ fn draw_frame(
         );
 
         // Body — render active tab's layout
-        let focus_path = state.tabs[state.active_tab].focus_path.clone();
-        let mut current_path: Vec<usize> = Vec::new();
-        // We need to borrow tab.root immutably and slots mutably.
-        // Split the borrow: reborrow root reference after extracting what we need.
         let active_tab_idx = state.active_tab;
-        // SAFETY: we only borrow root via a raw pointer to avoid the simultaneous
-        // mutable borrow of slots. This is safe because render_layout only reads
-        // `root` and mutates `slots` at disjoint indices.
+        let focus_path = state.tabs[active_tab_idx].focus_path.clone();
+        let zoomed = state.tabs[active_tab_idx].zoomed.clone();
+        let mut new_boundaries: Vec<SplitBoundary> = Vec::new();
+
+        // SAFETY: we only borrow root/zoomed via a raw pointer to avoid the
+        // simultaneous mutable borrow of slots. render_layout only reads `root`
+        // and mutates `slots` at disjoint indices; no mutation of `tabs` occurs.
         let root_ptr: *const LayoutNode = &state.tabs[active_tab_idx].root;
-        // SAFETY: root_ptr is valid for the duration of this closure; no mutation
-        // of `tabs` occurs during render_layout.
-        render_layout(
-            frame,
-            body_area,
-            unsafe { &*root_ptr },
-            &mut state.slots,
-            &focus_path,
-            &mut current_path,
-        );
+
+        if let Some(ref zoom_path) = zoomed {
+            // Zoom mode: render only the zoomed leaf filling body_area.
+            if let Some(slot_idx) = slot_at(unsafe { &*root_ptr }, zoom_path) {
+                let focused = true;
+                render_pane(frame, body_area, &mut state.slots[slot_idx], focused);
+            }
+        } else {
+            let mut current_path: Vec<usize> = Vec::new();
+            render_layout(
+                frame,
+                body_area,
+                unsafe { &*root_ptr },
+                &mut state.slots,
+                &focus_path,
+                &mut current_path,
+                &mut new_boundaries,
+            );
+        }
+        state.tabs[active_tab_idx].boundaries = new_boundaries;
 
         // Status bar — two segments + optional middle message.
         {
             let tab = &state.tabs[state.active_tab];
             let focused_slot = slot_at(&tab.root, &tab.focus_path);
+            let is_zoomed = tab.zoomed.is_some();
 
             // Determine mode label and mid message.
             let (mode_label, mid_msg) = if state.search.open {
@@ -1012,7 +1131,7 @@ fn draw_frame(
                 format!(" ● {:.8} ", state.session.0.to_string())
             };
 
-            // Right: mode indicator
+            // Right: mode indicator + optional ZOOM chip
             let right_text = format!(" {mode_label} ");
 
             let mut status_spans: Vec<Span> = vec![Span::styled(left_text, EMBER.status())];
@@ -1024,6 +1143,15 @@ fn draw_frame(
             }
             // Spacer to push mode to right — approximate with bg fill.
             status_spans.push(Span::styled(" ", Style::default().bg(EMBER.surface)));
+            if is_zoomed {
+                status_spans.push(Span::styled(
+                    " ZOOM ",
+                    Style::default()
+                        .fg(EMBER.bg)
+                        .bg(EMBER.primary)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
             status_spans.push(Span::styled(
                 right_text,
                 Style::default()
@@ -1097,6 +1225,8 @@ async fn split_active(state: &mut AppState, horizontal: bool) -> Result<()> {
     state.slots.push(slot);
 
     let tab = &mut state.tabs[state.active_tab];
+    // Clear zoom before splitting.
+    tab.zoomed = None;
     let old_path = tab.focus_path.clone();
 
     // Find the existing leaf slot index at the current focus path.
@@ -1105,15 +1235,16 @@ async fn split_active(state: &mut AppState, horizontal: bool) -> Result<()> {
         None => return Ok(()), // nothing to split
     };
 
+    // Equal 50/50 weights for a two-child split.
     let new_node = if horizontal {
         LayoutNode::HSplit(vec![
-            LayoutNode::Leaf(old_slot_idx),
-            LayoutNode::Leaf(new_slot_idx),
+            (LayoutNode::Leaf(old_slot_idx), 50),
+            (LayoutNode::Leaf(new_slot_idx), 50),
         ])
     } else {
         LayoutNode::VSplit(vec![
-            LayoutNode::Leaf(old_slot_idx),
-            LayoutNode::Leaf(new_slot_idx),
+            (LayoutNode::Leaf(old_slot_idx), 50),
+            (LayoutNode::Leaf(new_slot_idx), 50),
         ])
     };
 
@@ -1152,6 +1283,9 @@ async fn open_new_tab(state: &mut AppState) -> Result<()> {
     state.tabs.push(Tab {
         root: LayoutNode::Leaf(slot_idx),
         focus_path: vec![],
+        zoomed: None,
+        boundaries: Vec::new(),
+        drag: None,
     });
     state.active_tab = state.tabs.len() - 1;
 
@@ -1188,7 +1322,6 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
 
     match me.kind {
         MouseEventKind::ScrollUp => {
-            // Find the pane under the cursor and scroll it up.
             let mut leaf_rects: Vec<(usize, Rect)> = Vec::new();
             collect_leaf_rects(
                 &state.tabs[state.active_tab].root,
@@ -1197,7 +1330,6 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
             );
             for (slot_idx, rect) in &leaf_rects {
                 if rect_contains(*rect, col, row) {
-                    // Focus and scroll.
                     focus_slot(state, *slot_idx);
                     let slot = &mut state.slots[*slot_idx];
                     let max_offset = slot.scrollback.len();
@@ -1232,6 +1364,34 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
                     return true;
                 }
             }
+
+            // Check if clicking near a split boundary to start a drag.
+            let tab = &mut state.tabs[state.active_tab];
+            for boundary in tab.boundaries.clone() {
+                let hit = if boundary.is_hsplit {
+                    row.abs_diff(boundary.coord) <= 1
+                } else {
+                    col.abs_diff(boundary.coord) <= 1
+                };
+                if hit {
+                    let start_coord = if boundary.is_hsplit { row } else { col };
+                    // Capture current weights from the parent node.
+                    let start_weights: Vec<u16> = if let Some(children) =
+                        children_at_mut(&mut tab.root, &boundary.parent_path)
+                    {
+                        children.iter().map(|(_, w)| *w).collect()
+                    } else {
+                        continue;
+                    };
+                    tab.drag = Some(DragState {
+                        boundary,
+                        start_coord,
+                        start_weights,
+                    });
+                    return true;
+                }
+            }
+
             // Check if clicking inside a leaf pane.
             let mut leaf_rects: Vec<(usize, Rect)> = Vec::new();
             collect_leaf_rects(
@@ -1244,6 +1404,48 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
                     focus_slot(state, *slot_idx);
                     return true;
                 }
+            }
+            false
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            let tab = &mut state.tabs[state.active_tab];
+            if let Some(ref drag) = tab.drag {
+                let cur_coord = if drag.boundary.is_hsplit { row } else { col };
+                let delta = cur_coord as i32 - drag.start_coord as i32;
+                let parent_size = drag.boundary.parent_size.max(1) as i32;
+                let delta_pct = (delta * 100) / parent_size;
+                let idx = drag.boundary.child_idx;
+                let mut new_weights = drag.start_weights.clone();
+
+                if idx + 1 < new_weights.len() {
+                    let left = new_weights[idx] as i32 + delta_pct;
+                    let right = new_weights[idx + 1] as i32 - delta_pct;
+                    // Clamp: each child must keep at least 5%.
+                    let left = left.clamp(5, (left + right - 5).max(5)) as u16;
+                    let right = (new_weights[idx] as i32 + new_weights[idx + 1] as i32
+                        - left as i32)
+                        .clamp(5, i32::MAX) as u16;
+                    new_weights[idx] = left;
+                    new_weights[idx + 1] = right;
+
+                    let parent_path = drag.boundary.parent_path.clone();
+                    if let Some(children) = children_at_mut(&mut tab.root, &parent_path) {
+                        for (i, w) in new_weights.iter().enumerate() {
+                            if i < children.len() {
+                                children[i].1 = *w;
+                            }
+                        }
+                    }
+                }
+                return true;
+            }
+            false
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            let tab = &mut state.tabs[state.active_tab];
+            if tab.drag.is_some() {
+                tab.drag = None;
+                return true;
             }
             false
         }
@@ -1284,6 +1486,9 @@ async fn run_tui(
         tabs: vec![Tab {
             root: LayoutNode::Leaf(0),
             focus_path: vec![],
+            zoomed: None,
+            boundaries: Vec::new(),
+            drag: None,
         }],
         active_tab: 0,
         control,
@@ -1469,6 +1674,56 @@ async fn run_tui(
                             state.search.pending_query = None;
                             state.search.rx = None;
                             state.status_msg = None;
+                        }
+
+                        // Zoom toggle (Ctrl-B z)
+                        KeyCode::Char('z') => {
+                            let tab = &mut state.tabs[state.active_tab];
+                            if tab.zoomed.is_some() {
+                                tab.zoomed = None;
+                            } else {
+                                tab.zoomed = Some(tab.focus_path.clone());
+                            }
+                        }
+
+                        // Copy last block stdout to clipboard (Ctrl-B y)
+                        KeyCode::Char('y') => {
+                            let tab = &state.tabs[state.active_tab];
+                            if let Some(slot_idx) = slot_at(&tab.root, &tab.focus_path) {
+                                let slot = &state.slots[slot_idx];
+                                if let Some(last_block) = slot.recent_blocks.last() {
+                                    let block_id = last_block.id;
+                                    match state
+                                        .control
+                                        .get_block_stdout(tarpc::context::current(), block_id)
+                                        .await
+                                    {
+                                        Ok(Ok(bytes)) => {
+                                            let text = String::from_utf8_lossy(&bytes);
+                                            match clipboard::copy_to_clipboard(&text) {
+                                                Ok(()) => {
+                                                    state.status_msg =
+                                                        Some("copied to clipboard".to_owned());
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!("clipboard: {e}");
+                                                    state.status_msg =
+                                                        Some(format!("clipboard error: {e}"));
+                                                }
+                                            }
+                                        }
+                                        Ok(Err(e)) => {
+                                            state.status_msg =
+                                                Some(format!("get_block_stdout rpc: {e}"));
+                                        }
+                                        Err(e) => {
+                                            state.status_msg = Some(format!("rpc transport: {e}"));
+                                        }
+                                    }
+                                } else {
+                                    state.status_msg = Some("no blocks".to_owned());
+                                }
+                            }
                         }
 
                         // All other prefix keys consumed silently
