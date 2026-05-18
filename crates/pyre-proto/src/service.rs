@@ -126,6 +126,8 @@ pub trait PyreDaemon {
     /// Bypasses the stream protocol to avoid the race where the socket closes
     /// before the async stream task forwards the InputFrame to pane.input_tx.
     async fn send_keys(pane: PaneId, bytes: Vec<u8>) -> Result<(), PyreError>;
+    /// Resize the PTY of a pane to the given dimensions.
+    async fn resize_pane(req: crate::ResizePaneReq) -> Result<crate::ResizePaneRes, PyreError>;
 }
 
 /// Process metadata returned by `inspect_pid`.
