@@ -35,6 +35,7 @@ async fn run_smoke() -> anyhow::Result<()> {
 
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_pyred"))
         .env("XDG_RUNTIME_DIR", tmpdir.path())
+        .env("PYRE_DATA_DIR", tmpdir.path())
         .stderr(std::process::Stdio::piped())
         .spawn()?;
 

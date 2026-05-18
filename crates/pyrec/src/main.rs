@@ -2,12 +2,24 @@
 //! puts the local TTY in raw mode, and bridges stdio.
 //!
 //! Without a subcommand: spawn new session+pane, then attach.
-//! `sessions`  — list active sessions.
-//! `panes`     — list panes in a session.
-//! `attach`    — attach to an existing session/pane.
-//! `new-pane`  — open a new pane in a session (no attach).
-//! `list`      — list recent blocks.
-//! `search`    — linear-scan search across stdout blobs.
+//! `sessions`        — list active sessions.
+//! `panes`           — list panes in a session.
+//! `attach`          — attach to an existing session/pane.
+//! `new-pane`        — open a new pane in a session (no attach).
+//! `list`            — list recent blocks.
+//! `search`          — linear-scan search across stdout blobs.
+//! `capture-pane`    — capture last N lines of a pane's ring buffer.
+//!
+//! tmux-compat aliases (mapped to pyre RPCs):
+//! `list-sessions`   → sessions
+//! `list-panes`      → panes
+//! `list-windows`    → panes (tmux windows ≈ pyre panes for MVP)
+//! `new-session`     → spawn (optionally detached)
+//! `kill-session`    → close_session RPC
+//! `send-keys`       → write bytes to pane via stream connection
+//! `split-window`    → open_pane (layout managed by TUI)
+//! `select-pane`     → stub (TUI-only)
+//! `display-message` → print to stderr
 
 use std::path::{Path, PathBuf};
 
@@ -92,6 +104,103 @@ enum Sub {
         query: String,
         #[arg(long, default_value_t = 20)]
         limit: u32,
+    },
+
+    /// Capture the last N lines of a pane's ring buffer (CSI stripped)
+    CapturePane {
+        /// Pane id or ≥8-char prefix
+        pane: String,
+        /// Session id or ≥8-char prefix (required to resolve pane prefix)
+        #[arg(long)]
+        session: Option<String>,
+        /// Number of lines to capture (default 50)
+        #[arg(short = 'N', long, default_value_t = 50)]
+        lines: u32,
+        /// Print to stdout (default: print to stdout)
+        #[arg(short, long)]
+        pipe: bool,
+    },
+
+    // ── tmux-compat aliases ────────────────────────────────────────────────────
+    /// [tmux compat] List active sessions
+    #[command(name = "list-sessions")]
+    ListSessions,
+
+    /// [tmux compat] List panes in a session
+    #[command(name = "list-panes")]
+    ListPanes {
+        /// Target session: id or ≥8-char prefix (-t <session>)
+        #[arg(short = 't')]
+        target: String,
+    },
+
+    /// [tmux compat] List windows — mapped to panes for MVP
+    #[command(name = "list-windows")]
+    ListWindows {
+        /// Target session: id or ≥8-char prefix (-t <session>)
+        #[arg(short = 't')]
+        target: String,
+    },
+
+    /// [tmux compat] Create a new session (optionally detached)
+    #[command(name = "new-session")]
+    NewSession {
+        /// Session name (informational; stored in session metadata)
+        #[arg(short = 's')]
+        name: Option<String>,
+        /// Detach immediately after spawn (do not attach)
+        #[arg(short = 'd')]
+        detach: bool,
+    },
+
+    /// [tmux compat] Kill a session
+    #[command(name = "kill-session")]
+    KillSession {
+        /// Target session: id or ≥8-char prefix (-t <session>)
+        #[arg(short = 't')]
+        target: String,
+    },
+
+    /// [tmux compat] Send keys to a pane
+    #[command(name = "send-keys")]
+    SendKeys {
+        /// Target pane id or ≥8-char prefix (-t <pane>)
+        #[arg(short = 't')]
+        target: String,
+        /// Text to send (multiple args joined by space)
+        keys: Vec<String>,
+        /// Append a newline (Enter) after the keys
+        #[arg(long)]
+        enter: bool,
+    },
+
+    /// [tmux compat] Split a pane (opens a new pane; TUI manages layout)
+    #[command(name = "split-window")]
+    SplitWindow {
+        /// Target session: id or ≥8-char prefix (-t <session>)
+        #[arg(short = 't')]
+        target: String,
+        /// Horizontal split (ignored for spawn, layout is TUI-managed)
+        #[arg(short = 'h')]
+        horizontal: bool,
+        /// Vertical split (ignored for spawn, layout is TUI-managed)
+        #[arg(short = 'v')]
+        vertical: bool,
+    },
+
+    /// [tmux compat] Select (focus) a pane — stub; focus is TUI-managed
+    #[command(name = "select-pane")]
+    SelectPane {
+        /// Target pane id or ≥8-char prefix (-t <pane>)
+        #[arg(short = 't')]
+        target: String,
+    },
+
+    /// [tmux compat] Display a message on stderr
+    #[command(name = "display-message")]
+    DisplayMessage {
+        /// Message to print
+        message: String,
     },
 }
 
@@ -474,6 +583,168 @@ async fn run_search(socket: PathBuf, query: String, limit: u32) -> Result<()> {
     Ok(())
 }
 
+async fn run_capture_pane(
+    socket: PathBuf,
+    pane_prefix: String,
+    session_prefix: Option<String>,
+    lines: u32,
+    _pipe: bool,
+) -> Result<()> {
+    let client = control_client(&socket).await?;
+
+    // Resolve the pane id. If a session prefix is given we search that session's
+    // panes; otherwise we scan all sessions for a matching pane.
+    let pane_id = if let Some(ref sp) = session_prefix {
+        let session = resolve_session(&client, sp).await?;
+        resolve_pane(&client, session, &pane_prefix).await?
+    } else {
+        // Enumerate all sessions and find a matching pane.
+        let sessions = client
+            .list_sessions(tarpc::context::current())
+            .await
+            .context("rpc transport")?
+            .map_err(|e| anyhow!("daemon list_sessions: {e}"))?;
+
+        let mut found: Option<PaneId> = None;
+        'outer: for s in sessions {
+            let panes = client
+                .list_panes(tarpc::context::current(), s.id)
+                .await
+                .context("rpc transport")?
+                .map_err(|e| anyhow!("daemon list_panes: {e}"))?;
+            for p in panes {
+                if p.id.0.to_string().starts_with(&pane_prefix) {
+                    found = Some(p.id);
+                    break 'outer;
+                }
+            }
+        }
+        found.ok_or_else(|| anyhow!("no pane matches prefix '{pane_prefix}'"))?
+    };
+
+    let bytes = client
+        .capture_pane(tarpc::context::current(), pane_id, lines)
+        .await
+        .context("rpc transport")?
+        .map_err(|e| anyhow!("daemon capture_pane: {e}"))?;
+
+    let text = String::from_utf8_lossy(&bytes);
+    print!("{text}");
+    if !text.ends_with('\n') {
+        println!();
+    }
+    Ok(())
+}
+
+async fn run_kill_session(socket: PathBuf, target: String) -> Result<()> {
+    let client = control_client(&socket).await?;
+    let session = resolve_session(&client, &target).await?;
+    client
+        .close_session(tarpc::context::current(), session)
+        .await
+        .context("rpc transport")?
+        .map_err(|e| anyhow!("daemon close_session: {e}"))
+}
+
+async fn run_send_keys(
+    socket: PathBuf,
+    pane_prefix: String,
+    keys: Vec<String>,
+    append_enter: bool,
+) -> Result<()> {
+    let client = control_client(&socket).await?;
+
+    // Resolve pane by scanning all sessions.
+    let sessions = client
+        .list_sessions(tarpc::context::current())
+        .await
+        .context("rpc transport")?
+        .map_err(|e| anyhow!("daemon list_sessions: {e}"))?;
+
+    let mut found_session: Option<SessionId> = None;
+    let mut found_pane: Option<PaneId> = None;
+    'outer: for s in sessions {
+        let panes = client
+            .list_panes(tarpc::context::current(), s.id)
+            .await
+            .context("rpc transport")?
+            .map_err(|e| anyhow!("daemon list_panes: {e}"))?;
+        for p in panes {
+            if p.id.0.to_string().starts_with(&pane_prefix) {
+                found_session = Some(s.id);
+                found_pane = Some(p.id);
+                break 'outer;
+            }
+        }
+    }
+    let session = found_session.ok_or_else(|| anyhow!("no pane matches prefix '{pane_prefix}'"))?;
+    let pane_id = found_pane.expect("set together with session");
+
+    // Open a stream connection and write the keys then close.
+    let mut stream_sock = tokio::net::UnixStream::connect(&socket)
+        .await
+        .with_context(|| format!("connect stream {}", socket.display()))?;
+    stream_sock.write_all(&[MODE_STREAM]).await?;
+    stream_sock.write_all(session.0.as_bytes()).await?;
+    stream_sock.write_all(pane_id.0.as_bytes()).await?;
+
+    use futures::SinkExt;
+    let (rd, wr) = stream_sock.into_split();
+    let frame_read =
+        tokio_util::codec::FramedRead::new(rd, tokio_util::codec::LengthDelimitedCodec::new());
+    let frame_write =
+        tokio_util::codec::FramedWrite::new(wr, tokio_util::codec::LengthDelimitedCodec::new());
+    let mut _output_frames: tokio_serde::SymmetricallyFramed<
+        _,
+        OutputFrame,
+        tokio_serde::formats::SymmetricalBincode<OutputFrame>,
+    > = tokio_serde::SymmetricallyFramed::new(
+        frame_read,
+        tokio_serde::formats::SymmetricalBincode::default(),
+    );
+    let mut input_frames: tokio_serde::SymmetricallyFramed<_, InputFrame, _> =
+        tokio_serde::SymmetricallyFramed::new(
+            frame_write,
+            tokio_serde::formats::SymmetricalBincode::default(),
+        );
+
+    let mut text = keys.join(" ");
+    if append_enter {
+        text.push('\n');
+    }
+    input_frames
+        .send(InputFrame {
+            session,
+            data: bytes::Bytes::from(text.into_bytes()),
+        })
+        .await
+        .map_err(|e| anyhow!("send keys: {e}"))?;
+
+    drop(input_frames);
+    Ok(())
+}
+
+async fn run_split_window(socket: PathBuf, session_prefix: String) -> Result<()> {
+    let client = control_client(&socket).await?;
+    let session = resolve_session(&client, &session_prefix).await?;
+    let (cols, rows) = term_size();
+    let req = OpenPaneReq {
+        session,
+        shell: std::env::var("SHELL").ok(),
+        cwd: std::env::current_dir().ok(),
+        cols,
+        rows,
+        env: std::env::vars().collect(),
+    };
+    let pane_id = client
+        .open_pane(tarpc::context::current(), req)
+        .await
+        .context("rpc transport")?
+        .map_err(|e| anyhow!("daemon open_pane: {e}"))?;
+    println!("{}", pane_id.0);
+    Ok(())
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Entry point
 // ──────────────────────────────────────────────────────────────────────────────
@@ -492,8 +763,10 @@ async fn main() -> Result<()> {
 
     match cli.command {
         None => run_default(sock_path, cli.shell).await,
-        Some(Sub::Sessions) => run_sessions(sock_path).await,
-        Some(Sub::Panes { session }) => run_panes(sock_path, session).await,
+        Some(Sub::Sessions) | Some(Sub::ListSessions) => run_sessions(sock_path).await,
+        Some(Sub::Panes { session })
+        | Some(Sub::ListPanes { target: session })
+        | Some(Sub::ListWindows { target: session }) => run_panes(sock_path, session).await,
         Some(Sub::Attach { session, pane }) => run_attach_cmd(sock_path, session, pane).await,
         Some(Sub::NewPane {
             session,
@@ -503,5 +776,58 @@ async fn main() -> Result<()> {
         }) => run_new_pane(sock_path, session, shell, cols, rows).await,
         Some(Sub::List { limit }) => run_list(sock_path, limit).await,
         Some(Sub::Search { query, limit }) => run_search(sock_path, query, limit).await,
+        Some(Sub::CapturePane {
+            pane,
+            session,
+            lines,
+            pipe,
+        }) => run_capture_pane(sock_path, pane, session, lines, pipe).await,
+        Some(Sub::NewSession { name: _, detach }) => {
+            let client = control_client(&sock_path).await?;
+            let (cols, rows) = term_size();
+            let shell = cli
+                .shell
+                .or_else(|| std::env::var("SHELL").ok())
+                .or_else(|| {
+                    for c in ["/bin/bash", "/bin/sh"] {
+                        if std::path::Path::new(c).exists() {
+                            return Some(c.to_owned());
+                        }
+                    }
+                    None
+                });
+            let req = SpawnReq {
+                shell,
+                cwd: std::env::current_dir().ok(),
+                cols,
+                rows,
+                env: std::env::vars().collect(),
+            };
+            let SpawnResp { session, pane } = client
+                .spawn(tarpc::context::current(), req)
+                .await
+                .context("rpc transport")?
+                .map_err(|e| anyhow!("daemon spawn: {e}"))?;
+            println!("{}", session.0);
+            if !detach {
+                run_attach(&sock_path, session, pane).await?;
+            }
+            Ok(())
+        }
+        Some(Sub::KillSession { target }) => run_kill_session(sock_path, target).await,
+        Some(Sub::SendKeys {
+            target,
+            keys,
+            enter,
+        }) => run_send_keys(sock_path, target, keys, enter).await,
+        Some(Sub::SplitWindow { target, .. }) => run_split_window(sock_path, target).await,
+        Some(Sub::SelectPane { target }) => {
+            eprintln!("select-pane: pane focus is TUI-managed; target={target}");
+            Ok(())
+        }
+        Some(Sub::DisplayMessage { message }) => {
+            eprintln!("{message}");
+            Ok(())
+        }
     }
 }

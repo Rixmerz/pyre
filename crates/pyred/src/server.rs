@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use pyre_proto::{
-    AttachAck, Block, BlockHit, ListBlocksReq, OpenPaneReq, PaneId, PaneInfo, PyreError,
+    AttachAck, Block, BlockHit, BlockId, ListBlocksReq, OpenPaneReq, PaneId, PaneInfo, PyreError,
     ReplayBlocks, SearchBlocksReq, SessionId, SessionInfo, SpawnReq, SpawnResp,
 };
 use tarpc::context;
@@ -182,5 +182,62 @@ impl pyre_proto::service::PyreDaemon for DaemonImpl {
             .await
             .map_err(|e| PyreError::Io(e.to_string()))?;
         Ok(ReplayBlocks { recent, snapshot })
+    }
+
+    async fn get_block_stdout(
+        self,
+        _ctx: context::Context,
+        block_id: BlockId,
+    ) -> Result<Vec<u8>, PyreError> {
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || store.read_block_stdout(block_id))
+            .await
+            .map_err(|e| PyreError::Io(e.to_string()))?
+            .map_err(|e| PyreError::Io(e.to_string()))
+    }
+
+    async fn capture_pane(
+        self,
+        _ctx: context::Context,
+        pane: PaneId,
+        lines: u32,
+    ) -> Result<Vec<u8>, PyreError> {
+        use regex::Regex;
+        use std::sync::OnceLock;
+
+        static ANSI_RE: OnceLock<Regex> = OnceLock::new();
+        let re = ANSI_RE.get_or_init(|| {
+            Regex::new(r"\x1b\[[\x20-\x3f]*[\x40-\x7e]").expect("static regex is valid")
+        });
+
+        let (_session, pane_state) = self
+            .registry
+            .get_pane(pane)
+            .await
+            .ok_or(PyreError::NoSuchPane(pane))?;
+
+        let snapshot = {
+            let rb = pane_state.ringbuf.lock().expect("ringbuf poisoned");
+            rb.snapshot()
+        };
+
+        let lossy = String::from_utf8_lossy(&snapshot);
+        let stripped = re.replace_all(&lossy, "");
+        let all_lines: Vec<&str> = stripped.split('\n').collect();
+        let take = (lines as usize).min(all_lines.len());
+        let tail_lines = &all_lines[all_lines.len().saturating_sub(take)..];
+        let joined = tail_lines.join("\n");
+        Ok(joined.into_bytes())
+    }
+
+    async fn close_session(
+        self,
+        _ctx: context::Context,
+        session: SessionId,
+    ) -> Result<(), PyreError> {
+        self.registry
+            .kill_session(session)
+            .await
+            .map_err(|_| PyreError::NoSuchSession(session))
     }
 }

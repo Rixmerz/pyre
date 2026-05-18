@@ -169,6 +169,20 @@ impl Store {
         row.map(row_to_block).transpose()
     }
 
+    /// Read and decompress the stdout blob for a block. Returns empty vec if blob does not exist.
+    pub fn read_block_stdout(&self, id: pyre_proto::BlockId) -> Result<Vec<u8>> {
+        let path = self.blob_path_for(id);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let file =
+            std::fs::File::open(&path).with_context(|| format!("open blob {}", path.display()))?;
+        let mut dec = zstd::Decoder::new(file)?;
+        let mut out = Vec::new();
+        std::io::Read::read_to_end(&mut dec, &mut out)?;
+        Ok(out)
+    }
+
     pub async fn list_blocks_for_pane(&self, pane: PaneId, limit: u32) -> Result<Vec<Block>> {
         let rows = sqlx::query(
             "SELECT id, pane_id, session_id, command, started_at, ended_at, exit_code, cwd, stdout_len
