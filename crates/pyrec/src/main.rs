@@ -12,8 +12,8 @@ use bytes::Bytes;
 use clap::Parser;
 use futures::{SinkExt, StreamExt};
 use pyre_proto::{
-    BlockHit, InputFrame, ListBlocksReq, OutputFrame, PyreDaemonClient, SearchBlocksReq, SessionId,
-    SpawnReq, MODE_CONTROL, MODE_STREAM,
+    BlockHit, InputFrame, ListBlocksReq, OutputFrame, PyreDaemonClient, SearchBlocksReq, SpawnReq,
+    SpawnResp, MODE_CONTROL, MODE_STREAM,
 };
 use tarpc::client;
 use tarpc::tokio_serde::formats::Bincode;
@@ -155,7 +155,7 @@ async fn run_attach(socket: PathBuf, shell: Option<String>) -> Result<()> {
         rows,
         env: std::env::vars().collect(),
     };
-    let session: SessionId = client_obj
+    let SpawnResp { session, pane } = client_obj
         .spawn(tarpc::context::current(), req)
         .await
         .context("rpc transport")?
@@ -167,6 +167,7 @@ async fn run_attach(socket: PathBuf, shell: Option<String>) -> Result<()> {
         .with_context(|| format!("connect stream {}", socket.display()))?;
     stream_sock.write_all(&[MODE_STREAM]).await?;
     stream_sock.write_all(session.0.as_bytes()).await?;
+    stream_sock.write_all(pane.0.as_bytes()).await?;
 
     let (rd, wr) = stream_sock.into_split();
 

@@ -2,11 +2,13 @@
 
 pub mod blocks;
 pub mod service;
+pub mod sessions;
 pub use blocks::{BlockEvent, BlockHit, ListBlocksReq, SearchBlocksReq};
 pub use service::{
     AttachAck, InputFrame, OutputFrame, PyreDaemon, PyreDaemonClient, PyreError, SpawnReq,
     MODE_CONTROL, MODE_STREAM,
 };
+pub use sessions::{OpenPaneReq, PaneInfo, ReplayBlocks, SessionInfo, SpawnResp};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

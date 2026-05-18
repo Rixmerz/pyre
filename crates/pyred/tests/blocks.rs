@@ -19,7 +19,7 @@ use futures::{SinkExt, StreamExt};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use pyre_proto::{
-    InputFrame, ListBlocksReq, OutputFrame, PyreDaemonClient, SearchBlocksReq, SpawnReq,
+    InputFrame, ListBlocksReq, OutputFrame, PyreDaemonClient, SearchBlocksReq, SpawnReq, SpawnResp,
     MODE_CONTROL, MODE_STREAM,
 };
 use tarpc::client;
@@ -104,7 +104,7 @@ async fn run_blocks_test() -> anyhow::Result<()> {
     );
     let rpc_client = PyreDaemonClient::new(client::Config::default(), transport).spawn();
 
-    let session = rpc_client
+    let SpawnResp { session, pane } = rpc_client
         .spawn(
             tarpc::context::current(),
             SpawnReq {
@@ -123,6 +123,7 @@ async fn run_blocks_test() -> anyhow::Result<()> {
     let mut stream_sock = UnixStream::connect(&sock_path).await?;
     stream_sock.write_all(&[MODE_STREAM]).await?;
     stream_sock.write_all(session.0.as_bytes()).await?;
+    stream_sock.write_all(pane.0.as_bytes()).await?;
 
     let (rd, wr) = stream_sock.into_split();
     let frame_read = FramedRead::new(rd, LengthDelimitedCodec::new());

@@ -8,7 +8,9 @@ use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
-use pyre_proto::{InputFrame, OutputFrame, PyreDaemonClient, SpawnReq, MODE_CONTROL, MODE_STREAM};
+use pyre_proto::{
+    InputFrame, OutputFrame, PyreDaemonClient, SpawnReq, SpawnResp, MODE_CONTROL, MODE_STREAM,
+};
 use tarpc::client;
 use tarpc::tokio_serde::formats::Bincode;
 use tokio::io::AsyncWriteExt;
@@ -58,7 +60,7 @@ async fn run_smoke() -> anyhow::Result<()> {
     );
     let rpc_client = PyreDaemonClient::new(client::Config::default(), transport).spawn();
 
-    let session = rpc_client
+    let SpawnResp { session, pane } = rpc_client
         .spawn(
             tarpc::context::current(),
             SpawnReq {
@@ -77,6 +79,7 @@ async fn run_smoke() -> anyhow::Result<()> {
     let mut stream_sock = UnixStream::connect(&sock_path).await?;
     stream_sock.write_all(&[MODE_STREAM]).await?;
     stream_sock.write_all(session.0.as_bytes()).await?;
+    stream_sock.write_all(pane.0.as_bytes()).await?;
 
     let (rd, wr) = stream_sock.into_split();
     let frame_read = FramedRead::new(rd, LengthDelimitedCodec::new());
