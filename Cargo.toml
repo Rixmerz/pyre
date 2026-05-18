@@ -6,6 +6,7 @@ members = [
     "crates/pyrec",
     "crates/pyre-tui",
     "crates/pyre-gpu",
+    "crates/pyre-mcp",
 ]
 
 [workspace.package]
