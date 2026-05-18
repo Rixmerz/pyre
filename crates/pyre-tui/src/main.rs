@@ -974,17 +974,22 @@ fn render_pane(
         };
 
         let height = text_area.height as usize;
-        let total = slot.scrollback.len();
-        // The bottom of the visible window is `total - scroll_offset` lines from top.
-        let window_end = total.saturating_sub(slot.scroll_offset);
+        // Include current_line (in-flight, no trailing \n yet) in the virtual buffer
+        // so scroll_offset=1 doesn't make the bottom row disappear.
+        let has_partial = !slot.current_line.is_empty();
+        let virtual_total = slot.scrollback.len() + usize::from(has_partial);
+        let offset = slot.scroll_offset.min(virtual_total);
+        let window_end = virtual_total.saturating_sub(offset);
         let window_start = window_end.saturating_sub(height);
 
         let lines: Vec<Line> = slot
             .scrollback
             .iter()
+            .map(|s| s.as_str())
+            .chain(std::iter::once(slot.current_line.as_str()).filter(|_| has_partial))
             .skip(window_start)
-            .take(height)
-            .map(|l| Line::from(l.as_str()))
+            .take(window_end - window_start)
+            .map(Line::from)
             .collect();
 
         frame.render_widget(Paragraph::new(lines), text_area);
@@ -1018,7 +1023,7 @@ fn render_pane(
         }
 
         if let Some(sb_rect) = sb_area {
-            let mut sb_state = ScrollbarState::new(total).position(window_end);
+            let mut sb_state = ScrollbarState::new(virtual_total).position(window_end);
             frame.render_stateful_widget(
                 Scrollbar::new(ScrollbarOrientation::VerticalRight)
                     .style(EMBER.border())
@@ -1489,19 +1494,21 @@ fn draw_frame(
                 }
             }
 
-            // [+] button at far right.
+            // [+] button immediately after the last label (browser-style).
             let plus_label = "[+]";
             let plus_len = plus_label.len() as u16;
-            let plus_x = sessions_area.x + sessions_area.width.saturating_sub(plus_len);
-            let plus_rect = if sessions_area.height > 0 {
+            // x_cursor now points to the cell right after the last session label.
+            let plus_x = x_cursor;
+            let plus_rect = if sessions_area.height > 0
+                && plus_x + plus_len <= sessions_area.x + sessions_area.width
+            {
                 Some(Rect::new(plus_x, sessions_area.y, plus_len, 1))
             } else {
                 None
             };
-            spans.push(Span::styled(
-                " ".repeat(plus_x.saturating_sub(x_cursor) as usize),
-                Style::default().bg(EMBER.bg),
-            ));
+            if !spans.is_empty() {
+                spans.push(Span::styled(" ", Style::default().bg(EMBER.bg)));
+            }
             spans.push(Span::styled(plus_label, EMBER.tab_inactive()));
 
             state.session_strip_rects = new_session_rects;
@@ -1536,19 +1543,19 @@ fn draw_frame(
                 }
             }
 
-            // [+] button at far right.
+            // [+] button immediately after the last tab label (browser-style).
             let plus_label = "[+]";
             let plus_len = plus_label.len() as u16;
-            let plus_x = tabs_area.x + tabs_area.width.saturating_sub(plus_len);
-            let plus_rect = if tabs_area.height > 0 {
-                Some(Rect::new(plus_x, tabs_area.y, plus_len, 1))
-            } else {
-                None
-            };
-            spans.push(Span::styled(
-                " ".repeat(plus_x.saturating_sub(x_cursor) as usize),
-                Style::default().bg(EMBER.bg),
-            ));
+            let plus_x = x_cursor;
+            let plus_rect =
+                if tabs_area.height > 0 && plus_x + plus_len <= tabs_area.x + tabs_area.width {
+                    Some(Rect::new(plus_x, tabs_area.y, plus_len, 1))
+                } else {
+                    None
+                };
+            if !spans.is_empty() {
+                spans.push(Span::styled(" ", Style::default().bg(EMBER.bg)));
+            }
             spans.push(Span::styled(plus_label, EMBER.tab_inactive()));
 
             state.tab_plus_rect = plus_rect;
@@ -1946,7 +1953,8 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
                 if rect_contains(*rect, col, row) {
                     focus_slot(state, *slot_idx);
                     if let Some(slot) = state.slots[*slot_idx].as_mut() {
-                        let max_offset = slot.scrollback.len();
+                        let max_offset =
+                            slot.scrollback.len() + usize::from(!slot.current_line.is_empty());
                         slot.scroll_offset = (slot.scroll_offset + 3).min(max_offset);
                     }
                     return true;
@@ -2831,7 +2839,8 @@ async fn run_tui(
                         if let Some(slot) = state.slots[slot_idx].as_mut() {
                             match code {
                                 KeyCode::PageUp => {
-                                    let max_offset = slot.scrollback.len();
+                                    let max_offset = slot.scrollback.len()
+                                        + usize::from(!slot.current_line.is_empty());
                                     slot.scroll_offset =
                                         (slot.scroll_offset + half_page).min(max_offset);
                                     continue;
