@@ -116,4 +116,19 @@ pub trait PyreDaemon {
     ) -> Result<(), PyreError>;
     /// List all panes across all sessions (convenience for clients that iterate sessions).
     async fn list_all_panes() -> Result<Vec<crate::PaneInfo>, PyreError>;
+    /// Return process metadata for the foreground PID of a pane (Linux-only).
+    async fn inspect_pid(pane: PaneId) -> Result<PidInspect, PyreError>;
+}
+
+/// Process metadata returned by `inspect_pid`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PidInspect {
+    pub pid: u32,
+    pub comm: String,
+    /// First ≤50 environment variables; values truncated to 80 chars.
+    pub env: Vec<(String, String)>,
+    /// Resolved symlinks from /proc/{pid}/fd (≤50 entries).
+    pub fds: Vec<String>,
+    /// Direct child PIDs.
+    pub children: Vec<u32>,
 }

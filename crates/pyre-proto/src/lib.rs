@@ -5,8 +5,8 @@ pub mod service;
 pub mod sessions;
 pub use blocks::{BlockEvent, BlockHit, ListBlocksReq, SearchBlocksReq};
 pub use service::{
-    AttachAck, InputFrame, OutputFrame, PyreDaemon, PyreDaemonClient, PyreError, SpawnReq,
-    MODE_CONTROL, MODE_STREAM,
+    AttachAck, InputFrame, OutputFrame, PidInspect, PyreDaemon, PyreDaemonClient, PyreError,
+    SpawnReq, MODE_CONTROL, MODE_STREAM,
 };
 pub use sessions::{OpenPaneReq, PaneInfo, PaneStateKind, ReplayBlocks, SessionInfo, SpawnResp};
 

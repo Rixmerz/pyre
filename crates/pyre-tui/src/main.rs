@@ -41,8 +41,8 @@ use futures::SinkExt;
 use futures::StreamExt;
 use pyre_proto::{
     blocks::{BlockHit, SearchBlocksReq},
-    Block, InputFrame, OpenPaneReq, OutputFrame, PaneId, PyreDaemonClient, SessionId, SpawnReq,
-    SpawnResp, MODE_CONTROL, MODE_STREAM,
+    Block, InputFrame, OpenPaneReq, OutputFrame, PaneId, PidInspect, PyreDaemonClient, SessionId,
+    SpawnReq, SpawnResp, MODE_CONTROL, MODE_STREAM,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -326,6 +326,8 @@ struct PaneSlot {
     current_line: String,
     /// The screen rect captured during the last render, used for mouse hit-test.
     last_screen_rect: Rect,
+    /// Ribbon chip rects captured during last render: (block_idx, rect).
+    ribbon_chip_rects: Vec<(usize, Rect)>,
 }
 
 impl PaneSlot {
@@ -444,6 +446,114 @@ impl Default for SearchState {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Drag-selection types
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+#[allow(dead_code)]
+enum SelectionBase {
+    Live,
+    Scrollback(usize), // window_top line index into scrollback
+}
+
+#[derive(Clone)]
+#[allow(dead_code)]
+struct Selection {
+    pane_idx: usize,
+    /// (row, col) relative to the pane's vt100/content area, viewport-relative.
+    start: (u16, u16),
+    end: (u16, u16),
+    dragging: bool,
+    base: SelectionBase,
+}
+
+#[allow(dead_code)]
+impl Selection {
+    fn normalized(&self) -> ((u16, u16), (u16, u16)) {
+        let (sr, sc) = self.start;
+        let (er, ec) = self.end;
+        if (sr, sc) <= (er, ec) {
+            ((sr, sc), (er, ec))
+        } else {
+            ((er, ec), (sr, sc))
+        }
+    }
+
+    fn contains(&self, row: u16, col: u16) -> bool {
+        let ((r0, c0), (r1, c1)) = self.normalized();
+        if row < r0 || row > r1 {
+            return false;
+        }
+        if row == r0 && col < c0 {
+            return false;
+        }
+        if row == r1 && col > c1 {
+            return false;
+        }
+        true
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Click tracker (for double/triple-click detection)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[allow(dead_code)]
+struct ClickTracker {
+    last_at: Instant,
+    last_pos: (u16, u16), // (col, row) in terminal coordinates
+    count: u8,
+    pane_idx: usize,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Right-click context menu
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum MenuItem {
+    Copy,
+    KillPane,
+    SplitH,
+    SplitV,
+    ZoomToggle,
+    InspectPid,
+}
+
+#[allow(dead_code)]
+impl MenuItem {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Copy => " Copy",
+            Self::KillPane => " Kill pane",
+            Self::SplitH => " Split horizontal",
+            Self::SplitV => " Split vertical",
+            Self::ZoomToggle => " Zoom toggle",
+            Self::InspectPid => " Inspect PID",
+        }
+    }
+}
+
+#[allow(dead_code)]
+const MENU_ITEMS: &[MenuItem] = &[
+    MenuItem::Copy,
+    MenuItem::KillPane,
+    MenuItem::SplitH,
+    MenuItem::SplitV,
+    MenuItem::ZoomToggle,
+    MenuItem::InspectPid,
+];
+
+#[allow(dead_code)]
+struct ContextMenu {
+    rect: Rect,
+    cursor: usize,
+    target_slot: usize,
+}
+
+#[allow(dead_code)]
 struct AppState {
     session: SessionId,
     slots: Vec<PaneSlot>,
@@ -465,6 +575,14 @@ struct AppState {
     sidebar_cursor: usize,
     /// Whether the sidebar panel has keyboard focus.
     sidebar_focused: bool,
+    /// Active text selection (drag or click-to-select).
+    selection: Option<Selection>,
+    /// State for double/triple-click detection.
+    last_click: Option<ClickTracker>,
+    /// Right-click context menu state.
+    context_menu: Option<ContextMenu>,
+    /// PID inspect overlay data.
+    pid_inspect: Option<PidInspect>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -646,6 +764,7 @@ async fn attach_pane(socket: &Path, session: SessionId, pane_id: PaneId) -> Resu
         scroll_offset: 0,
         current_line: String::new(),
         last_screen_rect: Rect::default(),
+        ribbon_chip_rects: Vec::new(),
     })
 }
 
@@ -653,7 +772,15 @@ async fn attach_pane(socket: &Path, session: SessionId, pane_id: PaneId) -> Resu
 // Rendering
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn render_pane(frame: &mut ratatui::Frame, area: Rect, slot: &mut PaneSlot, focused: bool) {
+#[allow(clippy::too_many_arguments)]
+fn render_pane(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    slot: &mut PaneSlot,
+    focused: bool,
+    selection: Option<&Selection>,
+    slot_idx: usize,
+) {
     let short8: String = slot.pane_id.0.to_string().chars().take(8).collect();
     let border_block = if focused {
         RatatuiBlock::default()
@@ -739,6 +866,32 @@ fn render_pane(frame: &mut ratatui::Frame, area: Rect, slot: &mut PaneSlot, focu
         }
 
         frame.render_widget(Paragraph::new(lines), vt_area);
+
+        // Overlay selection highlight on live view.
+        if let Some(sel) = selection {
+            if sel.pane_idx == slot_idx {
+                if let SelectionBase::Live = sel.base {
+                    let ((r0, c0), (r1, c1)) = sel.normalized();
+                    for row in r0..=r1.min(vt_area.height.saturating_sub(1)) {
+                        let col_start = if row == r0 { c0 } else { 0 };
+                        let col_end = if row == r1 {
+                            c1.min(vt_area.width.saturating_sub(1))
+                        } else {
+                            vt_area.width.saturating_sub(1)
+                        };
+                        for col in col_start..=col_end {
+                            let sx = vt_area.x + col;
+                            let sy = vt_area.y + row;
+                            if sx < vt_area.x + vt_area.width && sy < vt_area.y + vt_area.height {
+                                if let Some(cell) = frame.buffer_mut().cell_mut((sx, sy)) {
+                                    cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     } else {
         // ── Scrollback render ──
         // Reserve 1 column on the right for the scrollbar.
@@ -768,6 +921,34 @@ fn render_pane(frame: &mut ratatui::Frame, area: Rect, slot: &mut PaneSlot, focu
 
         frame.render_widget(Paragraph::new(lines), text_area);
 
+        // Overlay selection highlight on scrollback view.
+        if let Some(sel) = selection {
+            if sel.pane_idx == slot_idx {
+                if let SelectionBase::Scrollback(_) = sel.base {
+                    let ((r0, c0), (r1, c1)) = sel.normalized();
+                    for row in r0..=r1.min(text_area.height.saturating_sub(1)) {
+                        let col_start = if row == r0 { c0 } else { 0 };
+                        let col_end = if row == r1 {
+                            c1.min(text_area.width.saturating_sub(1))
+                        } else {
+                            text_area.width.saturating_sub(1)
+                        };
+                        for col in col_start..=col_end {
+                            let sx = text_area.x + col;
+                            let sy = text_area.y + row;
+                            if sx < text_area.x + text_area.width
+                                && sy < text_area.y + text_area.height
+                            {
+                                if let Some(cell) = frame.buffer_mut().cell_mut((sx, sy)) {
+                                    cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if let Some(sb_rect) = sb_area {
             let mut sb_state = ScrollbarState::new(total).position(window_end);
             frame.render_stateful_widget(
@@ -787,7 +968,11 @@ fn render_pane(frame: &mut ratatui::Frame, area: Rect, slot: &mut PaneSlot, focu
 }
 
 /// Render the one-line block ribbon inside `area`.
-fn render_ribbon(frame: &mut ratatui::Frame, area: Rect, slot: &PaneSlot) {
+/// Captures chip rects into `slot.ribbon_chip_rects` for mouse hit-test.
+fn render_ribbon(frame: &mut ratatui::Frame, area: Rect, slot: &mut PaneSlot) {
+    // Clear chip rects from the previous frame.
+    slot.ribbon_chip_rects.clear();
+
     if slot.recent_blocks.is_empty() {
         let p =
             Paragraph::new(" (no blocks)").style(Style::default().fg(EMBER.text_dim).bg(EMBER.bg));
@@ -801,6 +986,9 @@ fn render_ribbon(frame: &mut ratatui::Frame, area: Rect, slot: &PaneSlot) {
     let highlight_idx = slot.ribbon_cursor.unwrap_or(latest_idx);
 
     let mut spans: Vec<Span> = Vec::new();
+    // Track x offset for chip rect calculation.
+    let mut x_offset: u16 = area.x;
+
     for (i, b) in slot.recent_blocks.iter().enumerate() {
         let short4: String = b.id.0.to_string().chars().take(4).collect();
 
@@ -811,13 +999,28 @@ fn render_ribbon(frame: &mut ratatui::Frame, area: Rect, slot: &PaneSlot) {
             None => (EMBER.spark, "●"),
         };
 
+        let sep = if i > 0 { "│" } else { "" };
         let chip_text = format!("{live_prefix}▎b{short4}");
+        let sep_len = sep.chars().count() as u16;
+        let chip_len = chip_text.chars().count() as u16;
+
+        // Record rect for this chip (separator not included in clickable area).
+        if area.height > 0 && x_offset + sep_len < area.x + area.width {
+            slot.ribbon_chip_rects.push((
+                i,
+                Rect::new(
+                    x_offset + sep_len,
+                    area.y,
+                    chip_len.min((area.x + area.width).saturating_sub(x_offset + sep_len)),
+                    1,
+                ),
+            ));
+        }
+        x_offset += sep_len + chip_len;
 
         let chip_style = if i == highlight_idx && !is_live {
-            // Selected in scrollback cursor mode.
             EMBER.selection()
         } else if i == latest_idx && is_live {
-            // Latest block in live mode.
             Style::default()
                 .fg(EMBER.bg)
                 .bg(EMBER.primary)
@@ -838,6 +1041,7 @@ fn render_ribbon(frame: &mut ratatui::Frame, area: Rect, slot: &PaneSlot) {
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_layout(
     frame: &mut ratatui::Frame,
     area: Rect,
@@ -846,11 +1050,19 @@ fn render_layout(
     focus_path: &[usize],
     current_path: &mut Vec<usize>,
     boundaries: &mut Vec<SplitBoundary>,
+    selection: Option<&Selection>,
 ) {
     match node {
         LayoutNode::Leaf(slot_idx) => {
             let focused = current_path == focus_path;
-            render_pane(frame, area, &mut slots[*slot_idx], focused);
+            render_pane(
+                frame,
+                area,
+                &mut slots[*slot_idx],
+                focused,
+                selection,
+                *slot_idx,
+            );
         }
         LayoutNode::HSplit(children) => {
             let constraints: Vec<Constraint> = children
@@ -882,6 +1094,7 @@ fn render_layout(
                     focus_path,
                     current_path,
                     boundaries,
+                    selection,
                 );
                 current_path.pop();
             }
@@ -916,6 +1129,7 @@ fn render_layout(
                     focus_path,
                     current_path,
                     boundaries,
+                    selection,
                 );
                 current_path.pop();
             }
@@ -1160,7 +1374,14 @@ fn draw_frame(
             // Zoom mode: render only the zoomed leaf filling pane_body_area.
             if let Some(slot_idx) = slot_at(unsafe { &*root_ptr }, zoom_path) {
                 let focused = true;
-                render_pane(frame, pane_body_area, &mut state.slots[slot_idx], focused);
+                render_pane(
+                    frame,
+                    pane_body_area,
+                    &mut state.slots[slot_idx],
+                    focused,
+                    state.selection.as_ref(),
+                    slot_idx,
+                );
             }
         } else {
             let mut current_path: Vec<usize> = Vec::new();
@@ -1172,6 +1393,7 @@ fn draw_frame(
                 &focus_path,
                 &mut current_path,
                 &mut new_boundaries,
+                state.selection.as_ref(),
             );
         }
         state.tabs[active_tab_idx].boundaries = new_boundaries;
@@ -1591,6 +1813,10 @@ async fn run_tui(
         sidebar_last_poll: Instant::now() - Duration::from_secs(10),
         sidebar_cursor: 0,
         sidebar_focused: false,
+        selection: None,
+        last_click: None,
+        context_menu: None,
+        pid_inspect: None,
     };
 
     let _guard = TermGuard::enter()?;

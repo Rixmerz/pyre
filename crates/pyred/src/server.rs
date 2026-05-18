@@ -271,4 +271,23 @@ impl pyre_proto::service::PyreDaemon for DaemonImpl {
     async fn list_all_panes(self, _ctx: context::Context) -> Result<Vec<PaneInfo>, PyreError> {
         Ok(self.registry.list_all_panes().await)
     }
+
+    async fn inspect_pid(
+        self,
+        _ctx: context::Context,
+        pane: PaneId,
+    ) -> Result<pyre_proto::PidInspect, PyreError> {
+        let (_session, pane_state) = self
+            .registry
+            .get_pane(pane)
+            .await
+            .ok_or(PyreError::NoSuchPane(pane))?;
+
+        let pid = pane_state
+            .state_tracker
+            .lock()
+            .map(|t| t.root_pid)
+            .unwrap_or(0);
+        Ok(crate::inspect::inspect_pid(pid))
+    }
 }
