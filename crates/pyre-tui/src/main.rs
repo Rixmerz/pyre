@@ -2256,6 +2256,44 @@ fn close_focused_pane(state: &mut AppState) {
         None => return,
     };
 
+    // Special case: root itself is the only leaf (no splits).  remove_leaf
+    // returns the slot index but cannot mutate root in this case, so
+    // leaves_in_order would still find the leaf and the tab-removal branch
+    // would never fire.  Bypass remove_leaf and go straight to tab removal.
+    let root_is_leaf = focus_path.is_empty()
+        && matches!(
+            &state.sessions[sess_idx].tabs[tab_idx].root,
+            LayoutNode::Leaf(_)
+        );
+
+    if root_is_leaf {
+        if slot_idx < state.slots.len() {
+            state.slots[slot_idx] = None;
+        }
+        state.sessions[sess_idx].tabs.remove(tab_idx);
+        if state.sessions[sess_idx].tabs.is_empty() {
+            state.sessions.remove(sess_idx);
+            if state.sessions.is_empty() {
+                return;
+            }
+            state.active_session = state.active_session.min(state.sessions.len() - 1);
+        } else {
+            state.sessions[sess_idx].active_tab =
+                tab_idx.min(state.sessions[sess_idx].tabs.len() - 1);
+            let new_tab_idx = state.sessions[sess_idx].active_tab;
+            let mut paths: Vec<Vec<usize>> = Vec::new();
+            let mut t: Vec<usize> = Vec::new();
+            leaves_in_order(
+                &state.sessions[sess_idx].tabs[new_tab_idx].root,
+                &mut t,
+                &mut paths,
+            );
+            state.sessions[sess_idx].tabs[new_tab_idx].focus_path =
+                paths.into_iter().next().unwrap_or_default();
+        }
+        return;
+    }
+
     // Remove the leaf from the layout tree.
     let removed = remove_leaf(
         &mut state.sessions[sess_idx].tabs[tab_idx].root,
