@@ -1,0 +1,14 @@
+#!/usr/bin/make -f
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build --release --locked
+
+override_dh_auto_install:
+	for bin in pyred pyrec pyre-tui pyre-mcp; do \
+		install -Dm755 target/release/$$bin \
+			debian/pyre/usr/bin/$$bin; \
+	done
+	install -Dm644 dist/systemd/pyred.service \
+		debian/pyre/usr/lib/systemd/user/pyred.service

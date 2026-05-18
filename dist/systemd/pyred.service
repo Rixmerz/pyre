@@ -1,0 +1,11 @@
+[Unit]
+Description=pyre terminal multiplexer daemon
+After=default.target
+
+[Service]
+ExecStart=/usr/bin/pyred
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,18 @@
+Source: pyre
+Section: utils
+Priority: optional
+Maintainer: pyre contributors <noreply@example.com>
+Build-Depends: debhelper-compat (= 13), cargo, rustc
+Standards-Version: 4.6.2
+Homepage: https://github.com/<TODO>/pyre
+Rules-Requires-Root: no
+
+Package: pyre
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Recommends: wl-clipboard | xclip
+Description: Daemon-owned terminal multiplexer with block model and agent observability
+ pyre is a Linux-first terminal multiplexer built around a persistent daemon
+ (pyred) that owns PTYs and survives client disconnects. Every command is a
+ Block: persisted to SQLite, searchable via Tantivy, and exposed to AI agents
+ through an MCP server.

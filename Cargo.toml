@@ -46,3 +46,10 @@ crossterm = "0.29"
 tantivy = "0.26"
 toml = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[profile.release-prod]
+inherits = "release"
+strip = true
+lto = "fat"
+opt-level = 3
+codegen-units = 1

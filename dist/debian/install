@@ -1,0 +1,5 @@
+target/release/pyred usr/bin
+target/release/pyrec usr/bin
+target/release/pyre-tui usr/bin
+target/release/pyre-mcp usr/bin
+dist/systemd/pyred.service usr/lib/systemd/user
