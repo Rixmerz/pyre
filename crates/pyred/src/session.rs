@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 
 use crate::pty::spawn_pty;
+use crate::state::PaneStateTracker;
 use crate::store::Store;
 
 pub struct PaneState {
@@ -31,6 +32,8 @@ pub struct PaneState {
     pub input_tx: mpsc::Sender<Bytes>,
     child: Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
     pub ringbuf: Arc<StdMutex<crate::ringbuf::RingBuf>>,
+    /// State tracker — updated by output path and parser; polled by state engine.
+    pub state_tracker: Arc<StdMutex<PaneStateTracker>>,
 }
 
 impl PaneState {
@@ -48,6 +51,7 @@ impl PaneState {
         input_tx: mpsc::Sender<Bytes>,
         child: Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
         ringbuf: Arc<StdMutex<crate::ringbuf::RingBuf>>,
+        state_tracker: Arc<StdMutex<PaneStateTracker>>,
     ) -> Self {
         Self {
             id,
@@ -63,6 +67,7 @@ impl PaneState {
             input_tx,
             child,
             ringbuf,
+            state_tracker,
         }
     }
 }
@@ -201,18 +206,40 @@ impl SessionRegistry {
             return vec![];
         };
         let panes = s.panes.lock().await;
-        panes
-            .values()
-            .map(|p| PaneInfo {
-                id: p.id,
-                session: p.session,
-                cols: p.cols,
-                rows: p.rows,
-                shell: p.shell.clone(),
-                created_at: p.created_at,
-                closed_at: None, // panes in the map are live; closed ones are removed
-            })
-            .collect()
+        panes.values().map(pane_info_from_state).collect()
+    }
+
+    /// List all panes across all sessions (convenience; avoids N client RPCs).
+    pub async fn list_all_panes(&self) -> Vec<PaneInfo> {
+        let sessions = self.sessions.lock().await;
+        let mut out = Vec::new();
+        for s in sessions.values() {
+            let panes = s.panes.lock().await;
+            for p in panes.values() {
+                out.push(pane_info_from_state(p));
+            }
+        }
+        out
+    }
+
+    /// Return `(session_id, pane_id, tracker_arc)` for every live pane.
+    /// Used by the state engine tick task.
+    pub async fn all_trackers(
+        &self,
+    ) -> Vec<(
+        pyre_proto::SessionId,
+        pyre_proto::PaneId,
+        Arc<StdMutex<PaneStateTracker>>,
+    )> {
+        let sessions = self.sessions.lock().await;
+        let mut out = Vec::new();
+        for s in sessions.values() {
+            let panes = s.panes.lock().await;
+            for p in panes.values() {
+                out.push((s.id, p.id, p.state_tracker.clone()));
+            }
+        }
+        out
     }
 
     /// Kill and remove all panes for a session. Used by server kill().
@@ -239,5 +266,36 @@ impl SessionRegistry {
     /// Used by shutdown path in main.rs.
     pub async fn all_sessions(&self) -> Vec<Arc<SessionState>> {
         self.sessions.lock().await.values().cloned().collect()
+    }
+}
+
+/// Build a `PaneInfo` from a live `PaneState`, reading the tracker under lock.
+fn pane_info_from_state(p: &Arc<PaneState>) -> PaneInfo {
+    let (state, reason, last_activity, foreground_cmd, root_pid) = {
+        let t = p.state_tracker.lock().expect("tracker poisoned");
+        let last_activity = chrono::Utc::now()
+            - chrono::Duration::from_std(t.last_output_at.elapsed())
+                .unwrap_or(chrono::Duration::zero());
+        (
+            t.state,
+            t.reason.clone(),
+            last_activity,
+            t.foreground_cmd.clone(),
+            t.root_pid,
+        )
+    };
+    PaneInfo {
+        id: p.id,
+        session: p.session,
+        cols: p.cols,
+        rows: p.rows,
+        shell: p.shell.clone(),
+        created_at: p.created_at,
+        closed_at: None,
+        state,
+        state_reason: reason,
+        last_activity,
+        foreground_cmd,
+        root_pid,
     }
 }

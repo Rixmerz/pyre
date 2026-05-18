@@ -28,8 +28,8 @@ use bytes::Bytes;
 use clap::Parser;
 use futures::{SinkExt, StreamExt};
 use pyre_proto::{
-    BlockHit, InputFrame, ListBlocksReq, OpenPaneReq, OutputFrame, PaneId, PyreDaemonClient,
-    SearchBlocksReq, SessionId, SpawnReq, SpawnResp, MODE_CONTROL, MODE_STREAM,
+    BlockHit, InputFrame, ListBlocksReq, OpenPaneReq, OutputFrame, PaneId, PaneStateKind,
+    PyreDaemonClient, SearchBlocksReq, SessionId, SpawnReq, SpawnResp, MODE_CONTROL, MODE_STREAM,
 };
 use tarpc::client;
 use tarpc::tokio_serde::formats::Bincode;
@@ -119,6 +119,16 @@ enum Sub {
         /// Print to stdout (default: print to stdout)
         #[arg(short, long)]
         pipe: bool,
+    },
+
+    /// Show pane state summary (colored table)
+    Status {
+        /// Show only panes in WaitingInput state
+        #[arg(long)]
+        waiting: bool,
+        /// Emit JSON array of PaneInfo instead of a table
+        #[arg(long)]
+        json: bool,
     },
 
     // ── tmux-compat aliases ────────────────────────────────────────────────────
@@ -636,6 +646,101 @@ async fn run_capture_pane(
     Ok(())
 }
 
+async fn run_status(socket: PathBuf, waiting: bool, json: bool) -> Result<()> {
+    use std::io::IsTerminal;
+
+    let client = control_client(&socket).await?;
+    let panes = client
+        .list_all_panes(tarpc::context::current())
+        .await
+        .context("rpc transport")?
+        .map_err(|e| anyhow!("daemon list_all_panes: {e}"))?;
+
+    let panes: Vec<_> = if waiting {
+        panes
+            .into_iter()
+            .filter(|p| p.state == PaneStateKind::WaitingInput)
+            .collect()
+    } else {
+        panes
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&panes)?);
+        return Ok(());
+    }
+
+    let is_tty = std::io::stdout().is_terminal();
+
+    // Color codes (only when stdout is a TTY).
+    let reset = if is_tty { "\x1b[0m" } else { "" };
+    let dim = if is_tty { "\x1b[2m" } else { "" };
+
+    fn state_color(state: PaneStateKind, is_tty: bool) -> &'static str {
+        if !is_tty {
+            return "";
+        }
+        match state {
+            PaneStateKind::Running => "\x1b[32m",      // green
+            PaneStateKind::WaitingInput => "\x1b[33m", // yellow
+            PaneStateKind::Idle => "\x1b[2m",          // dim
+            PaneStateKind::Interactive => "\x1b[36m",  // cyan
+            PaneStateKind::Crashed => "\x1b[31m",      // red
+            PaneStateKind::Done => "\x1b[2m",          // dim
+        }
+    }
+
+    fn state_dot(state: PaneStateKind) -> char {
+        match state {
+            PaneStateKind::Running => '●',
+            PaneStateKind::WaitingInput => '◎',
+            PaneStateKind::Idle => '○',
+            PaneStateKind::Interactive => '◆',
+            PaneStateKind::Crashed => '✗',
+            PaneStateKind::Done => '◦',
+        }
+    }
+
+    // Header
+    println!(
+        "{dim}{:<8}  {:<8}  {:<11}  {:<14}  {:<16}  PID{reset}",
+        "SESSION", "PANE", "STATE", "LAST ACTIVITY", "FOREGROUND",
+    );
+
+    for p in &panes {
+        let sess_short = &p.session.0.to_string()[..8];
+        let pane_short = &p.id.0.to_string()[..8];
+        let state_str = format!(
+            "{}{} {}{}",
+            state_color(p.state, is_tty),
+            state_dot(p.state),
+            p.state,
+            reset
+        );
+        let elapsed = {
+            let secs = (chrono::Utc::now() - p.last_activity).num_seconds().max(0);
+            if secs < 60 {
+                format!("{secs}s ago")
+            } else if secs < 3600 {
+                format!("{}m ago", secs / 60)
+            } else {
+                format!("{}h ago", secs / 3600)
+            }
+        };
+        let fg = p.foreground_cmd.as_deref().unwrap_or("-");
+        println!(
+            "{sess_short}  {pane_short}  {state_str:<20}  {elapsed:<14}  {fg:<16}  {}",
+            p.root_pid
+        );
+    }
+
+    if panes.is_empty() {
+        println!("no panes");
+    }
+
+    Ok(())
+}
+
 async fn run_kill_session(socket: PathBuf, target: String) -> Result<()> {
     let client = control_client(&socket).await?;
     let session = resolve_session(&client, &target).await?;
@@ -774,6 +879,7 @@ async fn main() -> Result<()> {
             cols,
             rows,
         }) => run_new_pane(sock_path, session, shell, cols, rows).await,
+        Some(Sub::Status { waiting, json }) => run_status(sock_path, waiting, json).await,
         Some(Sub::List { limit }) => run_list(sock_path, limit).await,
         Some(Sub::Search { query, limit }) => run_search(sock_path, query, limit).await,
         Some(Sub::CapturePane {

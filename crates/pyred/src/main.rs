@@ -6,12 +6,14 @@
 //!   * `0x02` stream  — 16-byte SessionId then bidirectional
 //!     length-delimited bincode `OutputFrame`/`InputFrame`
 
+mod hooks;
 mod index;
 mod parser;
 mod pty;
 mod ringbuf;
 mod server;
 mod session;
+mod state;
 mod store;
 mod stream;
 
@@ -30,9 +32,11 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tracing_subscriber::EnvFilter;
 
+use crate::hooks::HooksConfig;
 use crate::index::BlockIndex;
 use crate::server::DaemonImpl;
 use crate::session::SessionRegistry;
+use crate::state::spawn_state_engine;
 use crate::store::Store;
 
 fn socket_path() -> PathBuf {
@@ -107,6 +111,10 @@ async fn main() -> Result<()> {
     );
 
     let registry = Arc::new(SessionRegistry::new());
+
+    // Load hooks config and start the state engine.
+    let hooks = Arc::new(HooksConfig::load());
+    let _state_engine = spawn_state_engine(registry.clone(), hooks.clone());
 
     let shutdown_path = path.clone();
     let shutdown_registry = registry.clone();

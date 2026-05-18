@@ -455,6 +455,16 @@ struct AppState {
     search: SearchState,
     /// One-line status message shown when action feedback is needed.
     status_msg: Option<String>,
+    /// Whether the sidebar is visible.
+    sidebar_open: bool,
+    /// Cached pane info for sidebar display.
+    sidebar_data: Vec<pyre_proto::PaneInfo>,
+    /// Last time sidebar data was fetched.
+    sidebar_last_poll: Instant,
+    /// Selected row index within the sidebar.
+    sidebar_cursor: usize,
+    /// Whether the sidebar panel has keyboard focus.
+    sidebar_focused: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -999,6 +1009,71 @@ fn render_search_overlay(frame: &mut ratatui::Frame, app: &AppState) {
     frame.render_stateful_widget(list, results_area, &mut list_state);
 }
 
+fn state_dot_char(state: pyre_proto::PaneStateKind) -> char {
+    use pyre_proto::PaneStateKind::*;
+    match state {
+        Running => '●',
+        WaitingInput => '◎',
+        Idle => '○',
+        Interactive => '◆',
+        Crashed => '✗',
+        Done => '◦',
+    }
+}
+
+fn state_dot_color(state: pyre_proto::PaneStateKind) -> Color {
+    use pyre_proto::PaneStateKind::*;
+    match state {
+        Running => EMBER.ok,
+        WaitingInput => EMBER.spark,
+        Idle | Done => EMBER.text_dim,
+        Interactive => EMBER.info,
+        Crashed => EMBER.err,
+    }
+}
+
+fn render_sidebar(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
+    let block = RatatuiBlock::default()
+        .borders(Borders::RIGHT)
+        .border_type(BorderType::Rounded)
+        .style(EMBER.bg_style())
+        .title(Span::styled(" panes ", EMBER.title(EMBER.primary)));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let items: Vec<ListItem> = state
+        .sidebar_data
+        .iter()
+        .enumerate()
+        .take(inner.height as usize)
+        .map(|(i, info)| {
+            let dot = state_dot_char(info.state);
+            let dot_color = state_dot_color(info.state);
+            let id_str = info.id.0.to_string();
+            let pane_short = &id_str[..8.min(id_str.len())];
+            let fg = info.foreground_cmd.as_deref().unwrap_or("-");
+            let row_style = if i == state.sidebar_cursor && state.sidebar_focused {
+                Style::default()
+                    .fg(EMBER.bg)
+                    .bg(EMBER.primary)
+                    .add_modifier(Modifier::BOLD)
+            } else if i == state.sidebar_cursor {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default().fg(EMBER.text)
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled("  ", row_style),
+                Span::styled(dot.to_string(), Style::default().fg(dot_color)),
+                Span::styled(format!(" {pane_short} {fg}"), row_style),
+            ]))
+        })
+        .collect();
+
+    let list = List::new(items).style(EMBER.bg_style());
+    frame.render_widget(list, inner);
+}
+
 fn draw_frame(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     state: &mut AppState,
@@ -1055,7 +1130,22 @@ fn draw_frame(
             tab_area,
         );
 
-        // Body — render active tab's layout
+        // Body — optionally split horizontally for sidebar.
+        let (sidebar_area_opt, pane_body_area) = if state.sidebar_open {
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(24), Constraint::Min(0)])
+                .split(body_area);
+            (Some(cols[0]), cols[1])
+        } else {
+            (None, body_area)
+        };
+
+        if let Some(sbar_area) = sidebar_area_opt {
+            render_sidebar(frame, sbar_area, state);
+        }
+
+        // Render active tab's layout in the remaining area.
         let active_tab_idx = state.active_tab;
         let focus_path = state.tabs[active_tab_idx].focus_path.clone();
         let zoomed = state.tabs[active_tab_idx].zoomed.clone();
@@ -1067,16 +1157,16 @@ fn draw_frame(
         let root_ptr: *const LayoutNode = &state.tabs[active_tab_idx].root;
 
         if let Some(ref zoom_path) = zoomed {
-            // Zoom mode: render only the zoomed leaf filling body_area.
+            // Zoom mode: render only the zoomed leaf filling pane_body_area.
             if let Some(slot_idx) = slot_at(unsafe { &*root_ptr }, zoom_path) {
                 let focused = true;
-                render_pane(frame, body_area, &mut state.slots[slot_idx], focused);
+                render_pane(frame, pane_body_area, &mut state.slots[slot_idx], focused);
             }
         } else {
             let mut current_path: Vec<usize> = Vec::new();
             render_layout(
                 frame,
-                body_area,
+                pane_body_area,
                 unsafe { &*root_ptr },
                 &mut state.slots,
                 &focus_path,
@@ -1496,6 +1586,11 @@ async fn run_tui(
         shell,
         search: SearchState::default(),
         status_msg: None,
+        sidebar_open: false,
+        sidebar_data: Vec::new(),
+        sidebar_last_poll: Instant::now() - Duration::from_secs(10),
+        sidebar_cursor: 0,
+        sidebar_focused: false,
     };
 
     let _guard = TermGuard::enter()?;
@@ -1566,6 +1661,22 @@ async fn run_tui(
             if let Ok(hits) = rx.try_recv() {
                 state.search.results = hits;
                 state.search.cursor = 0;
+            }
+        }
+
+        // Sidebar poll — 1s when open, up to 50 panes.
+        if state.sidebar_open && state.sidebar_last_poll.elapsed() >= Duration::from_secs(1) {
+            state.sidebar_last_poll = Instant::now();
+            if let Ok(Ok(mut panes)) = state
+                .control
+                .list_all_panes(tarpc::context::current())
+                .await
+            {
+                panes.truncate(50);
+                state.sidebar_data = panes;
+                state.sidebar_cursor = state
+                    .sidebar_cursor
+                    .min(state.sidebar_data.len().saturating_sub(1));
             }
         }
 
@@ -1726,6 +1837,18 @@ async fn run_tui(
                             }
                         }
 
+                        // Toggle sidebar (Ctrl-B s)
+                        KeyCode::Char('s') => {
+                            state.sidebar_open = !state.sidebar_open;
+                            if state.sidebar_open {
+                                state.sidebar_focused = true;
+                                // Force immediate poll.
+                                state.sidebar_last_poll = Instant::now() - Duration::from_secs(10);
+                            } else {
+                                state.sidebar_focused = false;
+                            }
+                        }
+
                         // All other prefix keys consumed silently
                         _ => {}
                     }
@@ -1794,6 +1917,49 @@ async fn run_tui(
                         _ => {}
                     }
                     continue;
+                }
+
+                // Sidebar navigation when sidebar is focused.
+                if state.sidebar_open && state.sidebar_focused {
+                    match code {
+                        KeyCode::Up => {
+                            state.sidebar_cursor = state.sidebar_cursor.saturating_sub(1);
+                            continue;
+                        }
+                        KeyCode::Down => {
+                            let max = state.sidebar_data.len().saturating_sub(1);
+                            state.sidebar_cursor = (state.sidebar_cursor + 1).min(max);
+                            continue;
+                        }
+                        KeyCode::Enter => {
+                            // Focus pane if it is a leaf in the active tab.
+                            if let Some(info) = state.sidebar_data.get(state.sidebar_cursor) {
+                                let target = info.id;
+                                let tab = &mut state.tabs[state.active_tab];
+                                let mut all_paths: Vec<Vec<usize>> = Vec::new();
+                                let mut tmp: Vec<usize> = Vec::new();
+                                leaves_in_order(&tab.root, &mut tmp, &mut all_paths);
+                                let found = all_paths.iter().find(|p| {
+                                    slot_at(&tab.root, p)
+                                        .map(|i| state.slots[i].pane_id == target)
+                                        .unwrap_or(false)
+                                });
+                                if let Some(path) = found {
+                                    tab.focus_path = path.clone();
+                                    state.sidebar_focused = false;
+                                } else {
+                                    state.status_msg =
+                                        Some("open this pane first in a tab to focus".to_owned());
+                                }
+                            }
+                            continue;
+                        }
+                        KeyCode::Esc => {
+                            state.sidebar_focused = false;
+                            continue;
+                        }
+                        _ => {}
+                    }
                 }
 
                 // Block ribbon scrollback navigation (Ctrl-B [ mode).

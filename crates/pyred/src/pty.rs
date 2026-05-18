@@ -63,6 +63,11 @@ pub async fn spawn_pty(
     let (parse_tx, mut parse_rx) = mpsc::unbounded_channel::<Bytes>();
     let (input_tx, mut input_rx) = mpsc::channel::<Bytes>(IN_CHANNEL_CAP);
 
+    // State tracker — root PID obtained after spawn.
+    // We initialize with 0 and update it once the child pid is known.
+    let (state_tracker_inner, _state_rx) = crate::state::PaneStateTracker::new(0);
+    let state_tracker_arc = Arc::new(std::sync::Mutex::new(state_tracker_inner));
+
     // Reader: blocking std::io::Read on the master in a blocking thread,
     // bridging Bytes back to the async broadcast channel.
     let mut reader = pair
@@ -74,6 +79,7 @@ pub async fn spawn_pty(
         64 * 1024,
     )));
     let ringbuf_thread = ringbuf_arc.clone();
+    let state_tracker_reader = state_tracker_arc.clone();
     std::thread::Builder::new()
         .name(format!("pty-reader-{pane_id}"))
         .spawn(move || {
@@ -88,6 +94,10 @@ pub async fn spawn_pty(
                         {
                             let mut rb = ringbuf_thread.lock().expect("ringbuf poisoned");
                             rb.push(&buf[..n]);
+                        }
+                        // Update last_output_at on the state tracker.
+                        if let Ok(mut t) = state_tracker_reader.lock() {
+                            t.touch_output();
                         }
                         let chunk = Bytes::copy_from_slice(&buf[..n]);
                         let _ = out_tx.send(chunk.clone());
@@ -133,11 +143,25 @@ pub async fn spawn_pty(
         )
         .await?;
 
+    // Wrap child in Arc<Mutex<>> now that we've extracted the PID.
+    let child = Arc::new(Mutex::new(child));
+
+    // Stash the child PID into the state tracker.
+    {
+        let child_guard = child.lock().await;
+        if let Some(pid) = child_guard.process_id() {
+            if let Ok(mut t) = state_tracker_arc.lock() {
+                t.root_pid = pid;
+            }
+        }
+    }
+
     // Parser task: feed raw PTY bytes through BlockParser, broadcast BlockEvents,
     // and persist blocks/output into the store.
     let events_tx_clone = events_tx.clone();
     let store_clone = store.clone();
     let block_index_clone = block_index.clone();
+    let state_tracker_parser = state_tracker_arc.clone();
     tokio::spawn(async move {
         let mut parser = crate::parser::BlockParser::new(session_id);
         let mut writers: HashMap<pyre_proto::BlockId, crate::store::BlobWriter> = HashMap::new();
@@ -151,6 +175,28 @@ pub async fn spawn_pty(
             parser.feed(&chunk, &mut events);
             for ev in events.drain(..) {
                 let _ = events_tx_clone.send(ev.clone());
+
+                // Push OSC 133 markers into the state tracker.
+                match &ev {
+                    BlockEvent::PromptStart { .. } => {
+                        if let Ok(mut t) = state_tracker_parser.lock() {
+                            t.push_marker(crate::state::Osc133Marker::A);
+                        }
+                    }
+                    BlockEvent::CommandStart { .. } => {
+                        if let Ok(mut t) = state_tracker_parser.lock() {
+                            t.push_marker(crate::state::Osc133Marker::C);
+                        }
+                    }
+                    BlockEvent::BlockEnd { exit_code, .. } => {
+                        if let Ok(mut t) = state_tracker_parser.lock() {
+                            t.push_marker(crate::state::Osc133Marker::D {
+                                exit_code: *exit_code,
+                            });
+                        }
+                    }
+                    BlockEvent::OutputChunk { .. } => {}
+                }
 
                 match ev {
                     BlockEvent::PromptStart { .. } => {}
@@ -266,8 +312,9 @@ pub async fn spawn_pty(
         output_tx,
         events_tx,
         input_tx,
-        Arc::new(Mutex::new(child)),
+        child,
         ringbuf_arc,
+        state_tracker_arc,
     ))
 }
 
