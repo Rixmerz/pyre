@@ -1,0 +1,36 @@
+pkgname=pyre
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Daemon-owned terminal multiplexer with block model and agent observability'
+arch=('x86_64' 'aarch64')
+url='https://github.com/<TODO>/pyre'
+license=('MIT' 'Apache-2.0')
+makedepends=('rust' 'cargo')
+optdepends=(
+  'wl-clipboard: Wayland clipboard support'
+  'xclip: X11 clipboard support'
+  'libnotify: desktop notifications for state hooks'
+)
+source=("$pkgname-$pkgver.tar.gz::https://github.com/<TODO>/pyre/archive/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "$pkgname-$pkgver"
+  cargo build --release --locked
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  for bin in pyred pyrec pyre-tui pyre-mcp; do
+    install -Dm755 "target/release/$bin" "$pkgdir/usr/bin/$bin"
+  done
+  install -Dm644 dist/systemd/pyred.service \
+    "$pkgdir/usr/lib/systemd/user/pyred.service"
+  install -Dm644 LICENSE-MIT \
+    "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
+  # Man pages (if pre-built)
+  for page in docs/man/*.1; do
+    [ -f "$page" ] && install -Dm644 "$page" \
+      "$pkgdir/usr/share/man/man1/$(basename "$page")"
+  done
+}

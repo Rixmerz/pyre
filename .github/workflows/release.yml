@@ -1,0 +1,127 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    name: Build Linux binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-linux-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release binaries
+        run: cargo build --release --workspace
+
+      - name: Package tarball
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          OUTDIR="pyre-${VERSION}-linux-x86_64"
+          mkdir -p "$OUTDIR"
+          for bin in pyred pyrec pyre-tui pyre-mcp; do
+            cp "target/release/$bin" "$OUTDIR/"
+          done
+          cp README.md LICENSE-MIT CHANGELOG.md "$OUTDIR/" 2>/dev/null || true
+          tar czf "${OUTDIR}.tar.gz" "$OUTDIR"
+          sha256sum "${OUTDIR}.tar.gz" > "${OUTDIR}.tar.gz.sha256"
+          echo "TARBALL=${OUTDIR}.tar.gz" >> "$GITHUB_ENV"
+          echo "CHECKSUM=${OUTDIR}.tar.gz.sha256" >> "$GITHUB_ENV"
+
+      - name: Build .deb with cargo-deb
+        run: |
+          cargo install cargo-deb
+          cargo deb --no-build -p pyred 2>/dev/null || \
+            cargo deb -p pyred -- --release 2>/dev/null || \
+            echo "cargo-deb packaging skipped (no .deb config)"
+          find target -name "*.deb" -exec cp {} . \; 2>/dev/null || true
+
+      - name: Upload tarball + checksum + deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-release
+          path: |
+            *.tar.gz
+            *.sha256
+            *.deb
+
+  build-rpm:
+    name: Build RPM (Fedora)
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - name: Install deps
+        run: dnf install -y git rust cargo rpm-build rpmdevtools
+
+      - uses: actions/checkout@v4
+
+      - name: Build binaries
+        run: cargo build --release --locked --workspace
+
+      - name: Build RPM
+        run: |
+          rpmdev-setuptree
+          VERSION=${GITHUB_REF_NAME#v}
+          tar czf ~/rpmbuild/SOURCES/pyre-${VERSION}.tar.gz \
+            --transform "s,^,pyre-${VERSION}/," .
+          rpmbuild -bb dist/rpm/pyre.spec \
+            --define "version ${VERSION}" \
+            --define "_rpmdir $(pwd)" 2>/dev/null || true
+          find . -name "*.rpm" -not -name "*.src.rpm" | head -5
+
+      - name: Upload RPM
+        uses: actions/upload-artifact@v4
+        with:
+          name: fedora-rpm
+          path: "**/*.rpm"
+
+  arch-sanity:
+    name: Arch PKGBUILD sanity check
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install deps
+        run: pacman -Sy --noconfirm git rust base-devel
+
+      - uses: actions/checkout@v4
+
+      - name: Build binaries
+        run: cargo build --release --locked --workspace
+
+      - name: Validate PKGBUILD syntax
+        run: |
+          cd dist/arch
+          bash -n PKGBUILD && echo "PKGBUILD syntax OK"
+
+  github-release:
+    name: Create GitHub Release
+    needs: [build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-release
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            *.tar.gz
+            *.sha256
+            *.deb
+          generate_release_notes: true
