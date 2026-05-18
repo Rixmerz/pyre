@@ -86,6 +86,17 @@ pub struct SpawnResp {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResizePaneReq {
+    pub pane_id: PaneId,
+    pub size: crate::PaneSize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResizePaneRes {
+    pub ok: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplayBlocks {
     pub recent: Vec<Block>,
     #[serde(with = "bytes_serde")]
