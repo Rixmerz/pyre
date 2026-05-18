@@ -161,6 +161,18 @@ impl Store {
         rows.into_iter().map(row_to_block).collect()
     }
 
+    pub async fn list_blocks_for_pane(&self, pane: PaneId, limit: u32) -> Result<Vec<Block>> {
+        let rows = sqlx::query(
+            "SELECT id, pane_id, session_id, command, started_at, ended_at, exit_code, cwd, stdout_len
+             FROM blocks WHERE pane_id = ?1 ORDER BY started_at DESC LIMIT ?2",
+        )
+        .bind(pane.0.to_string())
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(row_to_block).collect()
+    }
+
     pub async fn linear_search(&self, query: &str, limit: u32) -> Result<Vec<BlockHit>> {
         let blocks = self.list_blocks(None, MAX_SCAN_BLOCKS).await?;
         let needle = query.to_string();
@@ -342,6 +354,72 @@ mod tests {
         let hits = store.linear_search("NEEDLE", 5).await?;
         assert_eq!(hits.len(), 1);
         assert!(hits[0].snippet.contains("NEEDLE"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_blocks_for_pane_filters_by_pane_and_respects_limit() -> Result<()> {
+        let tmp = TempDir::new()?;
+        unsafe {
+            std::env::set_var("PYRE_DATA_DIR", tmp.path());
+        }
+        let store = Store::open().await?;
+
+        let sid = SessionId(Uuid::new_v4());
+        let pane_a = PaneId(Uuid::new_v4());
+        let pane_b = PaneId(Uuid::new_v4());
+        store.upsert_session(sid, "test").await?;
+        store
+            .upsert_pane(pane_a, sid, "/bin/sh", None, 80, 24)
+            .await?;
+        store
+            .upsert_pane(pane_b, sid, "/bin/sh", None, 80, 24)
+            .await?;
+
+        // Insert 3 blocks for pane_a and 2 for pane_b.
+        for i in 0..3u8 {
+            let block = Block {
+                id: BlockId(Uuid::new_v4()),
+                pane: pane_a,
+                session: sid,
+                command: format!("cmd-a-{i}"),
+                cwd: None,
+                started_at: Utc::now(),
+                ended_at: None,
+                exit_code: None,
+                stdout_len: 0,
+            };
+            store.create_block(&block).await?;
+        }
+        for i in 0..2u8 {
+            let block = Block {
+                id: BlockId(Uuid::new_v4()),
+                pane: pane_b,
+                session: sid,
+                command: format!("cmd-b-{i}"),
+                cwd: None,
+                started_at: Utc::now(),
+                ended_at: None,
+                exit_code: None,
+                stdout_len: 0,
+            };
+            store.create_block(&block).await?;
+        }
+
+        // pane_a with no limit cap returns only pane_a rows.
+        let a_rows = store.list_blocks_for_pane(pane_a, 100).await?;
+        assert_eq!(a_rows.len(), 3);
+        assert!(a_rows.iter().all(|b| b.pane == pane_a));
+
+        // pane_b returns only pane_b rows.
+        let b_rows = store.list_blocks_for_pane(pane_b, 100).await?;
+        assert_eq!(b_rows.len(), 2);
+        assert!(b_rows.iter().all(|b| b.pane == pane_b));
+
+        // Limit is respected.
+        let limited = store.list_blocks_for_pane(pane_a, 2).await?;
+        assert_eq!(limited.len(), 2);
+
         Ok(())
     }
 }

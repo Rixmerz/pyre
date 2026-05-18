@@ -1,9 +1,13 @@
 //! pyrec — Pyre client. Connects to pyred over UDS, spawns a PTY session,
 //! puts the local TTY in raw mode, and bridges stdio.
 //!
-//! Without a subcommand: interactive attach (original behaviour).
-//! `list`   — list recent blocks.
-//! `search` — linear-scan search across stdout blobs.
+//! Without a subcommand: spawn new session+pane, then attach.
+//! `sessions`  — list active sessions.
+//! `panes`     — list panes in a session.
+//! `attach`    — attach to an existing session/pane.
+//! `new-pane`  — open a new pane in a session (no attach).
+//! `list`      — list recent blocks.
+//! `search`    — linear-scan search across stdout blobs.
 
 use std::path::{Path, PathBuf};
 
@@ -12,8 +16,8 @@ use bytes::Bytes;
 use clap::Parser;
 use futures::{SinkExt, StreamExt};
 use pyre_proto::{
-    BlockHit, InputFrame, ListBlocksReq, OutputFrame, PyreDaemonClient, SearchBlocksReq, SpawnReq,
-    SpawnResp, MODE_CONTROL, MODE_STREAM,
+    BlockHit, InputFrame, ListBlocksReq, OpenPaneReq, OutputFrame, PaneId, PyreDaemonClient,
+    SearchBlocksReq, SessionId, SpawnReq, SpawnResp, MODE_CONTROL, MODE_STREAM,
 };
 use tarpc::client;
 use tarpc::tokio_serde::formats::Bincode;
@@ -44,11 +48,45 @@ struct Cli {
 
 #[derive(clap::Subcommand, Debug)]
 enum Sub {
+    /// List active sessions
+    Sessions,
+
+    /// List panes in a session
+    Panes {
+        /// Session id or ≥8-char prefix
+        session: String,
+    },
+
+    /// Attach to an existing session (and optionally a specific pane)
+    Attach {
+        /// Session id or ≥8-char prefix
+        session: String,
+        /// Pane id or ≥8-char prefix (default: first pane)
+        #[arg(long)]
+        pane: Option<String>,
+    },
+
+    /// Open a new pane in a session and print its id (no attach)
+    NewPane {
+        /// Session id or ≥8-char prefix
+        session: String,
+        /// Shell to launch in the new pane
+        #[arg(long)]
+        shell: Option<String>,
+        /// Terminal width
+        #[arg(long, default_value_t = 80)]
+        cols: u16,
+        /// Terminal height
+        #[arg(long, default_value_t = 24)]
+        rows: u16,
+    },
+
     /// List recent blocks
     List {
         #[arg(long, default_value_t = 20)]
         limit: u32,
     },
+
     /// Linear-scan search across stdout blobs
     Search {
         query: String,
@@ -95,6 +133,71 @@ async fn control_client(socket: &Path) -> Result<PyreDaemonClient> {
     Ok(PyreDaemonClient::new(client::Config::default(), transport).spawn())
 }
 
+/// Resolve a session id from a full uuid string or a ≥8-char prefix.
+async fn resolve_session(client: &PyreDaemonClient, prefix: &str) -> Result<SessionId> {
+    let sessions = client
+        .list_sessions(tarpc::context::current())
+        .await
+        .context("rpc transport")?
+        .map_err(|e| anyhow!("daemon list_sessions: {e}"))?;
+
+    let matches: Vec<_> = sessions
+        .iter()
+        .filter(|s| s.id.0.to_string().starts_with(prefix))
+        .collect();
+
+    match matches.len() {
+        0 => Err(anyhow!("no session matches prefix '{prefix}'")),
+        1 => Ok(matches[0].id),
+        _ => Err(anyhow!(
+            "{} sessions match prefix '{prefix}'; provide a longer prefix",
+            matches.len()
+        )),
+    }
+}
+
+/// Resolve a pane id from a full uuid string or a ≥8-char prefix within a session.
+async fn resolve_pane(
+    client: &PyreDaemonClient,
+    session: SessionId,
+    prefix: &str,
+) -> Result<PaneId> {
+    let panes = client
+        .list_panes(tarpc::context::current(), session)
+        .await
+        .context("rpc transport")?
+        .map_err(|e| anyhow!("daemon list_panes: {e}"))?;
+
+    let matches: Vec<_> = panes
+        .iter()
+        .filter(|p| p.id.0.to_string().starts_with(prefix))
+        .collect();
+
+    match matches.len() {
+        0 => Err(anyhow!("no pane matches prefix '{prefix}'")),
+        1 => Ok(matches[0].id),
+        _ => Err(anyhow!(
+            "{} panes match prefix '{prefix}'; provide a longer prefix",
+            matches.len()
+        )),
+    }
+}
+
+/// Pick the first pane in a session.
+async fn first_pane(client: &PyreDaemonClient, session: SessionId) -> Result<PaneId> {
+    let panes = client
+        .list_panes(tarpc::context::current(), session)
+        .await
+        .context("rpc transport")?
+        .map_err(|e| anyhow!("daemon list_panes: {e}"))?;
+
+    panes
+        .into_iter()
+        .next()
+        .map(|p| p.id)
+        .ok_or_else(|| anyhow!("session has no panes"))
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Raw-mode guard
 // ──────────────────────────────────────────────────────────────────────────────
@@ -136,33 +239,9 @@ impl Drop for RawGuard {
 // Sub-command implementations
 // ──────────────────────────────────────────────────────────────────────────────
 
-async fn run_attach(socket: PathBuf, shell: Option<String>) -> Result<()> {
-    let client_obj = control_client(&socket).await?;
-
-    let (cols, rows) = term_size();
-    let shell = shell.or_else(|| std::env::var("SHELL").ok()).or_else(|| {
-        for candidate in ["/bin/bash", "/bin/sh"] {
-            if std::path::Path::new(candidate).exists() {
-                return Some(candidate.to_owned());
-            }
-        }
-        None
-    });
-    let req = SpawnReq {
-        shell,
-        cwd: std::env::current_dir().ok(),
-        cols,
-        rows,
-        env: std::env::vars().collect(),
-    };
-    let SpawnResp { session, pane } = client_obj
-        .spawn(tarpc::context::current(), req)
-        .await
-        .context("rpc transport")?
-        .map_err(|e| anyhow!("daemon spawn: {e}"))?;
-
-    // === Stream connection ===
-    let mut stream_sock = UnixStream::connect(&socket)
+/// Open a stream connection and bridge PTY I/O between the terminal and daemon.
+async fn run_attach(socket: &Path, session: SessionId, pane: PaneId) -> Result<()> {
+    let mut stream_sock = UnixStream::connect(socket)
         .await
         .with_context(|| format!("connect stream {}", socket.display()))?;
     stream_sock.write_all(&[MODE_STREAM]).await?;
@@ -201,7 +280,7 @@ async fn run_attach(socket: PathBuf, shell: Option<String>) -> Result<()> {
         }
     });
 
-    // daemon -> OutputFrame -> stdout
+    // daemon -> OutputFrame -> stdout (first frame is snapshot replay)
     let stdout_task = tokio::spawn(async move {
         let mut stdout = tokio::io::stdout();
         while let Some(frame) = output_frames.next().await {
@@ -218,12 +297,12 @@ async fn run_attach(socket: PathBuf, shell: Option<String>) -> Result<()> {
     });
 
     // ctrl-c -> kill session via control RPC
-    let client_for_signal = client_obj.clone();
+    let socket_clone = socket.to_owned();
     let signal_task = tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
-            let _ = client_for_signal
-                .kill(tarpc::context::current(), session)
-                .await;
+            if let Ok(ctrl) = control_client(&socket_clone).await {
+                let _ = ctrl.kill(tarpc::context::current(), session).await;
+            }
         }
     });
 
@@ -232,6 +311,121 @@ async fn run_attach(socket: PathBuf, shell: Option<String>) -> Result<()> {
     stdin_task.abort();
     signal_task.abort();
 
+    Ok(())
+}
+
+async fn run_default(socket: PathBuf, shell: Option<String>) -> Result<()> {
+    let client = control_client(&socket).await?;
+
+    let (cols, rows) = term_size();
+    let shell_resolved = shell.or_else(|| std::env::var("SHELL").ok()).or_else(|| {
+        for candidate in ["/bin/bash", "/bin/sh"] {
+            if std::path::Path::new(candidate).exists() {
+                return Some(candidate.to_owned());
+            }
+        }
+        None
+    });
+    let req = SpawnReq {
+        shell: shell_resolved,
+        cwd: std::env::current_dir().ok(),
+        cols,
+        rows,
+        env: std::env::vars().collect(),
+    };
+    let SpawnResp { session, pane } = client
+        .spawn(tarpc::context::current(), req)
+        .await
+        .context("rpc transport")?
+        .map_err(|e| anyhow!("daemon spawn: {e}"))?;
+
+    run_attach(&socket, session, pane).await
+}
+
+async fn run_sessions(socket: PathBuf) -> Result<()> {
+    let client = control_client(&socket).await?;
+    let sessions = client
+        .list_sessions(tarpc::context::current())
+        .await
+        .context("rpc transport")?
+        .map_err(|e| anyhow!("daemon list_sessions: {e}"))?;
+
+    for s in &sessions {
+        let short_id = &s.id.0.to_string()[..8];
+        let created = s.created_at.format("%Y-%m-%d %H:%M:%S");
+        println!(
+            "{short_id}  {:>3} panes  {created}  {}",
+            s.pane_count, s.name
+        );
+    }
+
+    Ok(())
+}
+
+async fn run_panes(socket: PathBuf, session_prefix: String) -> Result<()> {
+    let client = control_client(&socket).await?;
+    let session = resolve_session(&client, &session_prefix).await?;
+    let panes = client
+        .list_panes(tarpc::context::current(), session)
+        .await
+        .context("rpc transport")?
+        .map_err(|e| anyhow!("daemon list_panes: {e}"))?;
+
+    for p in &panes {
+        let short_id = &p.id.0.to_string()[..8];
+        let created = p.created_at.format("%Y-%m-%d %H:%M:%S");
+        let status = if p.closed_at.is_some() {
+            "closed"
+        } else {
+            "open  "
+        };
+        println!(
+            "{short_id}  {status}  {}x{}  {created}  {}",
+            p.cols, p.rows, p.shell
+        );
+    }
+
+    Ok(())
+}
+
+async fn run_attach_cmd(
+    socket: PathBuf,
+    session_prefix: String,
+    pane_prefix: Option<String>,
+) -> Result<()> {
+    let client = control_client(&socket).await?;
+    let session = resolve_session(&client, &session_prefix).await?;
+    let pane = match pane_prefix {
+        Some(ref prefix) => resolve_pane(&client, session, prefix).await?,
+        None => first_pane(&client, session).await?,
+    };
+    run_attach(&socket, session, pane).await
+}
+
+async fn run_new_pane(
+    socket: PathBuf,
+    session_prefix: String,
+    shell: Option<String>,
+    cols: u16,
+    rows: u16,
+) -> Result<()> {
+    let client = control_client(&socket).await?;
+    let session = resolve_session(&client, &session_prefix).await?;
+    let req = OpenPaneReq {
+        session,
+        shell,
+        cwd: std::env::current_dir().ok(),
+        cols,
+        rows,
+        env: std::env::vars().collect(),
+    };
+    let pane_id = client
+        .open_pane(tarpc::context::current(), req)
+        .await
+        .context("rpc transport")?
+        .map_err(|e| anyhow!("daemon open_pane: {e}"))?;
+
+    println!("{}", pane_id.0);
     Ok(())
 }
 
@@ -297,7 +491,16 @@ async fn main() -> Result<()> {
     let sock_path = cli.socket.unwrap_or_else(default_socket);
 
     match cli.command {
-        None => run_attach(sock_path, cli.shell).await,
+        None => run_default(sock_path, cli.shell).await,
+        Some(Sub::Sessions) => run_sessions(sock_path).await,
+        Some(Sub::Panes { session }) => run_panes(sock_path, session).await,
+        Some(Sub::Attach { session, pane }) => run_attach_cmd(sock_path, session, pane).await,
+        Some(Sub::NewPane {
+            session,
+            shell,
+            cols,
+            rows,
+        }) => run_new_pane(sock_path, session, shell, cols, rows).await,
         Some(Sub::List { limit }) => run_list(sock_path, limit).await,
         Some(Sub::Search { query, limit }) => run_search(sock_path, query, limit).await,
     }

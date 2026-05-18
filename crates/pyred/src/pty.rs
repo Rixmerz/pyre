@@ -69,6 +69,10 @@ pub async fn spawn_pty(
         .try_clone_reader()
         .map_err(|e| anyhow!("clone reader: {e}"))?;
     let out_tx = output_tx.clone();
+    let ringbuf_arc = std::sync::Arc::new(std::sync::Mutex::new(crate::ringbuf::RingBuf::new(
+        64 * 1024,
+    )));
+    let ringbuf_thread = ringbuf_arc.clone();
     std::thread::Builder::new()
         .name(format!("pty-reader-{pane_id}"))
         .spawn(move || {
@@ -80,6 +84,10 @@ pub async fn spawn_pty(
                         break;
                     }
                     Ok(n) => {
+                        {
+                            let mut rb = ringbuf_thread.lock().expect("ringbuf poisoned");
+                            rb.push(&buf[..n]);
+                        }
                         let chunk = Bytes::copy_from_slice(&buf[..n]);
                         let _ = out_tx.send(chunk.clone());
                         let _ = parse_tx.send(chunk);
@@ -229,6 +237,7 @@ pub async fn spawn_pty(
         events_tx,
         input_tx,
         Arc::new(Mutex::new(child)),
+        ringbuf_arc,
     ))
 }
 

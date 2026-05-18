@@ -8,7 +8,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use pyre_proto::{BlockEvent, OpenPaneReq, PaneId, PaneInfo, SessionId, SessionInfo, SpawnReq};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 
 use crate::pty::spawn_pty;
@@ -30,6 +30,7 @@ pub struct PaneState {
     pub events_tx: broadcast::Sender<BlockEvent>,
     pub input_tx: mpsc::Sender<Bytes>,
     child: Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
+    pub ringbuf: Arc<StdMutex<crate::ringbuf::RingBuf>>,
 }
 
 impl PaneState {
@@ -46,6 +47,7 @@ impl PaneState {
         events_tx: broadcast::Sender<BlockEvent>,
         input_tx: mpsc::Sender<Bytes>,
         child: Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
+        ringbuf: Arc<StdMutex<crate::ringbuf::RingBuf>>,
     ) -> Self {
         Self {
             id,
@@ -60,6 +62,7 @@ impl PaneState {
             events_tx,
             input_tx,
             child,
+            ringbuf,
         }
     }
 }

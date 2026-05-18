@@ -26,24 +26,34 @@ pub async fn handle_stream(mut sock: UnixStream, registry: Arc<SessionRegistry>)
     // Read session id (16 bytes) then pane id (16 bytes).
     let mut session_buf = [0u8; 16];
     sock.read_exact(&mut session_buf).await?;
-    let _session = SessionId(Uuid::from_bytes(session_buf));
+    let session_id = SessionId(Uuid::from_bytes(session_buf));
 
     let mut pane_buf = [0u8; 16];
     sock.read_exact(&mut pane_buf).await?;
-    let pane = PaneId(Uuid::from_bytes(pane_buf));
+    let pane_id = PaneId(Uuid::from_bytes(pane_buf));
 
-    // TODO(s3-phase4-stream-target): replace with registry.get_pane(pane) once
-    // the client sends a real PaneId. For now look up by pane id directly.
-    let pty = match registry.get_pane(pane).await {
-        Some((_sess, p)) => p,
+    let pty = match registry.get_pane(pane_id).await {
+        Some((sess, p)) if sess.id == session_id => p,
+        Some(_) => {
+            tracing::warn!("stream pane {pane_id} does not belong to session {session_id}");
+            let _ = sock.shutdown().await;
+            return Ok(());
+        }
         None => {
-            tracing::warn!("stream for unknown pane {pane}");
+            tracing::warn!("stream for unknown pane {pane_id}");
             let _ = sock.shutdown().await;
             return Ok(());
         }
     };
-    // Use pane id as the session field in frames (matches what the client sent).
-    let session = SessionId(pane.0);
+    // Reuse the session id from the wire for frames.
+    let session = session_id;
+
+    // Snapshot the ringbuf before subscribing so we don't miss bytes that
+    // arrived between the subscribe call and the first recv().
+    let snap = {
+        let rb = pty.ringbuf.lock().expect("ringbuf poisoned");
+        rb.snapshot()
+    };
 
     let (rd, wr) = sock.into_split();
 
@@ -54,6 +64,19 @@ pub async fn handle_stream(mut sock: UnixStream, registry: Arc<SessionRegistry>)
         tokio_serde::SymmetricallyFramed::new(frame_read, SymmetricalBincode::default());
     let mut output_frames: tokio_serde::SymmetricallyFramed<_, OutputFrame, _> =
         tokio_serde::SymmetricallyFramed::new(frame_write, SymmetricalBincode::default());
+
+    // Send snapshot as seq=0 frame (always, even if empty — uniform client path).
+    output_frames
+        .send(OutputFrame {
+            session,
+            seq: 0,
+            data: snap,
+        })
+        .await?;
+
+    // Subscribe *after* the snapshot write.  Any live bytes that arrive after
+    // the snapshot was taken will be delivered by the broadcast receiver below.
+    let mut sub = pty.subscribe();
 
     let input_tx = pty.input_tx.clone();
     let recv_task = tokio::spawn(async move {
@@ -72,9 +95,8 @@ pub async fn handle_stream(mut sock: UnixStream, registry: Arc<SessionRegistry>)
         }
     });
 
-    let mut sub = pty.subscribe();
     let send_task = tokio::spawn(async move {
-        let mut seq: u64 = 0;
+        let mut seq: u64 = 0; // seq 0 was the snapshot frame; live frames start at 1
         loop {
             match sub.recv().await {
                 Ok(data) => {

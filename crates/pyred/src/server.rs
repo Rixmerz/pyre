@@ -134,13 +134,23 @@ impl pyre_proto::service::PyreDaemon for DaemonImpl {
     async fn replay(
         self,
         _ctx: context::Context,
-        _pane: PaneId,
-        _recent_blocks: u32,
+        pane: PaneId,
+        recent_blocks: u32,
     ) -> Result<ReplayBlocks, PyreError> {
-        // TODO(s3-phase4-stream-target): wire replay to pane-scoped block query
-        Ok(ReplayBlocks {
-            recent: vec![],
-            snapshot: bytes::Bytes::new(),
-        })
+        let (_session, pane_state) = self
+            .registry
+            .get_pane(pane)
+            .await
+            .ok_or(PyreError::NoSuchPane(pane))?;
+        let snapshot = {
+            let rb = pane_state.ringbuf.lock().expect("ringbuf poisoned");
+            rb.snapshot()
+        };
+        let recent = self
+            .store
+            .list_blocks_for_pane(pane, recent_blocks)
+            .await
+            .map_err(|e| PyreError::Io(e.to_string()))?;
+        Ok(ReplayBlocks { recent, snapshot })
     }
 }
