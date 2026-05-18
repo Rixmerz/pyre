@@ -8,6 +8,37 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Block, PaneId, SessionId};
 
+/// Coarse lifecycle state of a pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum PaneStateKind {
+    #[default]
+    /// Shell/process is actively producing output.
+    Running,
+    /// Shell prompt visible; waiting for user/agent input.
+    WaitingInput,
+    /// Process is alive but idle (no input, no output).
+    Idle,
+    /// Foreground is a full-screen interactive program (vim, less, top, …).
+    Interactive,
+    /// Process exited with a non-zero code and has not been respawned.
+    Crashed,
+    /// Process exited cleanly.
+    Done,
+}
+
+impl std::fmt::Display for PaneStateKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Running => write!(f, "running"),
+            Self::WaitingInput => write!(f, "waiting"),
+            Self::Idle => write!(f, "idle"),
+            Self::Interactive => write!(f, "interactive"),
+            Self::Crashed => write!(f, "crashed"),
+            Self::Done => write!(f, "done"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub id: SessionId,
@@ -26,6 +57,16 @@ pub struct PaneInfo {
     pub shell: String,
     pub created_at: DateTime<Utc>,
     pub closed_at: Option<DateTime<Utc>>,
+    /// Current lifecycle state.
+    pub state: PaneStateKind,
+    /// Human-readable reason for the current state.
+    pub state_reason: String,
+    /// Wall-clock time of the last byte received from this pane.
+    pub last_activity: DateTime<Utc>,
+    /// Basename of the current foreground process (if known).
+    pub foreground_cmd: Option<String>,
+    /// Root PID of the PTY child process.
+    pub root_pid: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -107,4 +107,13 @@ pub trait PyreDaemon {
     async fn capture_pane(pane: PaneId, lines: u32) -> Result<Vec<u8>, PyreError>;
     /// Close all panes in a session and remove it from the registry.
     async fn close_session(session: SessionId) -> Result<(), PyreError>;
+    /// Override the state of a pane for up to `PYRE_OVERRIDE_WINDOW_SECS` seconds.
+    /// After the window expires the heuristic engine resumes.
+    async fn set_pane_state(
+        pane: PaneId,
+        state: crate::PaneStateKind,
+        reason: String,
+    ) -> Result<(), PyreError>;
+    /// List all panes across all sessions (convenience for clients that iterate sessions).
+    async fn list_all_panes() -> Result<Vec<crate::PaneInfo>, PyreError>;
 }

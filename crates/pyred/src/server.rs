@@ -3,8 +3,9 @@
 use std::sync::Arc;
 
 use pyre_proto::{
-    AttachAck, Block, BlockHit, BlockId, ListBlocksReq, OpenPaneReq, PaneId, PaneInfo, PyreError,
-    ReplayBlocks, SearchBlocksReq, SessionId, SessionInfo, SpawnReq, SpawnResp,
+    AttachAck, Block, BlockHit, BlockId, ListBlocksReq, OpenPaneReq, PaneId, PaneInfo,
+    PaneStateKind, PyreError, ReplayBlocks, SearchBlocksReq, SessionId, SessionInfo, SpawnReq,
+    SpawnResp,
 };
 use tarpc::context;
 
@@ -239,5 +240,35 @@ impl pyre_proto::service::PyreDaemon for DaemonImpl {
             .kill_session(session)
             .await
             .map_err(|_| PyreError::NoSuchSession(session))
+    }
+
+    async fn set_pane_state(
+        self,
+        _ctx: context::Context,
+        pane: PaneId,
+        state: PaneStateKind,
+        reason: String,
+    ) -> Result<(), PyreError> {
+        let (_session, pane_state) = self
+            .registry
+            .get_pane(pane)
+            .await
+            .ok_or(PyreError::NoSuchPane(pane))?;
+
+        let override_secs: u64 = std::env::var("PYRE_OVERRIDE_WINDOW_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(30);
+
+        let mut t = pane_state
+            .state_tracker
+            .lock()
+            .map_err(|_| PyreError::Io("tracker lock poisoned".into()))?;
+        t.set_override(state, reason, override_secs);
+        Ok(())
+    }
+
+    async fn list_all_panes(self, _ctx: context::Context) -> Result<Vec<PaneInfo>, PyreError> {
+        Ok(self.registry.list_all_panes().await)
     }
 }

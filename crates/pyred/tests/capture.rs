@@ -45,12 +45,14 @@ async fn run_capture() -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let client = loop {
         if tokio::time::Instant::now() >= deadline {
-            anyhow::bail!("pyred socket never became connectable at {}", sock_path.display());
+            anyhow::bail!(
+                "pyred socket never became connectable at {}",
+                sock_path.display()
+            );
         }
         if sock_path.exists() {
-            match connect_control(&sock_path).await {
-                Ok(c) => break c,
-                Err(_) => {}
+            if let Ok(c) = connect_control(&sock_path).await {
+                break c;
             }
         }
         tokio::time::sleep(Duration::from_millis(50)).await;

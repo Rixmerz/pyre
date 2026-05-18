@@ -8,7 +8,7 @@ pub use service::{
     AttachAck, InputFrame, OutputFrame, PyreDaemon, PyreDaemonClient, PyreError, SpawnReq,
     MODE_CONTROL, MODE_STREAM,
 };
-pub use sessions::{OpenPaneReq, PaneInfo, ReplayBlocks, SessionInfo, SpawnResp};
+pub use sessions::{OpenPaneReq, PaneInfo, PaneStateKind, ReplayBlocks, SessionInfo, SpawnResp};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
