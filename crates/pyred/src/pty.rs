@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
-use crate::session::PaneState;
+use crate::session::{PaneState, SessionRegistry};
 
 const OUT_CHANNEL_CAP: usize = 1024;
 const IN_CHANNEL_CAP: usize = 256;
@@ -28,6 +28,7 @@ pub async fn spawn_pty(
     session_id: SessionId,
     store: Arc<crate::store::Store>,
     block_index: Arc<crate::index::BlockIndex>,
+    registry: Arc<SessionRegistry>,
 ) -> Result<PaneState> {
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -163,22 +164,28 @@ pub async fn spawn_pty(
         }
     }
 
-    // Child-wait task: blocks until the shell exits, then fires close_notify
-    // so all stream handlers observing this pane break their loops and drop
-    // their sockets (clients receive EOF → PaneEvent::Closed).
+    // Child-wait task: blocks until the shell exits, cancels close_token so
+    // all stream handlers drop their sockets (clients receive EOF), then
+    // removes the pane (and its session if empty) from the registry so
+    // subsequent list_sessions / attach calls do not see dead state.
     {
         let child_wait = child.clone();
         let token = close_token.clone();
-        tokio::task::spawn_blocking(move || {
-            // Lock briefly to extract the child, then wait outside the lock.
-            // portable_pty::Child::wait() is a blocking syscall.
-            let mut guard = child_wait.blocking_lock();
-            match guard.wait() {
-                Ok(status) => tracing::info!("child exited: {status:?}"),
-                Err(e) => tracing::warn!("child.wait(): {e}"),
-            }
-            tracing::info!("pane close_token cancelled");
-            token.cancel();
+        let registry_wait = Arc::clone(&registry);
+        tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                let mut guard = child_wait.blocking_lock();
+                match guard.wait() {
+                    Ok(status) => tracing::info!("child exited: {status:?}"),
+                    Err(e) => tracing::warn!("child.wait(): {e}"),
+                }
+                token.cancel();
+                tracing::info!("pane {pane_id} close_token cancelled");
+            })
+            .await
+            .ok();
+            registry_wait.remove_pane(pane_id).await;
+            tracing::info!("pane {pane_id} removed from registry after exit");
         });
     }
 

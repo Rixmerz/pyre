@@ -257,7 +257,10 @@ async fn run_multi_pane_test() -> anyhow::Result<()> {
         String::from_utf8_lossy(&buf2)
     );
 
-    // 6. list_sessions must report exactly one session.
+    // 6. Both panes have exited; the daemon auto-removes the session once its
+    //    last pane exits. list_sessions must now be empty.
+    // Give the async remove_pane task a moment to run.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     let sessions = rpc
         .list_sessions(tarpc::context::current())
         .await
@@ -265,8 +268,8 @@ async fn run_multi_pane_test() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("list_sessions: {e}"))?;
     assert_eq!(
         sessions.len(),
-        1,
-        "expected 1 session, got {}: {:?}",
+        0,
+        "expected 0 sessions after all panes exited, got {}: {:?}",
         sessions.len(),
         sessions.iter().map(|s| s.id).collect::<Vec<_>>()
     );
