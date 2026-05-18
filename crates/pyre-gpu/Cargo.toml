@@ -1,0 +1,6 @@
+[package]
+name = "pyre-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
