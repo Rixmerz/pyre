@@ -118,6 +118,10 @@ pub trait PyreDaemon {
     async fn list_all_panes() -> Result<Vec<crate::PaneInfo>, PyreError>;
     /// Return process metadata for the foreground PID of a pane (Linux-only).
     async fn inspect_pid(pane: PaneId) -> Result<PidInspect, PyreError>;
+    /// Deliver raw bytes directly to a pane's PTY input channel.
+    /// Bypasses the stream protocol to avoid the race where the socket closes
+    /// before the async stream task forwards the InputFrame to pane.input_tx.
+    async fn send_keys(pane: PaneId, bytes: Vec<u8>) -> Result<(), PyreError>;
 }
 
 /// Process metadata returned by `inspect_pid`.

@@ -272,6 +272,25 @@ impl pyre_proto::service::PyreDaemon for DaemonImpl {
         Ok(self.registry.list_all_panes().await)
     }
 
+    async fn send_keys(
+        self,
+        _ctx: context::Context,
+        pane: PaneId,
+        bytes: Vec<u8>,
+    ) -> Result<(), PyreError> {
+        let (_session, pane_state) = self
+            .registry
+            .get_pane(pane)
+            .await
+            .ok_or(PyreError::NoSuchPane(pane))?;
+        pane_state
+            .input_tx
+            .send(bytes::Bytes::from(bytes))
+            .await
+            .map_err(|e| PyreError::Io(format!("input channel closed: {e}")))?;
+        Ok(())
+    }
+
     async fn inspect_pid(
         self,
         _ctx: context::Context,
