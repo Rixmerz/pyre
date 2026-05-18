@@ -67,6 +67,7 @@ async fn run_capture() -> anyhow::Result<()> {
                 cols: 80,
                 rows: 24,
                 env: vec![("PS1".into(), "".into())],
+                name: None,
             },
         )
         .await

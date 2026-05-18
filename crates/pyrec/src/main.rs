@@ -451,6 +451,7 @@ async fn run_default(socket: PathBuf, shell: Option<String>) -> Result<()> {
         cols,
         rows,
         env: std::env::vars().collect(),
+        name: None,
     };
     let SpawnResp { session, pane } = client
         .spawn(tarpc::context::current(), req)
@@ -873,6 +874,7 @@ async fn main() -> Result<()> {
                 cols,
                 rows,
                 env: std::env::vars().collect(),
+                name: None,
             };
             let SpawnResp { session, pane } = client
                 .spawn(tarpc::context::current(), req)

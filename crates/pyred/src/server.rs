@@ -21,7 +21,10 @@ pub struct DaemonImpl {
 
 impl pyre_proto::service::PyreDaemon for DaemonImpl {
     async fn spawn(self, _ctx: context::Context, req: SpawnReq) -> Result<SpawnResp, PyreError> {
-        let session = self.registry.new_session(self.store.clone()).await;
+        let session = self
+            .registry
+            .new_session(self.store.clone(), req.name.clone())
+            .await;
         let open_req = OpenPaneReq {
             session: session.id,
             shell: req.shell,
