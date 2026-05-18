@@ -28,6 +28,7 @@ zstd.workspace = true
 alacritty_terminal.workspace = true
 dirs.workspace = true
 regex.workspace = true
+tantivy.workspace = true
 async-trait.workspace = true
 
 [dev-dependencies]

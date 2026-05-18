@@ -26,6 +26,7 @@ pub async fn spawn_pty(
     req: SpawnReq,
     session_id: SessionId,
     store: Arc<crate::store::Store>,
+    block_index: Arc<crate::index::BlockIndex>,
 ) -> Result<PaneState> {
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -136,9 +137,14 @@ pub async fn spawn_pty(
     // and persist blocks/output into the store.
     let events_tx_clone = events_tx.clone();
     let store_clone = store.clone();
+    let block_index_clone = block_index.clone();
     tokio::spawn(async move {
         let mut parser = crate::parser::BlockParser::new(session_id);
         let mut writers: HashMap<pyre_proto::BlockId, crate::store::BlobWriter> = HashMap::new();
+        // In-memory stdout accumulator per block for indexing (capped at 256 KiB).
+        let mut stdout_bufs: HashMap<pyre_proto::BlockId, Vec<u8>> = HashMap::new();
+        // Block metadata keyed by id, needed at BlockEnd for indexing.
+        let mut block_meta: HashMap<pyre_proto::BlockId, pyre_proto::Block> = HashMap::new();
         let mut events = Vec::new();
         while let Some(chunk) = parse_rx.recv().await {
             events.clear();
@@ -181,8 +187,19 @@ pub async fn spawn_pty(
                             Ok(Err(e)) => tracing::warn!("BlobWriter::open: {e:#}"),
                             Err(e) => tracing::warn!("spawn_blocking BlobWriter::open: {e}"),
                         }
+                        stdout_bufs.insert(block, Vec::new());
+                        block_meta.insert(block, proto_block);
                     }
                     BlockEvent::OutputChunk { block, data } => {
+                        // Accumulate stdout for indexing (cap at 256 KiB).
+                        if let Some(buf) = stdout_bufs.get_mut(&block) {
+                            const INDEX_CAP: usize = 256 * 1024;
+                            let remaining = INDEX_CAP.saturating_sub(buf.len());
+                            if remaining > 0 {
+                                let slice = &data[..data.len().min(remaining)];
+                                buf.extend_from_slice(slice);
+                            }
+                        }
                         if let Some(mut bw) = writers.remove(&block) {
                             let bytes_vec = data.to_vec();
                             let result = tokio::task::spawn_blocking(move || {
@@ -209,6 +226,19 @@ pub async fn spawn_pty(
                             .await
                         {
                             tracing::warn!("store.finalize_block: {e:#}");
+                        }
+                        // Index the block.
+                        let stdout_text = stdout_bufs
+                            .remove(&block)
+                            .and_then(|b| String::from_utf8(b).ok())
+                            .unwrap_or_default();
+                        if let Some(meta) = block_meta.remove(&block) {
+                            let idx = block_index_clone.clone();
+                            tokio::task::spawn_blocking(move || {
+                                if let Err(e) = idx.add_block(&meta, &stdout_text) {
+                                    tracing::warn!("block_index.add_block: {e:#}");
+                                }
+                            });
                         }
                     }
                 }

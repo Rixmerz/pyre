@@ -122,6 +122,7 @@ impl SessionRegistry {
         session_id: SessionId,
         req: OpenPaneReq,
         store: Arc<Store>,
+        block_index: Arc<crate::index::BlockIndex>,
     ) -> Result<Arc<PaneState>> {
         let session = {
             self.sessions
@@ -141,7 +142,7 @@ impl SessionRegistry {
             env: req.env,
         };
 
-        let raw = spawn_pty(spawn_req, session_id, store).await?;
+        let raw = spawn_pty(spawn_req, session_id, store, block_index).await?;
         let pane = Arc::new(raw);
 
         session.panes.lock().await.insert(pane.id, pane.clone());
