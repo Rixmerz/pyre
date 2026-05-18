@@ -59,7 +59,9 @@ use tarpc::tokio_serde::formats::Bincode;
 use theme::EMBER;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
+use tokio::process::Command as TokioCommand;
 use tokio::sync::mpsc;
+use std::process::Stdio;
 use tokio_serde::formats::SymmetricalBincode;
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 
@@ -129,6 +131,52 @@ fn resolve_shell(shell_arg: Option<String>) -> Option<String> {
 }
 
 async fn control_client(socket: &Path) -> Result<PyreDaemonClient> {
+    // Try connecting first. On ENOENT/ECONNREFUSED, spawn pyred and retry.
+    if let Ok(sock) = try_connect_control(socket).await {
+        return Ok(sock);
+    }
+
+    // Daemon not running — spawn it.
+    let pyred_bin = std::env::var("PYRED_BIN").ok().unwrap_or_else(|| {
+        // Sibling of current_exe() (e.g. target/release/pyred next to target/release/pyre-tui).
+        if let Ok(exe) = std::env::current_exe() {
+            let sibling = exe.parent().map(|p| p.join("pyred"));
+            if let Some(path) = sibling {
+                if path.exists() {
+                    return path.to_string_lossy().into_owned();
+                }
+            }
+        }
+        "pyred".to_owned()
+    });
+
+    tracing::info!("pyred not reachable at {}; spawning {}", socket.display(), pyred_bin);
+    TokioCommand::new(&pyred_bin)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("failed to spawn pyred binary '{pyred_bin}'"))?;
+
+    // Poll every 100 ms for up to 3 s (30 attempts).
+    let mut last_err = anyhow!("daemon did not come up after 3 s");
+    for _ in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        match try_connect_control(socket).await {
+            Ok(client) => return Ok(client),
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err).with_context(|| {
+        format!(
+            "spawned pyred but socket {} never became ready; check pyred logs",
+            socket.display()
+        )
+    })
+}
+
+/// Single non-retrying connect attempt; wraps the mode-byte handshake.
+async fn try_connect_control(socket: &Path) -> Result<PyreDaemonClient> {
     let mut sock = UnixStream::connect(socket)
         .await
         .with_context(|| format!("connect {}", socket.display()))?;
@@ -292,6 +340,9 @@ struct PaneSlot {
     /// Wall-clock instant of the last block-poll so we throttle to ~500 ms.
     last_block_poll: std::time::Instant,
 
+    /// Last PTY size successfully sent to the daemon, to avoid spamming per frame.
+    last_sent_size: (u16, u16),
+
     /// 0 = live view; N = N lines scrolled back via vt100 native scrollback.
     scroll_offset: usize,
     /// Total scrollback lines available as of the last render (cached via peek/restore).
@@ -392,14 +443,13 @@ impl Default for SearchState {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
-#[allow(dead_code)]
 enum SelectionBase {
     Live,
+    #[allow(dead_code)]
     Scrollback(usize), // window_top line index into scrollback
 }
 
 #[derive(Clone)]
-#[allow(dead_code)]
 struct Selection {
     pane_idx: usize,
     /// (row, col) relative to the pane's vt100/content area, viewport-relative.
@@ -409,7 +459,6 @@ struct Selection {
     base: SelectionBase,
 }
 
-#[allow(dead_code)]
 impl Selection {
     fn normalized(&self) -> ((u16, u16), (u16, u16)) {
         let (sr, sc) = self.start;
@@ -421,6 +470,7 @@ impl Selection {
         }
     }
 
+    #[allow(dead_code)]
     fn contains(&self, row: u16, col: u16) -> bool {
         let ((r0, c0), (r1, c1)) = self.normalized();
         if row < r0 || row > r1 {
@@ -555,6 +605,8 @@ struct AppState {
     session_plus_rect: Option<Rect>,
     /// Rect of the [+] button in the tabs strip.
     tab_plus_rect: Option<Rect>,
+    /// Queued resize RPCs collected by render_pane (sync); drained after each draw.
+    pending_resizes: Vec<(PaneId, pyre_proto::PaneSize)>,
 }
 
 impl AppState {
@@ -754,6 +806,7 @@ async fn attach_pane(socket: &Path, session: SessionId, pane_id: PaneId) -> Resu
         last_block_poll: std::time::Instant::now()
             .checked_sub(std::time::Duration::from_secs(10))
             .unwrap_or_else(std::time::Instant::now),
+        last_sent_size: (cols, rows),
         scroll_offset: 0,
         scrollback_capacity: 0,
         last_screen_rect: Rect::default(),
@@ -773,6 +826,7 @@ fn render_pane(
     focused: bool,
     selection: Option<&Selection>,
     slot_idx: usize,
+    pending_resizes: &mut Vec<(PaneId, pyre_proto::PaneSize)>,
 ) {
     let short8: String = slot.pane_id.0.to_string().chars().take(8).collect();
     let border_block = if focused {
@@ -840,9 +894,20 @@ fn render_pane(
         let (cur_rows, cur_cols) = slot.parser.screen().size();
         if cur_rows != target_rows || cur_cols != target_cols {
             slot.parser.set_size(target_rows, target_cols);
-            // TODO: no resize RPC yet — shell still thinks 80x24.
-            // Once a resize_pane control RPC exists in pyre-proto, call it here
-            // (tokio::spawn) so the child pty knows the real viewport dimensions.
+        }
+        // Fire resize RPC when dims changed AND differ from last sent — avoid
+        // spamming the daemon every frame. Collected into pending_resizes and
+        // drained after draw() returns (async context).
+        let (last_cols, last_rows) = slot.last_sent_size;
+        if target_cols != last_cols || target_rows != last_rows {
+            slot.last_sent_size = (target_cols, target_rows);
+            pending_resizes.push((
+                slot.pane_id,
+                pyre_proto::PaneSize {
+                    cols: target_cols,
+                    rows: target_rows,
+                },
+            ));
         }
     }
 
@@ -1030,12 +1095,13 @@ fn render_layout(
     current_path: &mut Vec<usize>,
     boundaries: &mut Vec<SplitBoundary>,
     selection: Option<&Selection>,
+    pending_resizes: &mut Vec<(PaneId, pyre_proto::PaneSize)>,
 ) {
     match node {
         LayoutNode::Leaf(slot_idx) => {
             if let Some(slot) = slots[*slot_idx].as_mut() {
                 let focused = current_path == focus_path;
-                render_pane(frame, area, slot, focused, selection, *slot_idx);
+                render_pane(frame, area, slot, focused, selection, *slot_idx, pending_resizes);
             }
         }
         LayoutNode::HSplit(children) => {
@@ -1069,6 +1135,7 @@ fn render_layout(
                     current_path,
                     boundaries,
                     selection,
+                    pending_resizes,
                 );
                 current_path.pop();
             }
@@ -1104,6 +1171,7 @@ fn render_layout(
                     current_path,
                     boundaries,
                     selection,
+                    pending_resizes,
                 );
                 current_path.pop();
             }
@@ -1494,6 +1562,7 @@ fn draw_frame(
                         true,
                         state.selection.as_ref(),
                         slot_idx,
+                        &mut state.pending_resizes,
                     );
                 }
             }
@@ -1508,6 +1577,7 @@ fn draw_frame(
                 &mut current_path,
                 &mut new_boundaries,
                 state.selection.as_ref(),
+                &mut state.pending_resizes,
             );
         }
         state.sessions[state.active_session].tabs[active_tab_idx].boundaries = new_boundaries;
@@ -1938,13 +2008,29 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
                 }
             }
 
-            // Check if clicking inside a leaf pane.
+            // Check if clicking inside a leaf pane — also start text selection.
             let sv = &state.sessions[state.active_session];
             let mut leaf_rects: Vec<(usize, Rect)> = Vec::new();
             collect_leaf_rects(&sv.tabs[sv.active_tab].root, body_area, &mut leaf_rects);
             for (slot_idx, rect) in &leaf_rects {
                 if rect_contains(*rect, col, row) {
                     focus_slot(state, *slot_idx);
+                    // Compute (row, col) relative to the slot's content area.
+                    // The content area inner rect is stored in last_screen_rect.
+                    if let Some(slot) = state.slots[*slot_idx].as_ref() {
+                        let content = slot.last_screen_rect;
+                        if rect_contains(content, col, row) {
+                            let sel_row = row.saturating_sub(content.y);
+                            let sel_col = col.saturating_sub(content.x);
+                            state.selection = Some(Selection {
+                                pane_idx: *slot_idx,
+                                start: (sel_row, sel_col),
+                                end: (sel_row, sel_col),
+                                dragging: true,
+                                base: SelectionBase::Live,
+                            });
+                        }
+                    }
                     return true;
                 }
             }
@@ -1953,6 +2039,7 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
         MouseEventKind::Drag(MouseButton::Left) => {
             let sv = &mut state.sessions[state.active_session];
             let tab = &mut sv.tabs[sv.active_tab];
+            // Split-resize drag takes priority.
             if let Some(ref drag) = tab.drag {
                 let cur_coord = if drag.boundary.is_hsplit { row } else { col };
                 let delta = cur_coord as i32 - drag.start_coord as i32;
@@ -1982,6 +2069,21 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
                 }
                 return true;
             }
+            // Text selection drag: update end point if selection is active.
+            if let Some(ref mut sel) = state.selection {
+                if sel.dragging {
+                    if let Some(slot) = state.slots[sel.pane_idx].as_ref() {
+                        let content = slot.last_screen_rect;
+                        if rect_contains(content, col, row) {
+                            sel.end = (
+                                row.saturating_sub(content.y),
+                                col.saturating_sub(content.x),
+                            );
+                            return true;
+                        }
+                    }
+                }
+            }
             false
         }
         MouseEventKind::Up(MouseButton::Left) => {
@@ -1990,6 +2092,49 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
             if tab.drag.is_some() {
                 tab.drag = None;
                 return true;
+            }
+            // Finish text selection: copy to clipboard.
+            if let Some(ref mut sel) = state.selection {
+                if sel.dragging {
+                    sel.dragging = false;
+                    // Extract selected text from the vt100 parser via per-cell iteration.
+                    let pane_idx = sel.pane_idx;
+                    let ((r0, c0), (r1, c1)) = sel.normalized();
+                    if let Some(slot) = state.slots[pane_idx].as_ref() {
+                        let screen = slot.parser.screen();
+                        let mut text = String::new();
+                        for row in r0..=r1 {
+                            if row > r0 {
+                                text.push('\n');
+                            }
+                            let col_start = if row == r0 { c0 } else { 0 };
+                            let col_end = if row == r1 { c1 } else { screen.size().1 };
+                            for col in col_start..=col_end {
+                                let contents = screen
+                                    .cell(row, col)
+                                    .map(|c| c.contents().to_owned())
+                                    .unwrap_or_default();
+                                if contents.is_empty() {
+                                    text.push(' ');
+                                } else {
+                                    text.push_str(&contents);
+                                }
+                            }
+                        }
+                        // Trim trailing whitespace from each line.
+                        let trimmed: String = text
+                            .lines()
+                            .map(|l| l.trim_end())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if !trimmed.is_empty() {
+                            if let Err(e) = crate::clipboard::copy_to_clipboard(&trimmed) {
+                                tracing::warn!("clipboard copy failed: {e}");
+                            }
+                        }
+                    }
+                    return true;
+                }
             }
             false
         }
@@ -2124,6 +2269,21 @@ fn close_pane_by_slot_idx(state: &mut AppState, slot_idx: usize) {
         Some(loc) => loc,
         None => return,
     };
+
+    // Extract the pane_id before we drop the slot so we can fire the close RPC.
+    let pane_id = state
+        .slots
+        .get(slot_idx)
+        .and_then(|s| s.as_ref())
+        .map(|s| s.pane_id);
+
+    // Fire close_pane RPC fire-and-forget so the daemon evicts the pane.
+    if let Some(pid) = pane_id {
+        let client = state.control.clone();
+        tokio::runtime::Handle::current().spawn(async move {
+            let _ = client.close_pane(tarpc::context::current(), pid).await;
+        });
+    }
 
     // Special case: root itself is the only leaf (no splits).  remove_leaf
     // returns the slot index but cannot mutate root in this case, so
@@ -2276,6 +2436,7 @@ fn initial_app_state(
         session_strip_rects: Vec::new(),
         session_plus_rect: None,
         tab_plus_rect: None,
+        pending_resizes: Vec::new(),
     }
 }
 
@@ -2399,6 +2560,20 @@ async fn run_tui(
 
         // Draw — pass state as mut so render_pane can store last_screen_rect.
         draw_frame(&mut terminal, &mut state, prefix_active)?;
+
+        // Drain pending resize RPCs collected by render_pane (fire-and-forget).
+        let resizes = std::mem::take(&mut state.pending_resizes);
+        if !resizes.is_empty() {
+            let client = state.control.clone();
+            tokio::spawn(async move {
+                for (pane_id, size) in resizes {
+                    let req = pyre_proto::ResizePaneReq { pane_id, size };
+                    let _ = client
+                        .resize_pane(tarpc::context::current(), req)
+                        .await;
+                }
+            });
+        }
 
         // Poll crossterm events (~16 ms = 60 fps)
         if !crossterm::event::poll(Duration::from_millis(16))? {
@@ -2818,9 +2993,9 @@ async fn run_tui(
             }
 
             Event::Resize(new_cols, new_rows) => {
-                for slot in state.slots.iter_mut().flatten() {
-                    slot.parser.set_size(new_rows, new_cols);
-                }
+                // render_pane handles per-slot set_size with split-correct dims.
+                // Just clear stale cells and let next draw repaint.
+                terminal.clear()?;
                 tracing::debug!("terminal resized to {new_cols}x{new_rows}");
             }
 
