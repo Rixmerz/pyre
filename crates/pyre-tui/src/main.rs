@@ -24,7 +24,6 @@
 //!   PgUp/PgDn: scroll focused pane's scrollback buffer (when NOT in prefix / search)
 //!   All other keys forwarded to the focused PTY.
 
-use std::collections::VecDeque;
 use std::io::stdout;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -293,12 +292,7 @@ struct PaneSlot {
     /// Wall-clock instant of the last block-poll so we throttle to ~500 ms.
     last_block_poll: std::time::Instant,
 
-    // ── Raw-byte scrollback buffer ──
-    /// All raw bytes received from the PTY, including CSI sequences. Oldest at front.
-    raw_history: VecDeque<u8>,
-    /// Byte capacity cap, default 256 KB.
-    raw_cap: usize,
-    /// 0 = live view; N = N lines scrolled back from the bottom of raw_history.
+    /// 0 = live view; N = N lines scrolled back via vt100 native scrollback.
     scroll_offset: usize,
     /// The screen rect captured during the last render, used for mouse hit-test.
     last_screen_rect: Rect,
@@ -307,21 +301,9 @@ struct PaneSlot {
 }
 
 impl PaneSlot {
-    /// Feed raw bytes into both the vt100 parser and the raw history buffer.
+    /// Feed raw bytes into the vt100 parser (scrollback is maintained natively).
     fn process_output(&mut self, data: &[u8]) {
         self.parser.process(data);
-        // Append to raw history, evicting oldest bytes if over cap.
-        for &b in data {
-            self.raw_history.push_back(b);
-        }
-        while self.raw_history.len() > self.raw_cap {
-            self.raw_history.pop_front();
-        }
-    }
-
-    /// Count newline bytes in raw_history (approximation of line count).
-    fn raw_line_count(&self) -> usize {
-        self.raw_history.iter().filter(|&&b| b == b'\n').count()
     }
 }
 
@@ -751,7 +733,7 @@ async fn attach_pane(socket: &Path, session: SessionId, pane_id: PaneId) -> Resu
 
     Ok(PaneSlot {
         pane_id,
-        parser: vt100::Parser::new(rows, cols, 0),
+        parser: vt100::Parser::new(rows, cols, 10_000),
         input_tx,
         output_rx,
         recent_blocks: Vec::new(),
@@ -759,8 +741,6 @@ async fn attach_pane(socket: &Path, session: SessionId, pane_id: PaneId) -> Resu
         last_block_poll: std::time::Instant::now()
             .checked_sub(std::time::Duration::from_secs(10))
             .unwrap_or_else(std::time::Instant::now),
-        raw_history: VecDeque::new(),
-        raw_cap: 256 * 1024,
         scroll_offset: 0,
         last_screen_rect: Rect::default(),
         ribbon_chip_rects: Vec::new(),
@@ -816,133 +796,24 @@ fn render_pane(
     // Store the content rect for mouse hit-test (used by scroll wheel handler).
     slot.last_screen_rect = content_area;
 
-    if slot.scroll_offset == 0 {
-        // ── Live vt100 render ──
-        let vt_area = content_area;
-        let screen = slot.parser.screen();
-        let mut lines: Vec<Line> = Vec::with_capacity(vt_area.height as usize);
+    // ── Unified render: set_scrollback shifts the vt100 view; 0 = live ──
+    slot.parser.set_scrollback(slot.scroll_offset);
 
-        for row in 0..vt_area.height {
-            let mut spans: Vec<Span> = Vec::new();
-            let mut current_text = String::new();
-            let mut current_style = Style::default();
-
-            for col in 0..vt_area.width {
-                let cell = screen.cell(row, col);
-                let (ch, fg, bg) = match cell {
-                    Some(c) => {
-                        let ch = if c.contents().is_empty() {
-                            ' '
-                        } else {
-                            c.contents().chars().next().unwrap_or(' ')
-                        };
-                        let fg = vt100_color(c.fgcolor());
-                        let bg = vt100_color(c.bgcolor());
-                        (ch, fg, bg)
-                    }
-                    None => (' ', None, None),
-                };
-
-                let style = Style::default()
-                    .fg(fg.unwrap_or(Color::Reset))
-                    .bg(bg.unwrap_or(Color::Reset));
-
-                if style == current_style {
-                    current_text.push(ch);
-                } else {
-                    if !current_text.is_empty() {
-                        spans.push(Span::styled(current_text.clone(), current_style));
-                        current_text.clear();
-                    }
-                    current_text.push(ch);
-                    current_style = style;
-                }
-            }
-            if !current_text.is_empty() {
-                spans.push(Span::styled(current_text, current_style));
-            }
-            lines.push(Line::from(spans));
-        }
-
-        frame.render_widget(Paragraph::new(lines), vt_area);
-
-        // Overlay selection highlight on live view.
-        if let Some(sel) = selection {
-            if sel.pane_idx == slot_idx {
-                if let SelectionBase::Live = sel.base {
-                    let ((r0, c0), (r1, c1)) = sel.normalized();
-                    for row in r0..=r1.min(vt_area.height.saturating_sub(1)) {
-                        let col_start = if row == r0 { c0 } else { 0 };
-                        let col_end = if row == r1 {
-                            c1.min(vt_area.width.saturating_sub(1))
-                        } else {
-                            vt_area.width.saturating_sub(1)
-                        };
-                        for col in col_start..=col_end {
-                            let sx = vt_area.x + col;
-                            let sy = vt_area.y + row;
-                            if sx < vt_area.x + vt_area.width && sy < vt_area.y + vt_area.height {
-                                if let Some(cell) = frame.buffer_mut().cell_mut((sx, sy)) {
-                                    cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    // When scrolled back, reserve 1 column on the right for a scrollbar.
+    let (sb_area, text_area) = if slot.scroll_offset > 0 && content_area.width > 1 {
+        let split = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(content_area);
+        (Some(split[1]), split[0])
     } else {
-        // ── Scrollback render (raw-byte replay) ──
-        // Reserve 1 column on the right for the scrollbar.
-        let (sb_area, text_area) = if content_area.width > 1 {
-            let split = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Min(1), Constraint::Length(1)])
-                .split(content_area);
-            (Some(split[1]), split[0])
-        } else {
-            (None, content_area)
-        };
+        (None, content_area)
+    };
 
-        // Convert raw_history to a contiguous slice for processing.
-        let raw: Vec<u8> = slot.raw_history.iter().copied().collect();
-        let total_lines = raw.iter().filter(|&&b| b == b'\n').count();
+    {
+        let screen = slot.parser.screen();
+        let mut lines: Vec<Line> = Vec::with_capacity(text_area.height as usize);
 
-        // Clamp scroll_offset to valid range.
-        let offset = slot.scroll_offset.min(total_lines);
-
-        // Find the byte index that is `offset` newlines from the end.
-        // This is the exclusive end of the historical slice we feed to replay.
-        let slice_end = if offset == 0 {
-            raw.len()
-        } else {
-            let mut nl_count = 0usize;
-            let mut idx = raw.len();
-            while idx > 0 {
-                idx -= 1;
-                if raw[idx] == b'\n' {
-                    nl_count += 1;
-                    if nl_count == offset {
-                        break;
-                    }
-                }
-            }
-            idx
-        };
-
-        // Take up to (height * 200) bytes before slice_end so the replay parser
-        // sees enough context to fill the viewport without re-processing all history.
-        let height_usize = text_area.height as usize;
-        let slice_start = slice_end.saturating_sub(height_usize * 200);
-        let replay_bytes = &raw[slice_start..slice_end];
-
-        // Build a fresh parser sized to the pane and replay the slice.
-        let mut hist_parser = vt100::Parser::new(text_area.height, text_area.width, 0);
-        hist_parser.process(replay_bytes);
-
-        // Render the replay parser's screen using the same cell loop as live view.
-        let screen = hist_parser.screen();
-        let mut lines: Vec<Line> = Vec::with_capacity(height_usize);
         for row in 0..text_area.height {
             let mut spans: Vec<Span> = Vec::new();
             let mut current_text = String::new();
@@ -984,23 +855,55 @@ fn render_pane(
             }
             lines.push(Line::from(spans));
         }
-        frame.render_widget(Paragraph::new(lines), text_area);
 
-        // Scrollbar: position reflects how far back we are in total_lines.
-        if let Some(sb_rect) = sb_area {
-            let virtual_total = total_lines.max(1);
-            let position = virtual_total.saturating_sub(offset);
-            let mut sb_state = ScrollbarState::new(virtual_total).position(position);
-            frame.render_stateful_widget(
-                Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                    .style(EMBER.border())
-                    .thumb_style(Style::default().fg(EMBER.primary))
-                    .track_symbol(Some("│"))
-                    .thumb_symbol("█"),
-                sb_rect,
-                &mut sb_state,
-            );
+        frame.render_widget(Paragraph::new(lines), text_area);
+    }
+
+    // Overlay selection highlight on live view.
+    if slot.scroll_offset == 0 {
+        if let Some(sel) = selection {
+            if sel.pane_idx == slot_idx {
+                if let SelectionBase::Live = sel.base {
+                    let ((r0, c0), (r1, c1)) = sel.normalized();
+                    for row in r0..=r1.min(text_area.height.saturating_sub(1)) {
+                        let col_start = if row == r0 { c0 } else { 0 };
+                        let col_end = if row == r1 {
+                            c1.min(text_area.width.saturating_sub(1))
+                        } else {
+                            text_area.width.saturating_sub(1)
+                        };
+                        for col in col_start..=col_end {
+                            let sx = text_area.x + col;
+                            let sy = text_area.y + row;
+                            if sx < text_area.x + text_area.width
+                                && sy < text_area.y + text_area.height
+                            {
+                                if let Some(cell) = frame.buffer_mut().cell_mut((sx, sy)) {
+                                    cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
+    }
+
+    // Scrollbar when scrolled back.
+    if let Some(sb_rect) = sb_area {
+        let total_scrollback = slot.parser.screen().scrollback();
+        let virtual_total = total_scrollback.max(1);
+        let position = virtual_total.saturating_sub(slot.scroll_offset);
+        let mut sb_state = ScrollbarState::new(virtual_total).position(position);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .style(EMBER.border())
+                .thumb_style(Style::default().fg(EMBER.primary))
+                .track_symbol(Some("│"))
+                .thumb_symbol("█"),
+            sb_rect,
+            &mut sb_state,
+        );
     }
 
     // ── ribbon render ──
@@ -1899,7 +1802,7 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
                 if rect_contains(*rect, col, row) {
                     focus_slot(state, *slot_idx);
                     if let Some(slot) = state.slots[*slot_idx].as_mut() {
-                        let max_offset = slot.raw_line_count();
+                        let max_offset = slot.parser.screen().scrollback();
                         slot.scroll_offset = (slot.scroll_offset + 3).min(max_offset);
                     }
                     return true;
@@ -2851,7 +2754,7 @@ async fn run_tui(
                         if let Some(slot) = state.slots[slot_idx].as_mut() {
                             match code {
                                 KeyCode::PageUp => {
-                                    let max_offset = slot.raw_line_count();
+                                    let max_offset = slot.parser.screen().scrollback();
                                     slot.scroll_offset =
                                         (slot.scroll_offset + half_page).min(max_offset);
                                     continue;
