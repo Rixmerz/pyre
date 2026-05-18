@@ -151,17 +151,34 @@ async fn control_client(socket: &Path) -> Result<PyreDaemonClient> {
     });
 
     tracing::info!("pyred not reachable at {}; spawning {}", socket.display(), pyred_bin);
-    TokioCommand::new(&pyred_bin)
+    let mut child = TokioCommand::new(&pyred_bin)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        // Inherit stderr so startup errors from pyred are visible in the
+        // user's terminal (e.g. Tantivy lock contention, bind failures).
+        .stderr(Stdio::inherit())
         .spawn()
         .with_context(|| format!("failed to spawn pyred binary '{pyred_bin}'"))?;
 
-    // Poll every 100 ms for up to 3 s (30 attempts).
-    let mut last_err = anyhow!("daemon did not come up after 3 s");
-    for _ in 0..30 {
+    // Poll every 100 ms for up to 5 s (50 attempts).
+    // If the child exits before the socket becomes ready, surface its exit
+    // status immediately rather than waiting out the full timeout.
+    let mut last_err = anyhow!("daemon did not come up after 5 s");
+    for _ in 0..50 {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Check whether the child already exited (e.g. crashed on lock).
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Err(anyhow!(
+                    "spawned pyred exited immediately with status {status}; \
+                     check stderr for details (Tantivy lock? stale socket?)"
+                ));
+            }
+            Ok(None) => {} // still running — keep polling
+            Err(e) => tracing::warn!("try_wait on pyred child: {e}"),
+        }
+
         match try_connect_control(socket).await {
             Ok(client) => return Ok(client),
             Err(e) => last_err = e,
