@@ -553,12 +553,35 @@ struct ContextMenu {
     target_slot: usize,
 }
 
-#[allow(dead_code)]
-struct AppState {
-    session: SessionId,
-    slots: Vec<PaneSlot>,
+/// Per-session view: tabs and panes for one daemon session.
+struct SessionView {
+    id: SessionId,
+    name: String,
     tabs: Vec<Tab>,
     active_tab: usize,
+}
+
+/// Which kind of name-prompt overlay is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptKind {
+    NewSession,
+    NewTab,
+}
+
+/// Name-prompt overlay state.
+struct NamePrompt {
+    kind: PromptKind,
+    input: String,
+}
+
+#[allow(dead_code)]
+struct AppState {
+    /// All known sessions (may have tabs loaded lazily).
+    sessions: Vec<SessionView>,
+    /// Index into `sessions` that is currently displayed.
+    active_session: usize,
+    /// All attached pane slots (shared across all sessions).
+    slots: Vec<PaneSlot>,
     control: PyreDaemonClient,
     socket: PathBuf,
     shell: Option<String>,
@@ -583,6 +606,26 @@ struct AppState {
     context_menu: Option<ContextMenu>,
     /// PID inspect overlay data.
     pid_inspect: Option<PidInspect>,
+    /// Name-prompt overlay (new session or new tab).
+    prompt: Option<NamePrompt>,
+    /// Session strip hit-test rects: (session_vec_index, rect).
+    session_strip_rects: Vec<(usize, Rect)>,
+    /// Rect of the [+] button in the session strip.
+    session_plus_rect: Option<Rect>,
+    /// Rect of the [+] button in the tabs strip.
+    tab_plus_rect: Option<Rect>,
+}
+
+impl AppState {
+    /// Convenience: active session's session id.
+    fn active_session_id(&self) -> SessionId {
+        self.sessions[self.active_session].id
+    }
+
+    /// Convenience: active session view (mutable).
+    fn active_session_view_mut(&mut self) -> &mut SessionView {
+        &mut self.sessions[self.active_session]
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1297,6 +1340,60 @@ fn render_sidebar(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
     frame.render_widget(list, inner);
 }
 
+/// Render the name-prompt overlay and position the host cursor.
+fn render_name_prompt(frame: &mut ratatui::Frame, prompt: &NamePrompt) {
+    let area = frame.area();
+    let w = (area.width as f32 * 0.60) as u16;
+    let h: u16 = 5;
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let overlay_rect = Rect::new(x, y, w.max(30), h);
+
+    frame.render_widget(Clear, overlay_rect);
+
+    let title = match prompt.kind {
+        PromptKind::NewSession => " new session name ",
+        PromptKind::NewTab => " new tab label ",
+    };
+
+    let outer = RatatuiBlock::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(EMBER.border_focus())
+        .title(Span::styled(title, EMBER.title(EMBER.primary)))
+        .style(EMBER.overlay());
+    let inner = outer.inner(overlay_rect);
+    frame.render_widget(outer, overlay_rect);
+
+    // Input row (row 0 of inner) + hint row (row 1).
+    let split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+
+    let input_area = split[0];
+    let hint_area = split[1];
+
+    let input_spans = vec![
+        Span::styled("> ", Style::default().fg(EMBER.primary)),
+        Span::styled(prompt.input.as_str(), Style::default().fg(EMBER.text)),
+        Span::styled("█", Style::default().fg(EMBER.spark)),
+    ];
+    frame.render_widget(Paragraph::new(Line::from(input_spans)), input_area);
+
+    let hint = Paragraph::new(" Enter = create  |  Esc = cancel")
+        .style(Style::default().fg(EMBER.text_dim));
+    frame.render_widget(hint, hint_area);
+
+    // Host cursor at end of input.
+    let cursor_col = (2u16 + prompt.input.len() as u16).min(input_area.width.saturating_sub(1));
+    frame.set_cursor_position((input_area.x + cursor_col, input_area.y));
+}
+
 fn draw_frame(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     state: &mut AppState,
@@ -1305,19 +1402,21 @@ fn draw_frame(
     terminal.draw(|frame| {
         let area = frame.area();
 
-        // Three rows: tab bar (1) + body (min 0) + status bar (1)
+        // Four rows: sessions strip (1) + tabs strip (1) + body (min 0) + status bar (1)
         let outer = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
+                Constraint::Length(1),
                 Constraint::Length(1),
                 Constraint::Min(0),
                 Constraint::Length(1),
             ])
             .split(area);
 
-        let tab_area = outer[0];
-        let body_area = outer[1];
-        let status_area = outer[2];
+        let sessions_area = outer[0];
+        let tabs_area = outer[1];
+        let body_area = outer[2];
+        let status_area = outer[3];
 
         // Frame clear — paint entire frame with bg_style so no bleed.
         frame.render_widget(
@@ -1325,33 +1424,100 @@ fn draw_frame(
             frame.area(),
         );
 
-        // Tab bar
-        let total_tabs = state.tabs.len();
-        let mut tab_spans: Vec<Span> = Vec::new();
-        for (i, _) in state.tabs.iter().enumerate() {
-            let label = format!(" {} ", i + 1);
-            let style = if i == state.active_tab {
-                EMBER.tab_active()
-            } else {
-                EMBER.tab_inactive()
-            };
-            tab_spans.push(Span::styled(label, style));
-            // Single-space separator in bg color between tabs.
-            if i + 1 < total_tabs {
-                tab_spans.push(Span::styled(" ", Style::default().bg(EMBER.bg)));
+        // ── Row 0: sessions strip ──
+        {
+            let mut new_session_rects: Vec<(usize, Rect)> = Vec::new();
+            let mut spans: Vec<Span> = Vec::new();
+            let mut x_cursor: u16 = sessions_area.x;
+
+            for (i, sv) in state.sessions.iter().enumerate() {
+                let label = format!(" {} {} ", i + 1, sv.name);
+                let len = label.chars().count() as u16;
+                let style = if i == state.active_session {
+                    EMBER.tab_active()
+                } else {
+                    EMBER.tab_inactive()
+                };
+                if sessions_area.height > 0 {
+                    new_session_rects.push((i, Rect::new(x_cursor, sessions_area.y, len, 1)));
+                }
+                x_cursor += len;
+                spans.push(Span::styled(label, style));
+                if i + 1 < state.sessions.len() {
+                    spans.push(Span::styled(" ", Style::default().bg(EMBER.bg)));
+                    x_cursor += 1;
+                }
             }
+
+            // [+] button at far right.
+            let plus_label = "[+]";
+            let plus_len = plus_label.len() as u16;
+            let plus_x = sessions_area.x + sessions_area.width.saturating_sub(plus_len);
+            let plus_rect = if sessions_area.height > 0 {
+                Some(Rect::new(plus_x, sessions_area.y, plus_len, 1))
+            } else {
+                None
+            };
+            spans.push(Span::styled(
+                " ".repeat(plus_x.saturating_sub(x_cursor) as usize),
+                Style::default().bg(EMBER.bg),
+            ));
+            spans.push(Span::styled(plus_label, EMBER.tab_inactive()));
+
+            state.session_strip_rects = new_session_rects;
+            state.session_plus_rect = plus_rect;
+
+            frame.render_widget(
+                Paragraph::new(Line::from(spans)).style(Style::default().bg(EMBER.bg)),
+                sessions_area,
+            );
         }
-        // Tab count indicator on right side.
-        let count_label = format!(" {total_tabs} tabs ");
-        tab_spans.push(Span::styled(
-            count_label,
-            Style::default().fg(EMBER.text_dim).bg(EMBER.bg),
-        ));
-        let tab_line = Line::from(tab_spans);
-        frame.render_widget(
-            Paragraph::new(tab_line).style(Style::default().bg(EMBER.bg)),
-            tab_area,
-        );
+
+        // ── Row 1: tabs strip of active session ──
+        {
+            let sv = &state.sessions[state.active_session];
+            let total_tabs = sv.tabs.len();
+            let mut spans: Vec<Span> = Vec::new();
+            let mut x_cursor: u16 = tabs_area.x;
+
+            for (i, _) in sv.tabs.iter().enumerate() {
+                let label = format!(" {} ", i + 1);
+                let len = label.chars().count() as u16;
+                let style = if i == sv.active_tab {
+                    EMBER.tab_active()
+                } else {
+                    EMBER.tab_inactive()
+                };
+                x_cursor += len;
+                spans.push(Span::styled(label, style));
+                if i + 1 < total_tabs {
+                    spans.push(Span::styled(" ", Style::default().bg(EMBER.bg)));
+                    x_cursor += 1;
+                }
+            }
+
+            // [+] button at far right.
+            let plus_label = "[+]";
+            let plus_len = plus_label.len() as u16;
+            let plus_x = tabs_area.x + tabs_area.width.saturating_sub(plus_len);
+            let plus_rect = if tabs_area.height > 0 {
+                Some(Rect::new(plus_x, tabs_area.y, plus_len, 1))
+            } else {
+                None
+            };
+            spans.push(Span::styled(
+                " ".repeat(plus_x.saturating_sub(x_cursor) as usize),
+                Style::default().bg(EMBER.bg),
+            ));
+            spans.push(Span::styled(plus_label, EMBER.tab_inactive()));
+
+            state.tab_plus_rect = plus_rect;
+
+            frame.render_widget(
+                Paragraph::new(Line::from(spans)).style(Style::default().bg(EMBER.bg)),
+                tabs_area,
+            );
+        }
 
         // Body — optionally split horizontally for sidebar.
         let (sidebar_area_opt, pane_body_area) = if state.sidebar_open {
@@ -1369,15 +1535,20 @@ fn draw_frame(
         }
 
         // Render active tab's layout in the remaining area.
-        let active_tab_idx = state.active_tab;
-        let focus_path = state.tabs[active_tab_idx].focus_path.clone();
-        let zoomed = state.tabs[active_tab_idx].zoomed.clone();
+        let active_tab_idx = state.sessions[state.active_session].active_tab;
+        let focus_path = state.sessions[state.active_session].tabs[active_tab_idx]
+            .focus_path
+            .clone();
+        let zoomed = state.sessions[state.active_session].tabs[active_tab_idx]
+            .zoomed
+            .clone();
         let mut new_boundaries: Vec<SplitBoundary> = Vec::new();
 
         // SAFETY: we only borrow root/zoomed via a raw pointer to avoid the
         // simultaneous mutable borrow of slots. render_layout only reads `root`
         // and mutates `slots` at disjoint indices; no mutation of `tabs` occurs.
-        let root_ptr: *const LayoutNode = &state.tabs[active_tab_idx].root;
+        let root_ptr: *const LayoutNode =
+            &state.sessions[state.active_session].tabs[active_tab_idx].root;
 
         if let Some(ref zoom_path) = zoomed {
             // Zoom mode: render only the zoomed leaf filling pane_body_area.
@@ -1405,11 +1576,12 @@ fn draw_frame(
                 state.selection.as_ref(),
             );
         }
-        state.tabs[active_tab_idx].boundaries = new_boundaries;
+        state.sessions[state.active_session].tabs[active_tab_idx].boundaries = new_boundaries;
 
         // Status bar — two segments + optional middle message.
         {
-            let tab = &state.tabs[state.active_tab];
+            let sv = &state.sessions[state.active_session];
+            let tab = &sv.tabs[sv.active_tab];
             let focused_slot = slot_at(&tab.root, &tab.focus_path);
             let is_zoomed = tab.zoomed.is_some();
 
@@ -1442,14 +1614,13 @@ fn draw_frame(
                 ("LIVE", state.status_msg.as_ref().map(|m| format!(" {m} ")))
             };
 
-            // Left: ` ● {session} ▸ {pane} `
+            // Left: ` ● {session_name} ▸ {pane} `
             let left_text = if let Some(slot_idx) = focused_slot {
                 let slot = &state.slots[slot_idx];
-                let session_short = &state.session.0.to_string()[..8];
                 let pane_short = &slot.pane_id.0.to_string()[..8];
-                format!(" ● {session_short} ▸ {pane_short} ")
+                format!(" ● {} ▸ {pane_short} ", sv.name)
             } else {
-                format!(" ● {:.8} ", state.session.0.to_string())
+                format!(" ● {} ", sv.name)
             };
 
             // Right: mode indicator + optional ZOOM chip
@@ -1490,12 +1661,15 @@ fn draw_frame(
         // Host-terminal cursor positioning.
         // Only one pane (the focused one, live view) owns the cursor.
         // Overlays or scrollback suppress it.
-        if state.search.open {
+        if let Some(ref prompt) = state.prompt {
+            render_name_prompt(frame, prompt);
+        } else if state.search.open {
             // Search overlay — drawn on top of everything else and owns cursor.
             render_search_overlay(frame, state);
         } else if state.pid_inspect.is_none() {
             // No blocking overlay: propagate vt100 cursor from focused pane.
-            let tab = &state.tabs[state.active_tab];
+            let sv = &state.sessions[state.active_session];
+            let tab = &sv.tabs[sv.active_tab];
             let focused_slot_idx = if let Some(ref zoom_path) = tab.zoomed {
                 slot_at(&tab.root, zoom_path)
             } else {
@@ -1553,8 +1727,9 @@ fn focus_next(tab: &mut Tab, forward: bool) {
 /// Split the active leaf. `horizontal` = true means HSplit (top/bottom).
 async fn split_active(state: &mut AppState, horizontal: bool) -> Result<()> {
     let (cols, rows) = term_size();
+    let session_id = state.active_session_id();
     let req = OpenPaneReq {
-        session: state.session,
+        session: session_id,
         shell: state.shell.clone(),
         cwd: std::env::current_dir().ok(),
         cols,
@@ -1568,11 +1743,12 @@ async fn split_active(state: &mut AppState, horizontal: bool) -> Result<()> {
         .context("rpc transport")?
         .map_err(|e| anyhow!("daemon open_pane: {e}"))?;
 
-    let slot = attach_pane(&state.socket, state.session, new_pane_id).await?;
+    let slot = attach_pane(&state.socket, session_id, new_pane_id).await?;
     let new_slot_idx = state.slots.len();
     state.slots.push(slot);
 
-    let tab = &mut state.tabs[state.active_tab];
+    let sv = state.active_session_view_mut();
+    let tab = &mut sv.tabs[sv.active_tab];
     // Clear zoom before splitting.
     tab.zoomed = None;
     let old_path = tab.focus_path.clone();
@@ -1606,11 +1782,13 @@ async fn split_active(state: &mut AppState, horizontal: bool) -> Result<()> {
     Ok(())
 }
 
-/// Open a new pane in a new tab.
-async fn open_new_tab(state: &mut AppState) -> Result<()> {
+/// Open a new pane in a new tab within the active session.
+/// `label` is stored client-side only; pass `None` to auto-number.
+async fn open_new_tab(state: &mut AppState, label: Option<String>) -> Result<()> {
     let (cols, rows) = term_size();
+    let session_id = state.active_session_id();
     let req = OpenPaneReq {
-        session: state.session,
+        session: session_id,
         shell: state.shell.clone(),
         cwd: std::env::current_dir().ok(),
         cols,
@@ -1624,18 +1802,67 @@ async fn open_new_tab(state: &mut AppState) -> Result<()> {
         .context("rpc transport")?
         .map_err(|e| anyhow!("daemon open_pane: {e}"))?;
 
-    let slot = attach_pane(&state.socket, state.session, new_pane_id).await?;
+    let slot = attach_pane(&state.socket, session_id, new_pane_id).await?;
     let slot_idx = state.slots.len();
     state.slots.push(slot);
 
-    state.tabs.push(Tab {
+    let sv = state.active_session_view_mut();
+    let tab_n = sv.tabs.len() + 1;
+    let _label = label
+        .filter(|l| !l.is_empty())
+        .unwrap_or_else(|| format!("tab-{tab_n}"));
+    sv.tabs.push(Tab {
         root: LayoutNode::Leaf(slot_idx),
         focus_path: vec![],
         zoomed: None,
         boundaries: Vec::new(),
         drag: None,
     });
-    state.active_tab = state.tabs.len() - 1;
+    sv.active_tab = sv.tabs.len() - 1;
+
+    Ok(())
+}
+
+/// Spawn a brand-new daemon session and push a SessionView.
+async fn open_new_session(state: &mut AppState, name: Option<String>) -> Result<()> {
+    let (cols, rows) = term_size();
+    let resolved_name = name.filter(|n| !n.is_empty());
+    let req = SpawnReq {
+        shell: state.shell.clone(),
+        cwd: std::env::current_dir().ok(),
+        cols,
+        rows,
+        env: std::env::vars().collect(),
+        name: resolved_name.clone(),
+    };
+    let SpawnResp { session, pane } = state
+        .control
+        .spawn(tarpc::context::current(), req)
+        .await
+        .context("rpc transport")?
+        .map_err(|e| anyhow!("daemon spawn: {e}"))?;
+
+    let slot = attach_pane(&state.socket, session, pane).await?;
+    let slot_idx = state.slots.len();
+    state.slots.push(slot);
+
+    // Derive display name: use provided or fall back to session-<short8>.
+    let short8: String = session.0.to_string().chars().take(8).collect();
+    let display_name = resolved_name.unwrap_or_else(|| format!("session-{short8}"));
+
+    state.sessions.push(SessionView {
+        id: session,
+        name: display_name,
+        tabs: vec![Tab {
+            root: LayoutNode::Leaf(slot_idx),
+            focus_path: vec![],
+            zoomed: None,
+            boundaries: Vec::new(),
+            drag: None,
+        }],
+        active_tab: 0,
+    });
+    state.active_session = state.sessions.len() - 1;
 
     Ok(())
 }
@@ -1644,25 +1871,6 @@ async fn open_new_tab(state: &mut AppState) -> Result<()> {
 // Mouse event handler
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Compute tab strip layout widths and return the tab index clicked, if any.
-/// `col` is the x coordinate of the click (0-based).
-fn tab_idx_at_col(tabs: &[Tab], col: u16) -> Option<usize> {
-    let mut x: u16 = 0;
-    for (i, _) in tabs.iter().enumerate() {
-        let label_len = if i == 0 {
-            // label format: " [N*] " or " [N] "
-            format!(" [{}*] ", i + 1).len() as u16
-        } else {
-            format!(" [{}] ", i + 1).len() as u16
-        };
-        if col >= x && col < x + label_len {
-            return Some(i);
-        }
-        x += label_len;
-    }
-    None
-}
-
 /// Handle a mouse event. Returns true if the event was consumed.
 fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_area: Rect) -> bool {
     let col = me.column;
@@ -1670,12 +1878,9 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
 
     match me.kind {
         MouseEventKind::ScrollUp => {
+            let sv = &state.sessions[state.active_session];
             let mut leaf_rects: Vec<(usize, Rect)> = Vec::new();
-            collect_leaf_rects(
-                &state.tabs[state.active_tab].root,
-                body_area,
-                &mut leaf_rects,
-            );
+            collect_leaf_rects(&sv.tabs[sv.active_tab].root, body_area, &mut leaf_rects);
             for (slot_idx, rect) in &leaf_rects {
                 if rect_contains(*rect, col, row) {
                     focus_slot(state, *slot_idx);
@@ -1688,12 +1893,9 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
             false
         }
         MouseEventKind::ScrollDown => {
+            let sv = &state.sessions[state.active_session];
             let mut leaf_rects: Vec<(usize, Rect)> = Vec::new();
-            collect_leaf_rects(
-                &state.tabs[state.active_tab].root,
-                body_area,
-                &mut leaf_rects,
-            );
+            collect_leaf_rects(&sv.tabs[sv.active_tab].root, body_area, &mut leaf_rects);
             for (slot_idx, rect) in &leaf_rects {
                 if rect_contains(*rect, col, row) {
                     focus_slot(state, *slot_idx);
@@ -1705,48 +1907,87 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
             false
         }
         MouseEventKind::Down(MouseButton::Left) => {
-            // row == 0 is the tab strip (body_area starts at row 1).
+            // row 0 = sessions strip; row 1 = tabs strip; body starts at row 2.
             if row == 0 {
-                if let Some(tab_idx) = tab_idx_at_col(&state.tabs, col) {
-                    state.active_tab = tab_idx;
-                    return true;
+                // Check [+] session button first.
+                if let Some(plus_rect) = state.session_plus_rect {
+                    if rect_contains(plus_rect, col, row) {
+                        state.prompt = Some(NamePrompt {
+                            kind: PromptKind::NewSession,
+                            input: String::new(),
+                        });
+                        return true;
+                    }
                 }
+                // Check session tab rects (cloned to avoid borrow issues).
+                let session_rects = state.session_strip_rects.clone();
+                for (sess_idx, rect) in &session_rects {
+                    if rect_contains(*rect, col, row) {
+                        state.active_session = *sess_idx;
+                        return true;
+                    }
+                }
+                return false;
+            }
+
+            if row == 1 {
+                // Check [+] tab button.
+                if let Some(plus_rect) = state.tab_plus_rect {
+                    if rect_contains(plus_rect, col, row) {
+                        state.prompt = Some(NamePrompt {
+                            kind: PromptKind::NewTab,
+                            input: String::new(),
+                        });
+                        return true;
+                    }
+                }
+                // Check individual tab chips by computing widths inline.
+                let sv = &state.sessions[state.active_session];
+                let mut x: u16 = 0;
+                for (i, _) in sv.tabs.iter().enumerate() {
+                    let label_len = format!(" {} ", i + 1).len() as u16;
+                    if col >= x && col < x + label_len {
+                        state.sessions[state.active_session].active_tab = i;
+                        return true;
+                    }
+                    x += label_len + 1; // +1 for separator space
+                }
+                return false;
             }
 
             // Check if clicking near a split boundary to start a drag.
-            let tab = &mut state.tabs[state.active_tab];
-            for boundary in tab.boundaries.clone() {
-                let hit = if boundary.is_hsplit {
-                    row.abs_diff(boundary.coord) <= 1
-                } else {
-                    col.abs_diff(boundary.coord) <= 1
-                };
-                if hit {
-                    let start_coord = if boundary.is_hsplit { row } else { col };
-                    // Capture current weights from the parent node.
-                    let start_weights: Vec<u16> = if let Some(children) =
-                        children_at_mut(&mut tab.root, &boundary.parent_path)
-                    {
-                        children.iter().map(|(_, w)| *w).collect()
+            {
+                let sv = &mut state.sessions[state.active_session];
+                let tab = &mut sv.tabs[sv.active_tab];
+                for boundary in tab.boundaries.clone() {
+                    let hit = if boundary.is_hsplit {
+                        row.abs_diff(boundary.coord) <= 1
                     } else {
-                        continue;
+                        col.abs_diff(boundary.coord) <= 1
                     };
-                    tab.drag = Some(DragState {
-                        boundary,
-                        start_coord,
-                        start_weights,
-                    });
-                    return true;
+                    if hit {
+                        let start_coord = if boundary.is_hsplit { row } else { col };
+                        let start_weights: Vec<u16> = if let Some(children) =
+                            children_at_mut(&mut tab.root, &boundary.parent_path)
+                        {
+                            children.iter().map(|(_, w)| *w).collect()
+                        } else {
+                            continue;
+                        };
+                        tab.drag = Some(DragState {
+                            boundary,
+                            start_coord,
+                            start_weights,
+                        });
+                        return true;
+                    }
                 }
             }
 
             // Check if clicking inside a leaf pane.
+            let sv = &state.sessions[state.active_session];
             let mut leaf_rects: Vec<(usize, Rect)> = Vec::new();
-            collect_leaf_rects(
-                &state.tabs[state.active_tab].root,
-                body_area,
-                &mut leaf_rects,
-            );
+            collect_leaf_rects(&sv.tabs[sv.active_tab].root, body_area, &mut leaf_rects);
             for (slot_idx, rect) in &leaf_rects {
                 if rect_contains(*rect, col, row) {
                     focus_slot(state, *slot_idx);
@@ -1756,7 +1997,8 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
             false
         }
         MouseEventKind::Drag(MouseButton::Left) => {
-            let tab = &mut state.tabs[state.active_tab];
+            let sv = &mut state.sessions[state.active_session];
+            let tab = &mut sv.tabs[sv.active_tab];
             if let Some(ref drag) = tab.drag {
                 let cur_coord = if drag.boundary.is_hsplit { row } else { col };
                 let delta = cur_coord as i32 - drag.start_coord as i32;
@@ -1768,7 +2010,6 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
                 if idx + 1 < new_weights.len() {
                     let left = new_weights[idx] as i32 + delta_pct;
                     let right = new_weights[idx + 1] as i32 - delta_pct;
-                    // Clamp: each child must keep at least 5%.
                     let left = left.clamp(5, (left + right - 5).max(5)) as u16;
                     let right = (new_weights[idx] as i32 + new_weights[idx + 1] as i32
                         - left as i32)
@@ -1790,7 +2031,8 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
             false
         }
         MouseEventKind::Up(MouseButton::Left) => {
-            let tab = &mut state.tabs[state.active_tab];
+            let sv = &mut state.sessions[state.active_session];
+            let tab = &mut sv.tabs[sv.active_tab];
             if tab.drag.is_some() {
                 tab.drag = None;
                 return true;
@@ -1801,9 +2043,10 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
     }
 }
 
-/// Update active tab's focus_path to point at the given slot index.
+/// Update active session's active tab focus_path to point at the given slot index.
 fn focus_slot(state: &mut AppState, target_slot_idx: usize) {
-    let tab = &mut state.tabs[state.active_tab];
+    let sv = &mut state.sessions[state.active_session];
+    let tab = &mut sv.tabs[sv.active_tab];
     let mut all_paths: Vec<Vec<usize>> = Vec::new();
     let mut tmp: Vec<usize> = Vec::new();
     leaves_in_order(&tab.root, &mut tmp, &mut all_paths);
@@ -1819,26 +2062,30 @@ fn focus_slot(state: &mut AppState, target_slot_idx: usize) {
 // Main TUI loop
 // ─────────────────────────────────────────────────────────────────────────────
 
-async fn run_tui(
-    socket: PathBuf,
+/// Build an `AppState` from one already-attached initial session/pane.
+fn initial_app_state(
     session: SessionId,
-    pane: PaneId,
+    session_name: String,
+    initial_slot: PaneSlot,
     control: PyreDaemonClient,
+    socket: PathBuf,
     shell: Option<String>,
-) -> Result<()> {
-    let initial_slot = attach_pane(&socket, session, pane).await?;
-
-    let mut state = AppState {
-        session,
-        slots: vec![initial_slot],
-        tabs: vec![Tab {
-            root: LayoutNode::Leaf(0),
-            focus_path: vec![],
-            zoomed: None,
-            boundaries: Vec::new(),
-            drag: None,
+) -> AppState {
+    AppState {
+        sessions: vec![SessionView {
+            id: session,
+            name: session_name,
+            tabs: vec![Tab {
+                root: LayoutNode::Leaf(0),
+                focus_path: vec![],
+                zoomed: None,
+                boundaries: Vec::new(),
+                drag: None,
+            }],
+            active_tab: 0,
         }],
-        active_tab: 0,
+        active_session: 0,
+        slots: vec![initial_slot],
         control,
         socket,
         shell,
@@ -1853,7 +2100,23 @@ async fn run_tui(
         last_click: None,
         context_menu: None,
         pid_inspect: None,
-    };
+        prompt: None,
+        session_strip_rects: Vec::new(),
+        session_plus_rect: None,
+        tab_plus_rect: None,
+    }
+}
+
+async fn run_tui(
+    socket: PathBuf,
+    session: SessionId,
+    session_name: String,
+    pane: PaneId,
+    control: PyreDaemonClient,
+    shell: Option<String>,
+) -> Result<()> {
+    let initial_slot = attach_pane(&socket, session, pane).await?;
+    let mut state = initial_app_state(session, session_name, initial_slot, control, socket, shell);
 
     let _guard = TermGuard::enter()?;
     let backend = CrosstermBackend::new(stdout());
@@ -1882,10 +2145,8 @@ async fn run_tui(
                     .list_blocks(tarpc::context::current(), req)
                     .await
                 {
-                    // Filter to this pane's blocks only.
                     let pane_id = slot.pane_id;
                     slot.recent_blocks = blocks.into_iter().filter(|b| b.pane == pane_id).collect();
-                    // Clamp ribbon cursor if blocks shrank.
                     if let Some(cursor) = slot.ribbon_cursor {
                         if !slot.recent_blocks.is_empty() {
                             slot.ribbon_cursor = Some(cursor.min(slot.recent_blocks.len() - 1));
@@ -1951,16 +2212,18 @@ async fn run_tui(
         }
 
         // Compute body_area for mouse hit-tests (mirrors draw_frame layout).
+        // Now: row0=sessions, row1=tabs, rows2..N-1=body, rowN=status.
         let term_size_rect = terminal.size()?;
         let outer_rects = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1),
+                Constraint::Length(1),
                 Constraint::Min(0),
                 Constraint::Length(1),
             ])
             .split(term_size_rect.into());
-        let body_area = outer_rects[1];
+        let body_area = outer_rects[2];
 
         match crossterm::event::read()? {
             Event::Mouse(me) => {
@@ -1970,6 +2233,48 @@ async fn run_tui(
             Event::Key(key_event) => {
                 let code = key_event.code;
                 let mods = key_event.modifiers;
+
+                // Name-prompt intercepts all keys when open.
+                if state.prompt.is_some() {
+                    match code {
+                        KeyCode::Esc => {
+                            state.prompt = None;
+                        }
+                        KeyCode::Backspace => {
+                            if let Some(ref mut p) = state.prompt {
+                                p.input.pop();
+                            }
+                        }
+                        KeyCode::Enter => {
+                            if let Some(p) = state.prompt.take() {
+                                let input = if p.input.is_empty() {
+                                    None
+                                } else {
+                                    Some(p.input)
+                                };
+                                match p.kind {
+                                    PromptKind::NewSession => {
+                                        if let Err(e) = open_new_session(&mut state, input).await {
+                                            tracing::warn!("open_new_session failed: {e}");
+                                        }
+                                    }
+                                    PromptKind::NewTab => {
+                                        if let Err(e) = open_new_tab(&mut state, input).await {
+                                            tracing::warn!("open_new_tab failed: {e}");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        KeyCode::Char(c) => {
+                            if let Some(ref mut p) = state.prompt {
+                                p.input.push(c);
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
 
                 // Detect Ctrl-B prefix
                 if !prefix_active
@@ -1986,18 +2291,19 @@ async fn run_tui(
                         KeyCode::Char('q') => break,
 
                         KeyCode::Char('c') => {
-                            if let Err(e) = open_new_tab(&mut state).await {
+                            if let Err(e) = open_new_tab(&mut state, None).await {
                                 tracing::warn!("open_new_tab failed: {e}");
                             }
                         }
 
                         KeyCode::Char('n') => {
-                            state.active_tab = (state.active_tab + 1) % state.tabs.len();
+                            let sv = state.active_session_view_mut();
+                            sv.active_tab = (sv.active_tab + 1) % sv.tabs.len();
                         }
 
                         KeyCode::Char('p') => {
-                            state.active_tab =
-                                (state.active_tab + state.tabs.len() - 1) % state.tabs.len();
+                            let sv = state.active_session_view_mut();
+                            sv.active_tab = (sv.active_tab + sv.tabs.len() - 1) % sv.tabs.len();
                         }
 
                         KeyCode::Char('"') => {
@@ -2013,16 +2319,19 @@ async fn run_tui(
                         }
 
                         KeyCode::Right | KeyCode::Down => {
-                            focus_next(&mut state.tabs[state.active_tab], true);
+                            let sv = state.active_session_view_mut();
+                            focus_next(&mut sv.tabs[sv.active_tab], true);
                         }
 
                         KeyCode::Left | KeyCode::Up => {
-                            focus_next(&mut state.tabs[state.active_tab], false);
+                            let sv = state.active_session_view_mut();
+                            focus_next(&mut sv.tabs[sv.active_tab], false);
                         }
 
                         // Enter scrollback mode for focused pane (block ribbon)
                         KeyCode::Char('[') => {
-                            let tab = &state.tabs[state.active_tab];
+                            let sv = &state.sessions[state.active_session];
+                            let tab = &sv.tabs[sv.active_tab];
                             if let Some(slot_idx) = slot_at(&tab.root, &tab.focus_path) {
                                 let slot = &mut state.slots[slot_idx];
                                 let last = slot.recent_blocks.len().saturating_sub(1);
@@ -2032,7 +2341,8 @@ async fn run_tui(
 
                         // Exit scrollback mode for focused pane (block ribbon)
                         KeyCode::Char(']') => {
-                            let tab = &state.tabs[state.active_tab];
+                            let sv = &state.sessions[state.active_session];
+                            let tab = &sv.tabs[sv.active_tab];
                             if let Some(slot_idx) = slot_at(&tab.root, &tab.focus_path) {
                                 state.slots[slot_idx].ribbon_cursor = None;
                             }
@@ -2051,7 +2361,8 @@ async fn run_tui(
 
                         // Zoom toggle (Ctrl-B z)
                         KeyCode::Char('z') => {
-                            let tab = &mut state.tabs[state.active_tab];
+                            let sv = state.active_session_view_mut();
+                            let tab = &mut sv.tabs[sv.active_tab];
                             if tab.zoomed.is_some() {
                                 tab.zoomed = None;
                             } else {
@@ -2061,7 +2372,8 @@ async fn run_tui(
 
                         // Copy last block stdout to clipboard (Ctrl-B y)
                         KeyCode::Char('y') => {
-                            let tab = &state.tabs[state.active_tab];
+                            let sv = &state.sessions[state.active_session];
+                            let tab = &sv.tabs[sv.active_tab];
                             if let Some(slot_idx) = slot_at(&tab.root, &tab.focus_path) {
                                 let slot = &state.slots[slot_idx];
                                 if let Some(last_block) = slot.recent_blocks.last() {
@@ -2104,7 +2416,6 @@ async fn run_tui(
                             state.sidebar_open = !state.sidebar_open;
                             if state.sidebar_open {
                                 state.sidebar_focused = true;
-                                // Force immediate poll.
                                 state.sidebar_last_poll = Instant::now() - Duration::from_secs(10);
                             } else {
                                 state.sidebar_focused = false;
@@ -2128,8 +2439,8 @@ async fn run_tui(
                             if !state.search.results.is_empty() {
                                 let hit = &state.search.results[state.search.cursor];
                                 let target_pane = hit.block.pane;
-                                let tab = &mut state.tabs[state.active_tab];
-                                // Find if the target pane is a leaf in the active tab.
+                                let sv = &mut state.sessions[state.active_session];
+                                let tab = &mut sv.tabs[sv.active_tab];
                                 let mut all_paths: Vec<Vec<usize>> = Vec::new();
                                 let mut tmp: Vec<usize> = Vec::new();
                                 leaves_in_order(&tab.root, &mut tmp, &mut all_paths);
@@ -2142,7 +2453,6 @@ async fn run_tui(
                                     let path = path.clone();
                                     let slot_idx = slot_at(&tab.root, &path).expect("just found");
                                     tab.focus_path = path;
-                                    // Find block index in recent_blocks by id.
                                     let block_id = hit.block.id;
                                     let maybe_cursor = state.slots[slot_idx]
                                         .recent_blocks
@@ -2194,10 +2504,10 @@ async fn run_tui(
                             continue;
                         }
                         KeyCode::Enter => {
-                            // Focus pane if it is a leaf in the active tab.
                             if let Some(info) = state.sidebar_data.get(state.sidebar_cursor) {
                                 let target = info.id;
-                                let tab = &mut state.tabs[state.active_tab];
+                                let sv = &mut state.sessions[state.active_session];
+                                let tab = &mut sv.tabs[sv.active_tab];
                                 let mut all_paths: Vec<Vec<usize>> = Vec::new();
                                 let mut tmp: Vec<usize> = Vec::new();
                                 leaves_in_order(&tab.root, &mut tmp, &mut all_paths);
@@ -2226,7 +2536,8 @@ async fn run_tui(
 
                 // Block ribbon scrollback navigation (Ctrl-B [ mode).
                 {
-                    let tab = &state.tabs[state.active_tab];
+                    let sv = &state.sessions[state.active_session];
+                    let tab = &sv.tabs[sv.active_tab];
                     if let Some(slot_idx) = slot_at(&tab.root, &tab.focus_path) {
                         let slot = &mut state.slots[slot_idx];
                         if slot.ribbon_cursor.is_some() {
@@ -2247,7 +2558,6 @@ async fn run_tui(
                                     continue;
                                 }
                                 _ => {
-                                    // In block scrollback mode other keys are swallowed.
                                     continue;
                                 }
                             }
@@ -2256,9 +2566,9 @@ async fn run_tui(
                 }
 
                 // PgUp / PgDn for scrollback buffer (unmodified only).
-                // Shift/Ctrl-modified PgUp/PgDn fall through to PTY.
                 if mods == KeyModifiers::NONE {
-                    let tab = &state.tabs[state.active_tab];
+                    let sv = &state.sessions[state.active_session];
+                    let tab = &sv.tabs[sv.active_tab];
                     if let Some(slot_idx) = slot_at(&tab.root, &tab.focus_path) {
                         let half_page = (body_area.height / 2).max(1) as usize;
                         let slot = &mut state.slots[slot_idx];
@@ -2278,12 +2588,11 @@ async fn run_tui(
                     }
                 }
 
-                // Forward key to focused pane — reset scroll_offset first so
-                // the user sees the live terminal after typing.
+                // Forward key to focused pane.
                 if let Some(bytes) = key_to_bytes(code, mods) {
-                    let tab = &state.tabs[state.active_tab];
+                    let sv = &state.sessions[state.active_session];
+                    let tab = &sv.tabs[sv.active_tab];
                     if let Some(slot_idx) = slot_at(&tab.root, &tab.focus_path) {
-                        // Resume live view when sending input.
                         state.slots[slot_idx].scroll_offset = 0;
                         let _ = state.slots[slot_idx].input_tx.send(bytes).await;
                     }
@@ -2291,7 +2600,6 @@ async fn run_tui(
             }
 
             Event::Resize(new_cols, new_rows) => {
-                // Update all parsers; a Resize RPC doesn't exist yet (S3 TODO).
                 for slot in &mut state.slots {
                     slot.parser.set_size(new_rows, new_cols);
                 }
@@ -2327,33 +2635,62 @@ async fn main() -> Result<()> {
         None => {
             let client = control_client(&socket).await?;
             let (cols, rows) = term_size();
-            let req = SpawnReq {
-                shell: shell.clone(),
-                cwd: std::env::current_dir().ok(),
-                cols,
-                rows,
-                env: std::env::vars().collect(),
-            };
-            let SpawnResp { session, pane } = client
-                .spawn(tarpc::context::current(), req)
+            // Check for existing sessions first; attach to first if present.
+            let existing = client
+                .list_sessions(tarpc::context::current())
                 .await
                 .context("rpc transport")?
-                .map_err(|e| anyhow!("daemon spawn: {e}"))?;
+                .map_err(|e| anyhow!("daemon list_sessions: {e}"))?;
 
-            // We need a second control client; the spawn one can be reused.
-            run_tui(socket, session, pane, client, shell).await
+            let (session, session_name, pane) = if let Some(sess) = existing.into_iter().next() {
+                let pane = first_pane(&client, sess.id).await?;
+                (sess.id, sess.name, pane)
+            } else {
+                let req = SpawnReq {
+                    shell: shell.clone(),
+                    cwd: std::env::current_dir().ok(),
+                    cols,
+                    rows,
+                    env: std::env::vars().collect(),
+                    name: None,
+                };
+                let SpawnResp { session, pane } = client
+                    .spawn(tarpc::context::current(), req)
+                    .await
+                    .context("rpc transport")?
+                    .map_err(|e| anyhow!("daemon spawn: {e}"))?;
+                let short8: String = session.0.to_string().chars().take(8).collect();
+                (session, format!("session-{short8}"), pane)
+            };
+
+            run_tui(socket, session, session_name, pane, client, shell).await
         }
         Some(Sub::Attach {
             session: session_prefix,
             pane: pane_prefix,
         }) => {
             let client = control_client(&socket).await?;
-            let session = resolve_session(&client, &session_prefix).await?;
+            let sessions = client
+                .list_sessions(tarpc::context::current())
+                .await
+                .context("rpc transport")?
+                .map_err(|e| anyhow!("daemon list_sessions: {e}"))?;
+
+            let session_id = resolve_session(&client, &session_prefix).await?;
+            let session_name = sessions
+                .iter()
+                .find(|s| s.id == session_id)
+                .map(|s| s.name.clone())
+                .unwrap_or_else(|| {
+                    let short8: String = session_id.0.to_string().chars().take(8).collect();
+                    format!("session-{short8}")
+                });
+
             let pane = match pane_prefix {
-                Some(ref prefix) => resolve_pane(&client, session, prefix).await?,
-                None => first_pane(&client, session).await?,
+                Some(ref prefix) => resolve_pane(&client, session_id, prefix).await?,
+                None => first_pane(&client, session_id).await?,
             };
-            run_tui(socket, session, pane, client, shell).await
+            run_tui(socket, session_id, session_name, pane, client, shell).await
         }
     }
 }

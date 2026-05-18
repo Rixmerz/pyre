@@ -175,6 +175,7 @@ async fn run_multi_pane_test() -> anyhow::Result<()> {
                 cols: 80,
                 rows: 24,
                 env: vec![("PS1".into(), "".into())],
+                name: None,
             },
         )
         .await
@@ -301,6 +302,7 @@ async fn run_mirror_test() -> anyhow::Result<()> {
                 cols: 80,
                 rows: 24,
                 env: vec![("PS1".into(), "".into())],
+                name: None,
             },
         )
         .await
@@ -425,6 +427,7 @@ async fn run_reattach_test() -> anyhow::Result<()> {
                 cols: 80,
                 rows: 24,
                 env: vec![("PS1".into(), "".into())],
+                name: None,
             },
         )
         .await

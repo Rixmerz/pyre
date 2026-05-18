@@ -631,11 +631,7 @@ impl Server {
         let pane_id = self.resolve_pane_id(&client, pane_prefix).await?;
 
         client
-            .send_keys(
-                tarpc::context::current(),
-                pane_id,
-                payload.into_bytes(),
-            )
+            .send_keys(tarpc::context::current(), pane_id, payload.into_bytes())
             .await
             .context("rpc")?
             .map_err(|e| anyhow!("{e}"))?;
@@ -736,6 +732,7 @@ impl Server {
             cols,
             rows,
             env: std::env::vars().collect(),
+            name: None,
         };
         let resp = client
             .spawn(tarpc::context::current(), req)

@@ -102,12 +102,16 @@ impl SessionRegistry {
         Self::default()
     }
 
-    pub async fn new_session(&self, store: Arc<Store>) -> Arc<SessionState> {
+    pub async fn new_session(&self, store: Arc<Store>, name: Option<String>) -> Arc<SessionState> {
         let id = SessionId::new();
+        let short8: String = id.0.to_string().chars().take(8).collect();
+        let resolved_name = name
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| format!("session-{short8}"));
         let now = Utc::now();
         let state = Arc::new(SessionState {
             id,
-            name: RwLock::new(String::new()),
+            name: RwLock::new(resolved_name.clone()),
             created_at: now,
             last_active_at: Mutex::new(now),
             panes: Mutex::new(HashMap::new()),
@@ -115,7 +119,7 @@ impl SessionRegistry {
         self.sessions.lock().await.insert(id, state.clone());
         // Best-effort: persist the new session row. Errors are non-fatal here
         // because the in-memory registry is the authoritative source in S3.
-        if let Err(e) = store.upsert_session(id, "").await {
+        if let Err(e) = store.upsert_session(id, &resolved_name).await {
             tracing::warn!("upsert_session {id}: {e:#}");
         }
         state
@@ -145,6 +149,7 @@ impl SessionRegistry {
             shell: req.shell,
             cwd: req.cwd,
             env: req.env,
+            name: None,
         };
 
         let raw = spawn_pty(spawn_req, session_id, store, block_index).await?;

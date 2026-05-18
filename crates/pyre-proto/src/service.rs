@@ -32,6 +32,10 @@ pub struct SpawnReq {
     pub cols: u16,
     pub rows: u16,
     pub env: Vec<(String, String)>,
+    /// Optional human-readable name for the new session.
+    /// Defaults to `session-<short8>` on the daemon side when absent.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
