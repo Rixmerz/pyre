@@ -1,15 +1,17 @@
 //! Control-plane RPC + sidechannel frame types for pyred <-> pyrec.
 //!
-//! S1 multiplexes over a single UDS using a one-byte mode tag the
+//! S1/S3 multiplexes over a single UDS using a one-byte mode tag the
 //! client writes after `connect()`:
 //!
 //!   * `0x01` — control: tarpc bincode transport for the `PyreDaemon`
 //!     service trait below.
-//!   * `0x02` — stream: after the tag the client writes a 16-byte
-//!     `SessionId` (Uuid as_bytes), then the connection becomes a
-//!     bidirectional length-delimited bincode channel carrying
-//!     `OutputFrame` (daemon -> client) and `InputFrame`
-//!     (client -> daemon).
+//!   * `0x02` — stream: after the tag the client writes 16 bytes
+//!     `SessionId` (Uuid as_bytes) followed by 16 bytes `PaneId`
+//!     (Uuid as_bytes), totalling 32 bytes.  The server replies with
+//!     one synthetic `OutputFrame { seq: 0, data: <ring-buffer snapshot> }`
+//!     before live frames.  The connection then becomes a bidirectional
+//!     length-delimited bincode channel carrying `OutputFrame`
+//!     (daemon -> client) and `InputFrame` (client -> daemon).
 //!
 //! Keeping the streams off the tarpc service avoids modelling
 //! streaming-RPCs in tarpc 0.34 and gives us byte-clean raw passthrough
@@ -21,7 +23,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::SessionId;
+use crate::{PaneId, SessionId};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpawnReq {
@@ -43,6 +45,8 @@ pub struct AttachAck {
 pub enum PyreError {
     #[error("no such session: {0}")]
     NoSuchSession(SessionId),
+    #[error("no such pane: {0}")]
+    NoSuchPane(PaneId),
     #[error("spawn failed: {0}")]
     SpawnFailed(String),
     #[error("io: {0}")]
@@ -83,7 +87,7 @@ pub const MODE_STREAM: u8 = 0x02;
 
 #[tarpc::service]
 pub trait PyreDaemon {
-    async fn spawn(req: SpawnReq) -> Result<SessionId, PyreError>;
+    async fn spawn(req: SpawnReq) -> Result<crate::SpawnResp, PyreError>;
     async fn attach(session: SessionId) -> Result<AttachAck, PyreError>;
     async fn detach(session: SessionId) -> Result<(), PyreError>;
     async fn kill(session: SessionId) -> Result<(), PyreError>;
@@ -92,4 +96,9 @@ pub trait PyreDaemon {
     async fn search_blocks(
         req: crate::blocks::SearchBlocksReq,
     ) -> Result<Vec<crate::blocks::BlockHit>, PyreError>;
+    async fn list_sessions() -> Result<Vec<crate::SessionInfo>, PyreError>;
+    async fn list_panes(session: SessionId) -> Result<Vec<crate::PaneInfo>, PyreError>;
+    async fn open_pane(req: crate::OpenPaneReq) -> Result<PaneId, PyreError>;
+    async fn close_pane(pane: PaneId) -> Result<(), PyreError>;
+    async fn replay(pane: PaneId, recent_blocks: u32) -> Result<crate::ReplayBlocks, PyreError>;
 }
