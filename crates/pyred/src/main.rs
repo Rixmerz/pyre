@@ -9,6 +9,7 @@
 mod parser;
 mod pty;
 mod server;
+mod session;
 mod store;
 mod stream;
 
@@ -27,8 +28,8 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tracing_subscriber::EnvFilter;
 
-use crate::pty::SessionRegistry;
 use crate::server::DaemonImpl;
+use crate::session::SessionRegistry;
 use crate::store::Store;
 
 fn socket_path() -> PathBuf {
@@ -105,8 +106,11 @@ async fn main() -> Result<()> {
             _ = sigterm.recv() => tracing::info!("received SIGTERM"),
             _ = sigint.recv()  => tracing::info!("received SIGINT"),
         }
-        for s in shutdown_registry.all().await {
-            let _ = s.kill().await;
+        for s in shutdown_registry.all_sessions().await {
+            let panes: Vec<_> = s.panes.lock().await.values().cloned().collect();
+            for p in panes {
+                let _ = p.kill().await;
+            }
         }
         let _ = std::fs::remove_file(&shutdown_path);
         tracing::info!("pyred shut down cleanly");

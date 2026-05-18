@@ -3,11 +3,12 @@
 use std::sync::Arc;
 
 use pyre_proto::{
-    AttachAck, Block, BlockHit, ListBlocksReq, PyreError, SearchBlocksReq, SessionId, SpawnReq,
+    AttachAck, Block, BlockHit, ListBlocksReq, OpenPaneReq, PaneId, PaneInfo, PyreError,
+    ReplayBlocks, SearchBlocksReq, SessionId, SessionInfo, SpawnReq, SpawnResp,
 };
 use tarpc::context;
 
-use crate::pty::{spawn_pty, SessionRegistry};
+use crate::session::SessionRegistry;
 
 #[derive(Clone)]
 pub struct DaemonImpl {
@@ -16,12 +17,25 @@ pub struct DaemonImpl {
 }
 
 impl pyre_proto::service::PyreDaemon for DaemonImpl {
-    async fn spawn(self, _ctx: context::Context, req: SpawnReq) -> Result<SessionId, PyreError> {
-        let sess = spawn_pty(req, self.store.clone())
+    async fn spawn(self, _ctx: context::Context, req: SpawnReq) -> Result<SpawnResp, PyreError> {
+        let session = self.registry.new_session(self.store.clone()).await;
+        let open_req = OpenPaneReq {
+            session: session.id,
+            shell: req.shell,
+            cwd: req.cwd,
+            cols: req.cols,
+            rows: req.rows,
+            env: req.env,
+        };
+        let pane = self
+            .registry
+            .open_pane(session.id, open_req, self.store.clone())
             .await
             .map_err(|e| PyreError::SpawnFailed(e.to_string()))?;
-        let arc = self.registry.insert(sess).await;
-        Ok(arc.id)
+        Ok(SpawnResp {
+            session: session.id,
+            pane: pane.id,
+        })
     }
 
     async fn attach(
@@ -31,13 +45,22 @@ impl pyre_proto::service::PyreDaemon for DaemonImpl {
     ) -> Result<AttachAck, PyreError> {
         let s = self
             .registry
-            .get(session)
+            .get_session(session)
             .await
             .ok_or(PyreError::NoSuchSession(session))?;
+        // Return dimensions from the first live pane, or 0/0 if none.
+        let (cols, rows) = {
+            let panes = s.panes.lock().await;
+            panes
+                .values()
+                .next()
+                .map(|p| (p.cols, p.rows))
+                .unwrap_or((0, 0))
+        };
         Ok(AttachAck {
             session: s.id,
-            cols: s.cols,
-            rows: s.rows,
+            cols,
+            rows,
         })
     }
 
@@ -47,13 +70,10 @@ impl pyre_proto::service::PyreDaemon for DaemonImpl {
     }
 
     async fn kill(self, _ctx: context::Context, session: SessionId) -> Result<(), PyreError> {
-        let s = self
-            .registry
-            .remove(session)
+        self.registry
+            .kill_session(session)
             .await
-            .ok_or(PyreError::NoSuchSession(session))?;
-        s.kill().await.map_err(|e| PyreError::Io(e.to_string()))?;
-        Ok(())
+            .map_err(|_| PyreError::NoSuchSession(session))
     }
 
     async fn list_blocks(
@@ -76,5 +96,51 @@ impl pyre_proto::service::PyreDaemon for DaemonImpl {
             .linear_search(&req.query, req.limit)
             .await
             .map_err(|e| PyreError::Io(e.to_string()))
+    }
+
+    async fn list_sessions(self, _ctx: context::Context) -> Result<Vec<SessionInfo>, PyreError> {
+        Ok(self.registry.list_sessions().await)
+    }
+
+    async fn list_panes(
+        self,
+        _ctx: context::Context,
+        session: SessionId,
+    ) -> Result<Vec<PaneInfo>, PyreError> {
+        Ok(self.registry.list_panes(session).await)
+    }
+
+    async fn open_pane(
+        self,
+        _ctx: context::Context,
+        req: OpenPaneReq,
+    ) -> Result<PaneId, PyreError> {
+        let session_id = req.session;
+        let pane = self
+            .registry
+            .open_pane(session_id, req, self.store.clone())
+            .await
+            .map_err(|e| PyreError::SpawnFailed(e.to_string()))?;
+        Ok(pane.id)
+    }
+
+    async fn close_pane(self, _ctx: context::Context, pane: PaneId) -> Result<(), PyreError> {
+        self.registry
+            .close_pane(pane)
+            .await
+            .map_err(|e| PyreError::Io(e.to_string()))
+    }
+
+    async fn replay(
+        self,
+        _ctx: context::Context,
+        _pane: PaneId,
+        _recent_blocks: u32,
+    ) -> Result<ReplayBlocks, PyreError> {
+        // TODO(s3-phase4-stream-target): wire replay to pane-scoped block query
+        Ok(ReplayBlocks {
+            recent: vec![],
+            snapshot: bytes::Bytes::new(),
+        })
     }
 }
