@@ -1,14 +1,19 @@
 //! pyrec — Pyre client. Connects to pyred over UDS, spawns a PTY session,
 //! puts the local TTY in raw mode, and bridges stdio.
+//!
+//! Without a subcommand: interactive attach (original behaviour).
+//! `list`   — list recent blocks.
+//! `search` — linear-scan search across stdout blobs.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use clap::Parser;
 use futures::{SinkExt, StreamExt};
 use pyre_proto::{
-    InputFrame, OutputFrame, PyreDaemonClient, SessionId, SpawnReq, MODE_CONTROL, MODE_STREAM,
+    BlockHit, InputFrame, ListBlocksReq, OutputFrame, PyreDaemonClient, SearchBlocksReq, SessionId,
+    SpawnReq, MODE_CONTROL, MODE_STREAM,
 };
 use tarpc::client;
 use tarpc::tokio_serde::formats::Bincode;
@@ -18,16 +23,43 @@ use tokio_serde::formats::SymmetricalBincode;
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 use tracing_subscriber::EnvFilter;
 
+// ──────────────────────────────────────────────────────────────────────────────
+// CLI definition
+// ──────────────────────────────────────────────────────────────────────────────
+
 #[derive(Parser, Debug)]
 #[command(name = "pyrec", version)]
 struct Cli {
-    /// Override shell (default: $SHELL, /bin/bash, /bin/sh)
-    #[arg(long)]
-    shell: Option<String>,
-    /// Override socket path
-    #[arg(long)]
+    /// Override socket path (applies to all subcommands)
+    #[arg(long, global = true)]
     socket: Option<PathBuf>,
+
+    /// Override shell (only used by the default interactive attach)
+    #[arg(long, global = true)]
+    shell: Option<String>,
+
+    #[command(subcommand)]
+    command: Option<Sub>,
 }
+
+#[derive(clap::Subcommand, Debug)]
+enum Sub {
+    /// List recent blocks
+    List {
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
+    /// Linear-scan search across stdout blobs
+    Search {
+        query: String,
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ──────────────────────────────────────────────────────────────────────────────
 
 fn default_socket() -> PathBuf {
     if let Ok(rt) = std::env::var("XDG_RUNTIME_DIR") {
@@ -48,6 +80,24 @@ fn term_size() -> (u16, u16) {
         (80, 24)
     }
 }
+
+/// Open a control connection and return a tarpc client.
+async fn control_client(socket: &Path) -> Result<PyreDaemonClient> {
+    let mut sock = UnixStream::connect(socket)
+        .await
+        .with_context(|| format!("connect {}", socket.display()))?;
+    sock.write_all(&[MODE_CONTROL]).await?;
+
+    let transport = tarpc::serde_transport::new(
+        tokio_util::codec::Framed::new(sock, LengthDelimitedCodec::new()),
+        Bincode::default(),
+    );
+    Ok(PyreDaemonClient::new(client::Config::default(), transport).spawn())
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Raw-mode guard
+// ──────────────────────────────────────────────────────────────────────────────
 
 struct RawGuard {
     fd: std::os::fd::RawFd,
@@ -82,42 +132,22 @@ impl Drop for RawGuard {
     }
 }
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+// ──────────────────────────────────────────────────────────────────────────────
+// Sub-command implementations
+// ──────────────────────────────────────────────────────────────────────────────
 
-    let cli = Cli::parse();
-    let sock_path = cli.socket.unwrap_or_else(default_socket);
-
-    // === Control connection ===
-    let mut control_sock = UnixStream::connect(&sock_path)
-        .await
-        .with_context(|| format!("connect {}", sock_path.display()))?;
-    control_sock.write_all(&[MODE_CONTROL]).await?;
-
-    let transport = tarpc::serde_transport::new(
-        tokio_util::codec::Framed::new(control_sock, LengthDelimitedCodec::new()),
-        Bincode::default(),
-    );
-    let client_obj = PyreDaemonClient::new(client::Config::default(), transport).spawn();
+async fn run_attach(socket: PathBuf, shell: Option<String>) -> Result<()> {
+    let client_obj = control_client(&socket).await?;
 
     let (cols, rows) = term_size();
-    let shell = cli
-        .shell
-        .or_else(|| std::env::var("SHELL").ok())
-        .or_else(|| {
-            for candidate in ["/bin/bash", "/bin/sh"] {
-                if std::path::Path::new(candidate).exists() {
-                    return Some(candidate.to_owned());
-                }
+    let shell = shell.or_else(|| std::env::var("SHELL").ok()).or_else(|| {
+        for candidate in ["/bin/bash", "/bin/sh"] {
+            if std::path::Path::new(candidate).exists() {
+                return Some(candidate.to_owned());
             }
-            None
-        });
+        }
+        None
+    });
     let req = SpawnReq {
         shell,
         cwd: std::env::current_dir().ok(),
@@ -132,16 +162,14 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow!("daemon spawn: {e}"))?;
 
     // === Stream connection ===
-    let mut stream_sock = UnixStream::connect(&sock_path)
+    let mut stream_sock = UnixStream::connect(&socket)
         .await
-        .with_context(|| format!("connect stream {}", sock_path.display()))?;
+        .with_context(|| format!("connect stream {}", socket.display()))?;
     stream_sock.write_all(&[MODE_STREAM]).await?;
     stream_sock.write_all(session.0.as_bytes()).await?;
 
     let (rd, wr) = stream_sock.into_split();
 
-    // Client reads OutputFrame from daemon, writes InputFrame to daemon.
-    // Mirror of stream.rs which reads InputFrame and writes OutputFrame.
     let frame_read = FramedRead::new(rd, LengthDelimitedCodec::new());
     let frame_write = FramedWrite::new(wr, LengthDelimitedCodec::new());
     let mut output_frames: tokio_serde::SymmetricallyFramed<_, OutputFrame, _> =
@@ -204,4 +232,72 @@ async fn main() -> Result<()> {
     signal_task.abort();
 
     Ok(())
+}
+
+async fn run_list(socket: PathBuf, limit: u32) -> Result<()> {
+    let client = control_client(&socket).await?;
+    let blocks = client
+        .list_blocks(
+            tarpc::context::current(),
+            ListBlocksReq {
+                session: None,
+                limit,
+            },
+        )
+        .await
+        .context("rpc transport")?
+        .map_err(|e| anyhow!("daemon list_blocks: {e}"))?;
+
+    for block in &blocks {
+        let short_id = &block.id.0.to_string()[..8];
+        let time = block.started_at.format("%Y-%m-%d %H:%M:%S");
+        let exit = block
+            .exit_code
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        println!("{short_id:<8}  {time}  {exit:<4}  {}", block.command);
+    }
+
+    Ok(())
+}
+
+async fn run_search(socket: PathBuf, query: String, limit: u32) -> Result<()> {
+    let client = control_client(&socket).await?;
+    let hits: Vec<BlockHit> = client
+        .search_blocks(tarpc::context::current(), SearchBlocksReq { query, limit })
+        .await
+        .context("rpc transport")?
+        .map_err(|e| anyhow!("daemon search_blocks: {e}"))?;
+
+    for hit in &hits {
+        let short_id = &hit.block.id.0.to_string()[..8];
+        println!("{short_id:<8}  {}", hit.block.command);
+        let snippet = hit.snippet.replace('\n', " ");
+        println!("    {snippet}");
+    }
+
+    Ok(())
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Entry point
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
+    let cli = Cli::parse();
+    let sock_path = cli.socket.unwrap_or_else(default_socket);
+
+    match cli.command {
+        None => run_attach(sock_path, cli.shell).await,
+        Some(Sub::List { limit }) => run_list(sock_path, limit).await,
+        Some(Sub::Search { query, limit }) => run_search(sock_path, query, limit).await,
+    }
 }

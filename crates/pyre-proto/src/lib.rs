@@ -1,6 +1,8 @@
 //! pyre shared protocol types: sessions, panes, blocks, IPC commands.
 
+pub mod blocks;
 pub mod service;
+pub use blocks::{BlockEvent, BlockHit, ListBlocksReq, SearchBlocksReq};
 pub use service::{
     AttachAck, InputFrame, OutputFrame, PyreDaemon, PyreDaemonClient, PyreError, SpawnReq,
     MODE_CONTROL, MODE_STREAM,
@@ -68,12 +70,13 @@ pub struct Pane {
 pub struct Block {
     pub id: BlockId,
     pub pane: PaneId,
+    pub session: SessionId,
     pub command: String,
-    pub cwd: String,
-    pub stdout: String,
-    pub exit_code: Option<i32>,
+    pub cwd: Option<std::path::PathBuf>,
     pub started_at: DateTime<Utc>,
     pub ended_at: Option<DateTime<Utc>>,
+    pub exit_code: Option<i32>,
+    pub stdout_len: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

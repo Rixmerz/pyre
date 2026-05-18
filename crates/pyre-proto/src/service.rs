@@ -87,4 +87,9 @@ pub trait PyreDaemon {
     async fn attach(session: SessionId) -> Result<AttachAck, PyreError>;
     async fn detach(session: SessionId) -> Result<(), PyreError>;
     async fn kill(session: SessionId) -> Result<(), PyreError>;
+    async fn list_blocks(req: crate::blocks::ListBlocksReq)
+        -> Result<Vec<crate::Block>, PyreError>;
+    async fn search_blocks(
+        req: crate::blocks::SearchBlocksReq,
+    ) -> Result<Vec<crate::blocks::BlockHit>, PyreError>;
 }

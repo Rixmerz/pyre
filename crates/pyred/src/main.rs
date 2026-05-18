@@ -6,8 +6,10 @@
 //!   * `0x02` stream  — 16-byte SessionId then bidirectional
 //!     length-delimited bincode `OutputFrame`/`InputFrame`
 
+mod parser;
 mod pty;
 mod server;
+mod store;
 mod stream;
 
 use std::os::unix::fs::PermissionsExt;
@@ -27,6 +29,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::pty::SessionRegistry;
 use crate::server::DaemonImpl;
+use crate::store::Store;
 
 fn socket_path() -> PathBuf {
     if let Ok(rt) = std::env::var("XDG_RUNTIME_DIR") {
@@ -38,7 +41,11 @@ fn socket_path() -> PathBuf {
     PathBuf::from(format!("/tmp/pyre-{uid}.sock"))
 }
 
-async fn handle_conn(sock: UnixStream, registry: Arc<SessionRegistry>) -> Result<()> {
+async fn handle_conn(
+    sock: UnixStream,
+    registry: Arc<SessionRegistry>,
+    store: Arc<Store>,
+) -> Result<()> {
     let mut sock = sock;
     let mut tag = [0u8; 1];
     sock.read_exact(&mut tag).await.context("read mode tag")?;
@@ -47,6 +54,7 @@ async fn handle_conn(sock: UnixStream, registry: Arc<SessionRegistry>) -> Result
         MODE_CONTROL => {
             let daemon = DaemonImpl {
                 registry: registry.clone(),
+                store: store.clone(),
             };
             let transport = tarpc::serde_transport::new(
                 Framed::new(sock, LengthDelimitedCodec::new()),
@@ -81,6 +89,9 @@ async fn main() -> Result<()> {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
     tracing::info!("pyred listening on {}", path.display());
 
+    let store = Arc::new(Store::open().await.context("open store")?);
+    tracing::info!("store opened at {}", store.data_dir().display());
+
     let registry = Arc::new(SessionRegistry::new());
 
     let shutdown_path = path.clone();
@@ -106,8 +117,9 @@ async fn main() -> Result<()> {
             match listener.accept().await {
                 Ok((sock, _addr)) => {
                     let reg = registry.clone();
+                    let st = store.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_conn(sock, reg).await {
+                        if let Err(e) = handle_conn(sock, reg, st).await {
                             tracing::warn!("connection error: {e:#}");
                         }
                     });
