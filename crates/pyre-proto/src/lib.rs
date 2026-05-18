@@ -1,5 +1,11 @@
 //! pyre shared protocol types: sessions, panes, blocks, IPC commands.
 
+pub mod service;
+pub use service::{
+    AttachAck, InputFrame, OutputFrame, PyreDaemon, PyreDaemonClient, PyreError, SpawnReq,
+    MODE_CONTROL, MODE_STREAM,
+};
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
