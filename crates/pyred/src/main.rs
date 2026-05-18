@@ -8,6 +8,7 @@
 
 mod hooks;
 mod index;
+mod inspect;
 mod parser;
 mod pty;
 mod ringbuf;
