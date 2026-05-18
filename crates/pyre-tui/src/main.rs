@@ -1185,6 +1185,15 @@ fn render_search_overlay(frame: &mut ratatui::Frame, app: &AppState) {
         .style(EMBER.bg_style());
     frame.render_widget(input_para, input_area);
 
+    // Set host cursor at end of input text: inner input area x + 2 (prompt) + query len.
+    // The input block has 1-cell border on each side, so inner starts at input_area.x + 1.
+    let inner_x = input_area.x + 1;
+    let inner_y = input_area.y + 1;
+    // "> " prefix (2 chars) + query length, clamped to inner width.
+    let inner_width = input_area.width.saturating_sub(2); // subtract left+right border
+    let cursor_col = (2u16 + app.search.input.len() as u16).min(inner_width.saturating_sub(1));
+    frame.set_cursor_position((inner_x + cursor_col, inner_y));
+
     // Results list.
     let items: Vec<ListItem> = app
         .search
@@ -1478,9 +1487,36 @@ fn draw_frame(
             );
         }
 
-        // Search overlay — drawn on top of everything else.
+        // Host-terminal cursor positioning.
+        // Only one pane (the focused one, live view) owns the cursor.
+        // Overlays or scrollback suppress it.
         if state.search.open {
+            // Search overlay — drawn on top of everything else and owns cursor.
             render_search_overlay(frame, state);
+        } else if state.pid_inspect.is_none() {
+            // No blocking overlay: propagate vt100 cursor from focused pane.
+            let tab = &state.tabs[state.active_tab];
+            let focused_slot_idx = if let Some(ref zoom_path) = tab.zoomed {
+                slot_at(&tab.root, zoom_path)
+            } else {
+                slot_at(&tab.root, &tab.focus_path)
+            };
+            if let Some(slot_idx) = focused_slot_idx {
+                let slot = &state.slots[slot_idx];
+                if slot.scroll_offset == 0 {
+                    let vt_area = slot.last_screen_rect;
+                    let (vt_row, vt_col) = slot.parser.screen().cursor_position();
+                    let cursor_x = vt_area
+                        .x
+                        .saturating_add(vt_col)
+                        .min(vt_area.x.saturating_add(vt_area.width).saturating_sub(1));
+                    let cursor_y = vt_area
+                        .y
+                        .saturating_add(vt_row)
+                        .min(vt_area.y.saturating_add(vt_area.height).saturating_sub(1));
+                    frame.set_cursor_position((cursor_x, cursor_y));
+                }
+            }
         }
     })?;
     Ok(())
