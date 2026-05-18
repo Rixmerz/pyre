@@ -2470,6 +2470,11 @@ async fn run_tui(
             }
         }
 
+        // Guard: exit immediately if every session was removed by any code path.
+        if state.sessions.is_empty() {
+            break;
+        }
+
         // Draw — pass state as mut so render_pane can store last_screen_rect.
         draw_frame(&mut terminal, &mut state, prefix_active)?;
 
