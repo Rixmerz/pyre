@@ -8,12 +8,14 @@ use pyre_proto::{
 };
 use tarpc::context;
 
+use crate::index::BlockIndex;
 use crate::session::SessionRegistry;
 
 #[derive(Clone)]
 pub struct DaemonImpl {
     pub registry: Arc<SessionRegistry>,
     pub store: Arc<crate::store::Store>,
+    pub block_index: Arc<BlockIndex>,
 }
 
 impl pyre_proto::service::PyreDaemon for DaemonImpl {
@@ -29,7 +31,12 @@ impl pyre_proto::service::PyreDaemon for DaemonImpl {
         };
         let pane = self
             .registry
-            .open_pane(session.id, open_req, self.store.clone())
+            .open_pane(
+                session.id,
+                open_req,
+                self.store.clone(),
+                self.block_index.clone(),
+            )
             .await
             .map_err(|e| PyreError::SpawnFailed(e.to_string()))?;
         Ok(SpawnResp {
@@ -92,10 +99,28 @@ impl pyre_proto::service::PyreDaemon for DaemonImpl {
         _ctx: context::Context,
         req: SearchBlocksReq,
     ) -> Result<Vec<BlockHit>, PyreError> {
-        self.store
-            .linear_search(&req.query, req.limit)
+        let block_index = self.block_index.clone();
+        let query = req.query.clone();
+        let limit = req.limit;
+        let ids = tokio::task::spawn_blocking(move || block_index.search(&query, limit))
             .await
-            .map_err(|e| PyreError::Io(e.to_string()))
+            .map_err(|e| PyreError::Io(e.to_string()))?
+            .map_err(|e| PyreError::Io(e.to_string()))?;
+
+        let mut hits = Vec::with_capacity(ids.len());
+        for id in ids {
+            match self.store.get_block(id).await {
+                Ok(Some(block)) => hits.push(BlockHit {
+                    block,
+                    snippet: String::new(),
+                }),
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!("get_block {id:?}: {e:#}");
+                }
+            }
+        }
+        Ok(hits)
     }
 
     async fn list_sessions(self, _ctx: context::Context) -> Result<Vec<SessionInfo>, PyreError> {
@@ -118,7 +143,12 @@ impl pyre_proto::service::PyreDaemon for DaemonImpl {
         let session_id = req.session;
         let pane = self
             .registry
-            .open_pane(session_id, req, self.store.clone())
+            .open_pane(
+                session_id,
+                req,
+                self.store.clone(),
+                self.block_index.clone(),
+            )
             .await
             .map_err(|e| PyreError::SpawnFailed(e.to_string()))?;
         Ok(pane.id)

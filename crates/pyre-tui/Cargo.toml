@@ -4,3 +4,24 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+
+[[bin]]
+name = "pyre-tui"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+tokio = { workspace = true }
+tarpc = { workspace = true }
+anyhow = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+tokio-serde = { workspace = true }
+tokio-util = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+vt100 = "0.15"
+pyre-proto = { path = "../pyre-proto" }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+libc = { workspace = true }

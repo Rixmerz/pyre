@@ -198,12 +198,14 @@ async fn run_blocks_test() -> anyhow::Result<()> {
 
     let bid = pwd_block.id;
 
-    // --- 10. search_blocks: output of pwd starts with '/' ---
+    // --- 10. search_blocks: query by the command name "pwd" which is indexed ---
+    // The tantivy tokenizer splits on non-alphanumeric characters, so "/" does
+    // not produce a token. The command field contains "pwd" as a whole token.
     let hits = rpc_client
         .search_blocks(
             tarpc::context::current(),
             SearchBlocksReq {
-                query: "/".into(),
+                query: "pwd".into(),
                 limit: 10,
             },
         )
@@ -213,7 +215,7 @@ async fn run_blocks_test() -> anyhow::Result<()> {
 
     assert!(
         !hits.is_empty(),
-        "search_blocks(\"/\") returned 0 hits — pwd output did not reach the blob"
+        "search_blocks(\"pwd\") returned 0 hits — block was not indexed"
     );
 
     // --- 11. Blob file exists and is non-empty ---

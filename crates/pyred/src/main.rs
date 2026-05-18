@@ -6,6 +6,7 @@
 //!   * `0x02` stream  — 16-byte SessionId then bidirectional
 //!     length-delimited bincode `OutputFrame`/`InputFrame`
 
+mod index;
 mod parser;
 mod pty;
 mod ringbuf;
@@ -29,6 +30,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tracing_subscriber::EnvFilter;
 
+use crate::index::BlockIndex;
 use crate::server::DaemonImpl;
 use crate::session::SessionRegistry;
 use crate::store::Store;
@@ -47,6 +49,7 @@ async fn handle_conn(
     sock: UnixStream,
     registry: Arc<SessionRegistry>,
     store: Arc<Store>,
+    block_index: Arc<BlockIndex>,
 ) -> Result<()> {
     let mut sock = sock;
     let mut tag = [0u8; 1];
@@ -57,6 +60,7 @@ async fn handle_conn(
             let daemon = DaemonImpl {
                 registry: registry.clone(),
                 store: store.clone(),
+                block_index: block_index.clone(),
             };
             let transport = tarpc::serde_transport::new(
                 Framed::new(sock, LengthDelimitedCodec::new()),
@@ -94,6 +98,14 @@ async fn main() -> Result<()> {
     let store = Arc::new(Store::open().await.context("open store")?);
     tracing::info!("store opened at {}", store.data_dir().display());
 
+    let index_dir = store.data_dir().join("index");
+    let block_index = Arc::new(
+        tokio::task::spawn_blocking(move || BlockIndex::open(&index_dir))
+            .await
+            .context("spawn BlockIndex::open")?
+            .context("open block index")?,
+    );
+
     let registry = Arc::new(SessionRegistry::new());
 
     let shutdown_path = path.clone();
@@ -123,8 +135,9 @@ async fn main() -> Result<()> {
                 Ok((sock, _addr)) => {
                     let reg = registry.clone();
                     let st = store.clone();
+                    let bi = block_index.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_conn(sock, reg, st).await {
+                        if let Err(e) = handle_conn(sock, reg, st, bi).await {
                             tracing::warn!("connection error: {e:#}");
                         }
                     });
