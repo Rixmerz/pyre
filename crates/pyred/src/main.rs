@@ -94,7 +94,22 @@ async fn main() -> Result<()> {
 
     let path = socket_path();
     if path.exists() {
-        let _ = std::fs::remove_file(&path);
+        // Before stealing the socket, check whether a live pyred is already
+        // listening. If it is, exit cleanly so the existing daemon keeps running.
+        // Only remove the file if the connect fails (stale / crashed socket).
+        match tokio::net::UnixStream::connect(&path).await {
+            Ok(_) => {
+                tracing::info!(
+                    "pyred already running at {}; exiting",
+                    path.display()
+                );
+                return Ok(());
+            }
+            Err(_) => {
+                // Stale or crashed socket — safe to remove and rebind.
+                let _ = std::fs::remove_file(&path);
+            }
+        }
     }
     let listener = UnixListener::bind(&path).with_context(|| format!("bind {}", path.display()))?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
