@@ -315,10 +315,6 @@ struct PaneSlot {
     input_tx: mpsc::Sender<Bytes>,
     /// Events from daemon for this pane (drained each UI tick).
     output_rx: mpsc::Receiver<PaneEvent>,
-    /// True when the daemon stream has ended (child shell exited).
-    dead: bool,
-    /// Wall-clock instant when the slot transitioned to dead.
-    dead_at: Option<Instant>,
     /// Last polled block list for the ribbon (up to 20 entries, newest last).
     recent_blocks: Vec<Block>,
     /// `None` = live (rightmost highlighted); `Some(i)` = scrollback cursor.
@@ -832,8 +828,6 @@ async fn attach_pane(socket: &Path, session: SessionId, pane_id: PaneId) -> Resu
         parser: vt100::Parser::new(rows, cols, 0),
         input_tx,
         output_rx,
-        dead: false,
-        dead_at: None,
         recent_blocks: Vec::new(),
         ribbon_cursor: None,
         last_block_poll: std::time::Instant::now()
@@ -863,17 +857,7 @@ fn render_pane(
     slot_idx: usize,
 ) {
     let short8: String = slot.pane_id.0.to_string().chars().take(8).collect();
-    let border_block = if slot.dead {
-        // Dead pane: always use err border style regardless of focus.
-        RatatuiBlock::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(EMBER.err))
-            .title(Span::styled(
-                format!(" pane {short8} [exited] "),
-                Style::default().fg(EMBER.err).add_modifier(Modifier::BOLD),
-            ))
-    } else if focused {
+    let border_block = if focused {
         RatatuiBlock::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Thick)
@@ -1057,26 +1041,6 @@ fn render_pane(
                 &mut sb_state,
             );
         }
-    }
-
-    // ── dead pane banner overlay ──
-    if slot.dead && content_area.height > 0 {
-        let banner_text = "  [exited — press Ctrl-B x to close]  ";
-        let banner_len = banner_text.chars().count() as u16;
-        let banner_y = content_area.y + content_area.height / 2;
-        let banner_x = content_area
-            .x
-            .saturating_add(content_area.width.saturating_sub(banner_len) / 2);
-        let banner_rect = Rect::new(banner_x, banner_y, banner_len.min(content_area.width), 1);
-        frame.render_widget(
-            Paragraph::new(banner_text).style(
-                Style::default()
-                    .fg(EMBER.text)
-                    .bg(EMBER.err)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            banner_rect,
-        );
     }
 
     // ── ribbon render ──
@@ -1754,7 +1718,7 @@ fn draw_frame(
             };
             if let Some(slot_idx) = focused_slot_idx {
                 if let Some(slot) = state.slots[slot_idx].as_ref() {
-                    if !slot.dead && slot.scroll_offset == 0 {
+                    if slot.scroll_offset == 0 {
                         let vt_area = slot.last_screen_rect;
                         let (vt_row, vt_col) = slot.parser.screen().cursor_position();
                         let cursor_x = vt_area
@@ -1785,15 +1749,14 @@ fn focus_next(tab: &mut Tab, slots: &[Option<PaneSlot>], forward: bool) {
     let mut tmp: Vec<usize> = Vec::new();
     leaves_in_order(&tab.root, &mut tmp, &mut all_paths);
 
-    // Filter to only live (non-dead, non-None) leaves.
+    // Filter to only live (non-None) leaves.
     let live_paths: Vec<Vec<usize>> = all_paths
         .into_iter()
         .filter(|p| {
             slot_at(&tab.root, p)
                 .and_then(|idx| slots.get(idx))
                 .and_then(|s| s.as_ref())
-                .map(|s| !s.dead)
-                .unwrap_or(false)
+                .is_some()
         })
         .collect();
 
@@ -2240,19 +2203,28 @@ fn remove_leaf(root: &mut LayoutNode, leaf_path: &[usize]) -> Option<usize> {
     remove_in(root, parent_path, child_idx)
 }
 
-/// Close the focused pane in the active tab:
-/// - Removes its leaf from the layout tree (collapses parent split).
-/// - Marks the slot as None.
-/// - Removes the tab if it becomes empty; removes the session view if it becomes empty.
-/// - Adjusts focus_path to a valid remaining leaf (if any).
-fn close_focused_pane(state: &mut AppState) {
-    let sess_idx = state.active_session;
-    let tab_idx = state.sessions[sess_idx].active_tab;
-    let focus_path = state.sessions[sess_idx].tabs[tab_idx].focus_path.clone();
+/// Locate the (session_idx, tab_idx, leaf_path) for a given slot index.
+fn locate_slot(state: &AppState, target: usize) -> Option<(usize, usize, Vec<usize>)> {
+    for (si, sess) in state.sessions.iter().enumerate() {
+        for (ti, tab) in sess.tabs.iter().enumerate() {
+            let mut paths: Vec<Vec<usize>> = Vec::new();
+            let mut tmp: Vec<usize> = Vec::new();
+            leaves_in_order(&tab.root, &mut tmp, &mut paths);
+            for path in paths {
+                if slot_at(&tab.root, &path) == Some(target) {
+                    return Some((si, ti, path));
+                }
+            }
+        }
+    }
+    None
+}
 
-    // Find the slot index at the current focus path.
-    let slot_idx = match slot_at(&state.sessions[sess_idx].tabs[tab_idx].root, &focus_path) {
-        Some(idx) => idx,
+/// Close a pane by its slot index.
+/// Removes the leaf from the layout tree, drops the slot, cascades tab/session removal.
+fn close_pane_by_slot_idx(state: &mut AppState, slot_idx: usize) {
+    let (sess_idx, tab_idx, focus_path) = match locate_slot(state, slot_idx) {
+        Some(loc) => loc,
         None => return,
     };
 
@@ -2351,6 +2323,16 @@ fn close_focused_pane(state: &mut AppState) {
     }
 }
 
+/// Close the focused pane in the active tab.
+fn close_focused_pane(state: &mut AppState) {
+    let sess_idx = state.active_session;
+    let tab_idx = state.sessions[sess_idx].active_tab;
+    let focus_path = state.sessions[sess_idx].tabs[tab_idx].focus_path.clone();
+    if let Some(slot_idx) = slot_at(&state.sessions[sess_idx].tabs[tab_idx].root, &focus_path) {
+        close_pane_by_slot_idx(state, slot_idx);
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Main TUI loop
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2418,22 +2400,27 @@ async fn run_tui(
 
     loop {
         // Drain all pane output into their parsers and scrollback buffers.
-        for slot in state.slots.iter_mut().flatten() {
-            while let Ok(event) = slot.output_rx.try_recv() {
-                match event {
-                    PaneEvent::Output(data) => {
-                        if !slot.dead {
+        // Collect slot indices that received a Closed event so we can auto-close
+        // them after the borrow on state.slots ends.
+        let mut closed_slots: Vec<usize> = Vec::new();
+        for (slot_idx, slot_opt) in state.slots.iter_mut().enumerate() {
+            if let Some(slot) = slot_opt {
+                while let Ok(event) = slot.output_rx.try_recv() {
+                    match event {
+                        PaneEvent::Output(data) => {
                             slot.process_output(&data);
                         }
-                    }
-                    PaneEvent::Closed => {
-                        if !slot.dead {
-                            slot.dead = true;
-                            slot.dead_at = Some(Instant::now());
+                        PaneEvent::Closed => {
+                            closed_slots.push(slot_idx);
+                            // Stop draining this pane; it will be removed below.
+                            break;
                         }
                     }
                 }
             }
+        }
+        for slot_idx in closed_slots {
+            close_pane_by_slot_idx(&mut state, slot_idx);
         }
 
         // Poll block lists inline (~500 ms throttle per pane)
@@ -2922,16 +2909,14 @@ async fn run_tui(
                     }
                 }
 
-                // Forward key to focused pane (skip if pane is dead).
+                // Forward key to focused pane.
                 if let Some(bytes) = key_to_bytes(code, mods) {
                     let sv = &state.sessions[state.active_session];
                     let tab = &sv.tabs[sv.active_tab];
                     if let Some(slot_idx) = slot_at(&tab.root, &tab.focus_path) {
                         if let Some(slot) = state.slots[slot_idx].as_mut() {
-                            if !slot.dead {
-                                slot.scroll_offset = 0;
-                                let _ = slot.input_tx.send(bytes).await;
-                            }
+                            slot.scroll_offset = 0;
+                            let _ = slot.input_tx.send(bytes).await;
                         }
                     }
                 }
