@@ -12,6 +12,7 @@
 //!   Ctrl-B "  — horizontal split (HSplit active leaf)
 //!   Ctrl-B %  — vertical split (VSplit active leaf)
 //!   Ctrl-B ←/→/↑/↓ — cycle focus between panes (DFS order)
+//!   Ctrl-B x  — close focused pane (removes dead or live pane from layout)
 //!   Ctrl-B q  — quit
 //!   Ctrl-B [  — enter block ribbon scrollback for focused pane
 //!   Ctrl-B ]  — exit block ribbon scrollback
@@ -300,14 +301,24 @@ fn vt100_color(color: vt100::Color) -> Option<Color> {
 // Multi-pane layout data model
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Events flowing from the net→UI background task to the main loop.
+enum PaneEvent {
+    Output(Bytes),
+    Closed,
+}
+
 /// One attached PTY pane with its I/O channels and VT parser.
 struct PaneSlot {
     pane_id: PaneId,
     parser: vt100::Parser,
     /// Bytes to send to this pane (written by the key handler).
     input_tx: mpsc::Sender<Bytes>,
-    /// Bytes from daemon for this pane (drained each UI tick).
-    output_rx: mpsc::Receiver<Bytes>,
+    /// Events from daemon for this pane (drained each UI tick).
+    output_rx: mpsc::Receiver<PaneEvent>,
+    /// True when the daemon stream has ended (child shell exited).
+    dead: bool,
+    /// Wall-clock instant when the slot transitioned to dead.
+    dead_at: Option<Instant>,
     /// Last polled block list for the ribbon (up to 20 entries, newest last).
     recent_blocks: Vec<Block>,
     /// `None` = live (rightmost highlighted); `Some(i)` = scrollback cursor.
@@ -580,8 +591,8 @@ struct AppState {
     sessions: Vec<SessionView>,
     /// Index into `sessions` that is currently displayed.
     active_session: usize,
-    /// All attached pane slots (shared across all sessions).
-    slots: Vec<PaneSlot>,
+    /// All attached pane slots (shared across all sessions). None = closed/removed.
+    slots: Vec<Option<PaneSlot>>,
     control: PyreDaemonClient,
     socket: PathBuf,
     shell: Option<String>,
@@ -765,7 +776,7 @@ async fn attach_pane(socket: &Path, session: SessionId, pane_id: PaneId) -> Resu
     let mut input_frames: tokio_serde::SymmetricallyFramed<_, InputFrame, _> =
         tokio_serde::SymmetricallyFramed::new(frame_write, SymmetricalBincode::default());
 
-    let (net_tx, output_rx) = mpsc::channel::<Bytes>(256);
+    let (net_tx, output_rx) = mpsc::channel::<PaneEvent>(256);
     let (input_tx, mut key_rx) = mpsc::channel::<Bytes>(64);
 
     // net → UI
@@ -773,13 +784,15 @@ async fn attach_pane(socket: &Path, session: SessionId, pane_id: PaneId) -> Resu
         while let Some(frame) = output_frames.next().await {
             match frame {
                 Ok(f) => {
-                    if net_tx.send(f.data).await.is_err() {
+                    if net_tx.send(PaneEvent::Output(f.data)).await.is_err() {
                         break;
                     }
                 }
                 Err(_) => break,
             }
         }
+        // Stream ended (daemon closed or pane exited) — notify UI.
+        let _ = net_tx.send(PaneEvent::Closed).await;
     });
 
     // UI → net
@@ -797,6 +810,8 @@ async fn attach_pane(socket: &Path, session: SessionId, pane_id: PaneId) -> Resu
         parser: vt100::Parser::new(rows, cols, 0),
         input_tx,
         output_rx,
+        dead: false,
+        dead_at: None,
         recent_blocks: Vec::new(),
         ribbon_cursor: None,
         last_block_poll: std::time::Instant::now()
@@ -825,7 +840,17 @@ fn render_pane(
     slot_idx: usize,
 ) {
     let short8: String = slot.pane_id.0.to_string().chars().take(8).collect();
-    let border_block = if focused {
+    let border_block = if slot.dead {
+        // Dead pane: always use err border style regardless of focus.
+        RatatuiBlock::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(EMBER.err))
+            .title(Span::styled(
+                format!(" pane {short8} [exited] "),
+                Style::default().fg(EMBER.err).add_modifier(Modifier::BOLD),
+            ))
+    } else if focused {
         RatatuiBlock::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Thick)
@@ -1006,6 +1031,26 @@ fn render_pane(
         }
     }
 
+    // ── dead pane banner overlay ──
+    if slot.dead && content_area.height > 0 {
+        let banner_text = "  [exited — press Ctrl-B x to close]  ";
+        let banner_len = banner_text.chars().count() as u16;
+        let banner_y = content_area.y + content_area.height / 2;
+        let banner_x = content_area
+            .x
+            .saturating_add(content_area.width.saturating_sub(banner_len) / 2);
+        let banner_rect = Rect::new(banner_x, banner_y, banner_len.min(content_area.width), 1);
+        frame.render_widget(
+            Paragraph::new(banner_text).style(
+                Style::default()
+                    .fg(EMBER.text)
+                    .bg(EMBER.err)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            banner_rect,
+        );
+    }
+
     // ── ribbon render ──
     render_ribbon(frame, ribbon_area, slot);
 }
@@ -1089,7 +1134,7 @@ fn render_layout(
     frame: &mut ratatui::Frame,
     area: Rect,
     node: &LayoutNode,
-    slots: &mut Vec<PaneSlot>,
+    slots: &mut Vec<Option<PaneSlot>>,
     focus_path: &[usize],
     current_path: &mut Vec<usize>,
     boundaries: &mut Vec<SplitBoundary>,
@@ -1097,15 +1142,10 @@ fn render_layout(
 ) {
     match node {
         LayoutNode::Leaf(slot_idx) => {
-            let focused = current_path == focus_path;
-            render_pane(
-                frame,
-                area,
-                &mut slots[*slot_idx],
-                focused,
-                selection,
-                *slot_idx,
-            );
+            if let Some(slot) = slots[*slot_idx].as_mut() {
+                let focused = current_path == focus_path;
+                render_pane(frame, area, slot, focused, selection, *slot_idx);
+            }
         }
         LayoutNode::HSplit(children) => {
             let constraints: Vec<Constraint> = children
@@ -1553,15 +1593,16 @@ fn draw_frame(
         if let Some(ref zoom_path) = zoomed {
             // Zoom mode: render only the zoomed leaf filling pane_body_area.
             if let Some(slot_idx) = slot_at(unsafe { &*root_ptr }, zoom_path) {
-                let focused = true;
-                render_pane(
-                    frame,
-                    pane_body_area,
-                    &mut state.slots[slot_idx],
-                    focused,
-                    state.selection.as_ref(),
-                    slot_idx,
-                );
+                if let Some(slot) = state.slots[slot_idx].as_mut() {
+                    render_pane(
+                        frame,
+                        pane_body_area,
+                        slot,
+                        true,
+                        state.selection.as_ref(),
+                        slot_idx,
+                    );
+                }
             }
         } else {
             let mut current_path: Vec<usize> = Vec::new();
@@ -1601,8 +1642,11 @@ fn draw_frame(
                     state.status_msg.as_ref().map(|m| format!(" {m} ")),
                 )
             } else if let Some(slot_idx) = focused_slot {
-                let slot = &state.slots[slot_idx];
-                if slot.ribbon_cursor.is_some() {
+                let in_ribbon = state.slots[slot_idx]
+                    .as_ref()
+                    .map(|s| s.ribbon_cursor.is_some())
+                    .unwrap_or(false);
+                if in_ribbon {
                     (
                         "SCROLL",
                         state.status_msg.as_ref().map(|m| format!(" {m} ")),
@@ -1616,9 +1660,12 @@ fn draw_frame(
 
             // Left: ` ● {session_name} ▸ {pane} `
             let left_text = if let Some(slot_idx) = focused_slot {
-                let slot = &state.slots[slot_idx];
-                let pane_short = &slot.pane_id.0.to_string()[..8];
-                format!(" ● {} ▸ {pane_short} ", sv.name)
+                if let Some(slot) = state.slots[slot_idx].as_ref() {
+                    let pane_short = &slot.pane_id.0.to_string()[..8];
+                    format!(" ● {} ▸ {pane_short} ", sv.name)
+                } else {
+                    format!(" ● {} ", sv.name)
+                }
             } else {
                 format!(" ● {} ", sv.name)
             };
@@ -1676,19 +1723,20 @@ fn draw_frame(
                 slot_at(&tab.root, &tab.focus_path)
             };
             if let Some(slot_idx) = focused_slot_idx {
-                let slot = &state.slots[slot_idx];
-                if slot.scroll_offset == 0 {
-                    let vt_area = slot.last_screen_rect;
-                    let (vt_row, vt_col) = slot.parser.screen().cursor_position();
-                    let cursor_x = vt_area
-                        .x
-                        .saturating_add(vt_col)
-                        .min(vt_area.x.saturating_add(vt_area.width).saturating_sub(1));
-                    let cursor_y = vt_area
-                        .y
-                        .saturating_add(vt_row)
-                        .min(vt_area.y.saturating_add(vt_area.height).saturating_sub(1));
-                    frame.set_cursor_position((cursor_x, cursor_y));
+                if let Some(slot) = state.slots[slot_idx].as_ref() {
+                    if !slot.dead && slot.scroll_offset == 0 {
+                        let vt_area = slot.last_screen_rect;
+                        let (vt_row, vt_col) = slot.parser.screen().cursor_position();
+                        let cursor_x = vt_area
+                            .x
+                            .saturating_add(vt_col)
+                            .min(vt_area.x.saturating_add(vt_area.width).saturating_sub(1));
+                        let cursor_y = vt_area
+                            .y
+                            .saturating_add(vt_row)
+                            .min(vt_area.y.saturating_add(vt_area.height).saturating_sub(1));
+                        frame.set_cursor_position((cursor_x, cursor_y));
+                    }
                 }
             }
         }
@@ -1701,27 +1749,40 @@ fn draw_frame(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Cycle focus to the next leaf (DFS order), wrapping around.
-fn focus_next(tab: &mut Tab, forward: bool) {
+/// `slots` is passed so dead/None leaves can be skipped.
+fn focus_next(tab: &mut Tab, slots: &[Option<PaneSlot>], forward: bool) {
     let mut all_paths: Vec<Vec<usize>> = Vec::new();
     let mut tmp: Vec<usize> = Vec::new();
     leaves_in_order(&tab.root, &mut tmp, &mut all_paths);
 
-    if all_paths.is_empty() {
+    // Filter to only live (non-dead, non-None) leaves.
+    let live_paths: Vec<Vec<usize>> = all_paths
+        .into_iter()
+        .filter(|p| {
+            slot_at(&tab.root, p)
+                .and_then(|idx| slots.get(idx))
+                .and_then(|s| s.as_ref())
+                .map(|s| !s.dead)
+                .unwrap_or(false)
+        })
+        .collect();
+
+    if live_paths.is_empty() {
         return;
     }
 
-    let current_pos = all_paths
+    let current_pos = live_paths
         .iter()
         .position(|p| p == &tab.focus_path)
         .unwrap_or(0);
 
     let next_pos = if forward {
-        (current_pos + 1) % all_paths.len()
+        (current_pos + 1) % live_paths.len()
     } else {
-        (current_pos + all_paths.len() - 1) % all_paths.len()
+        (current_pos + live_paths.len() - 1) % live_paths.len()
     };
 
-    tab.focus_path = all_paths[next_pos].clone();
+    tab.focus_path = live_paths[next_pos].clone();
 }
 
 /// Split the active leaf. `horizontal` = true means HSplit (top/bottom).
@@ -1745,7 +1806,7 @@ async fn split_active(state: &mut AppState, horizontal: bool) -> Result<()> {
 
     let slot = attach_pane(&state.socket, session_id, new_pane_id).await?;
     let new_slot_idx = state.slots.len();
-    state.slots.push(slot);
+    state.slots.push(Some(slot));
 
     let sv = state.active_session_view_mut();
     let tab = &mut sv.tabs[sv.active_tab];
@@ -1804,7 +1865,7 @@ async fn open_new_tab(state: &mut AppState, label: Option<String>) -> Result<()>
 
     let slot = attach_pane(&state.socket, session_id, new_pane_id).await?;
     let slot_idx = state.slots.len();
-    state.slots.push(slot);
+    state.slots.push(Some(slot));
 
     let sv = state.active_session_view_mut();
     let tab_n = sv.tabs.len() + 1;
@@ -1844,7 +1905,7 @@ async fn open_new_session(state: &mut AppState, name: Option<String>) -> Result<
 
     let slot = attach_pane(&state.socket, session, pane).await?;
     let slot_idx = state.slots.len();
-    state.slots.push(slot);
+    state.slots.push(Some(slot));
 
     // Derive display name: use provided or fall back to session-<short8>.
     let short8: String = session.0.to_string().chars().take(8).collect();
@@ -1884,9 +1945,10 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
             for (slot_idx, rect) in &leaf_rects {
                 if rect_contains(*rect, col, row) {
                     focus_slot(state, *slot_idx);
-                    let slot = &mut state.slots[*slot_idx];
-                    let max_offset = slot.scrollback.len();
-                    slot.scroll_offset = (slot.scroll_offset + 3).min(max_offset);
+                    if let Some(slot) = state.slots[*slot_idx].as_mut() {
+                        let max_offset = slot.scrollback.len();
+                        slot.scroll_offset = (slot.scroll_offset + 3).min(max_offset);
+                    }
                     return true;
                 }
             }
@@ -1899,8 +1961,9 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
             for (slot_idx, rect) in &leaf_rects {
                 if rect_contains(*rect, col, row) {
                     focus_slot(state, *slot_idx);
-                    let slot = &mut state.slots[*slot_idx];
-                    slot.scroll_offset = slot.scroll_offset.saturating_sub(3);
+                    if let Some(slot) = state.slots[*slot_idx].as_mut() {
+                        slot.scroll_offset = slot.scroll_offset.saturating_sub(3);
+                    }
                     return true;
                 }
             }
@@ -2045,16 +2108,177 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
 
 /// Update active session's active tab focus_path to point at the given slot index.
 fn focus_slot(state: &mut AppState, target_slot_idx: usize) {
-    let sv = &mut state.sessions[state.active_session];
-    let tab = &mut sv.tabs[sv.active_tab];
-    let mut all_paths: Vec<Vec<usize>> = Vec::new();
-    let mut tmp: Vec<usize> = Vec::new();
-    leaves_in_order(&tab.root, &mut tmp, &mut all_paths);
-    for path in &all_paths {
-        if slot_at(&tab.root, path) == Some(target_slot_idx) {
-            tab.focus_path = path.clone();
-            return;
+    // Collect candidate paths first to avoid simultaneous borrow of sessions + slots.
+    let all_paths = {
+        let sv = &state.sessions[state.active_session];
+        let tab = &sv.tabs[sv.active_tab];
+        let mut paths: Vec<Vec<usize>> = Vec::new();
+        let mut tmp: Vec<usize> = Vec::new();
+        leaves_in_order(&tab.root, &mut tmp, &mut paths);
+        paths
+    };
+    let chosen = {
+        let sv = &state.sessions[state.active_session];
+        let tab = &sv.tabs[sv.active_tab];
+        all_paths.into_iter().find(|path| {
+            slot_at(&tab.root, path)
+                .map(|idx| {
+                    idx == target_slot_idx
+                        && state.slots.get(idx).and_then(|s| s.as_ref()).is_some()
+                })
+                .unwrap_or(false)
+        })
+    };
+    if let Some(path) = chosen {
+        let sv = &mut state.sessions[state.active_session];
+        let tab = &mut sv.tabs[sv.active_tab];
+        tab.focus_path = path;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pane close / layout collapse
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Remove the leaf at `leaf_path` from the layout tree, collapsing the parent
+/// split if it becomes a single child.  Returns the slot index that was removed.
+fn remove_leaf(root: &mut LayoutNode, leaf_path: &[usize]) -> Option<usize> {
+    if leaf_path.is_empty() {
+        // Root is a Leaf — replace with a sentinel; caller handles.
+        if let LayoutNode::Leaf(idx) = root {
+            return Some(*idx);
         }
+        return None;
+    }
+
+    let parent_path = &leaf_path[..leaf_path.len() - 1];
+    let child_idx = leaf_path[leaf_path.len() - 1];
+
+    // Navigate to parent, remove child, collapse if single child remains.
+    fn remove_in(node: &mut LayoutNode, path: &[usize], child_idx: usize) -> Option<usize> {
+        if path.is_empty() {
+            let removed = match node {
+                LayoutNode::HSplit(children) | LayoutNode::VSplit(children) => {
+                    if child_idx >= children.len() {
+                        return None;
+                    }
+                    let removed_slot = match &children[child_idx].0 {
+                        LayoutNode::Leaf(idx) => *idx,
+                        _ => return None, // only remove leaves
+                    };
+                    children.remove(child_idx);
+                    // Re-normalize weights to sum to 100.
+                    let n = children.len() as u16;
+                    if let Some(each) = 100u16.checked_div(n) {
+                        let remainder = 100 - each * n;
+                        for (i, (_, w)) in children.iter_mut().enumerate() {
+                            *w = each + if i == 0 { remainder } else { 0 };
+                        }
+                    }
+                    Some(removed_slot)
+                }
+                _ => None,
+            };
+            // Collapse single-child split into its child.
+            let collapse = match node {
+                LayoutNode::HSplit(children) | LayoutNode::VSplit(children) => children.len() == 1,
+                _ => false,
+            };
+            if collapse {
+                let child = match node {
+                    LayoutNode::HSplit(children) | LayoutNode::VSplit(children) => {
+                        children.remove(0).0
+                    }
+                    _ => unreachable!(),
+                };
+                *node = child;
+            }
+            return removed;
+        }
+        match node {
+            LayoutNode::HSplit(children) | LayoutNode::VSplit(children) => {
+                if path[0] >= children.len() {
+                    return None;
+                }
+                remove_in(&mut children[path[0]].0, &path[1..], child_idx)
+            }
+            _ => None,
+        }
+    }
+
+    remove_in(root, parent_path, child_idx)
+}
+
+/// Close the focused pane in the active tab:
+/// - Removes its leaf from the layout tree (collapses parent split).
+/// - Marks the slot as None.
+/// - Removes the tab if it becomes empty; removes the session view if it becomes empty.
+/// - Adjusts focus_path to a valid remaining leaf (if any).
+fn close_focused_pane(state: &mut AppState) {
+    let sess_idx = state.active_session;
+    let tab_idx = state.sessions[sess_idx].active_tab;
+    let focus_path = state.sessions[sess_idx].tabs[tab_idx].focus_path.clone();
+
+    // Find the slot index at the current focus path.
+    let slot_idx = match slot_at(&state.sessions[sess_idx].tabs[tab_idx].root, &focus_path) {
+        Some(idx) => idx,
+        None => return,
+    };
+
+    // Remove the leaf from the layout tree.
+    let removed = remove_leaf(
+        &mut state.sessions[sess_idx].tabs[tab_idx].root,
+        &focus_path,
+    );
+    if removed.is_none() {
+        return;
+    }
+
+    // Drop the slot.
+    if slot_idx < state.slots.len() {
+        state.slots[slot_idx] = None;
+    }
+
+    // Check if the tab now has no leaves.
+    let mut remaining_paths: Vec<Vec<usize>> = Vec::new();
+    let mut tmp: Vec<usize> = Vec::new();
+    leaves_in_order(
+        &state.sessions[sess_idx].tabs[tab_idx].root,
+        &mut tmp,
+        &mut remaining_paths,
+    );
+
+    if remaining_paths.is_empty() {
+        // Tab is empty — remove it.
+        state.sessions[sess_idx].tabs.remove(tab_idx);
+        if state.sessions[sess_idx].tabs.is_empty() {
+            // Session has no tabs — remove session view.
+            state.sessions.remove(sess_idx);
+            if state.sessions.is_empty() {
+                // No sessions left — nothing to do; caller should exit.
+                return;
+            }
+            state.active_session = state.active_session.min(state.sessions.len() - 1);
+        } else {
+            state.sessions[sess_idx].active_tab =
+                tab_idx.min(state.sessions[sess_idx].tabs.len() - 1);
+            // Reset focus to first leaf of new active tab.
+            let new_tab_idx = state.sessions[sess_idx].active_tab;
+            let mut paths: Vec<Vec<usize>> = Vec::new();
+            let mut t: Vec<usize> = Vec::new();
+            leaves_in_order(
+                &state.sessions[sess_idx].tabs[new_tab_idx].root,
+                &mut t,
+                &mut paths,
+            );
+            state.sessions[sess_idx].tabs[new_tab_idx].focus_path =
+                paths.into_iter().next().unwrap_or_default();
+        }
+    } else {
+        // Tab still has leaves — point focus at first remaining leaf.
+        let new_focus = remaining_paths.into_iter().next().unwrap_or_default();
+        state.sessions[sess_idx].tabs[tab_idx].focus_path = new_focus;
+        state.sessions[sess_idx].tabs[tab_idx].zoomed = None;
     }
 }
 
@@ -2085,7 +2309,7 @@ fn initial_app_state(
             active_tab: 0,
         }],
         active_session: 0,
-        slots: vec![initial_slot],
+        slots: vec![Some(initial_slot)],
         control,
         socket,
         shell,
@@ -2125,15 +2349,27 @@ async fn run_tui(
 
     loop {
         // Drain all pane output into their parsers and scrollback buffers.
-        for slot in &mut state.slots {
-            while let Ok(data) = slot.output_rx.try_recv() {
-                slot.process_output(&data);
+        for slot in state.slots.iter_mut().flatten() {
+            while let Ok(event) = slot.output_rx.try_recv() {
+                match event {
+                    PaneEvent::Output(data) => {
+                        if !slot.dead {
+                            slot.process_output(&data);
+                        }
+                    }
+                    PaneEvent::Closed => {
+                        if !slot.dead {
+                            slot.dead = true;
+                            slot.dead_at = Some(Instant::now());
+                        }
+                    }
+                }
             }
         }
 
         // Poll block lists inline (~500 ms throttle per pane)
         let poll_interval = std::time::Duration::from_millis(500);
-        for slot in &mut state.slots {
+        for slot in state.slots.iter_mut().flatten() {
             if slot.last_block_poll.elapsed() >= poll_interval {
                 slot.last_block_poll = std::time::Instant::now();
                 let req = pyre_proto::blocks::ListBlocksReq {
@@ -2319,13 +2555,15 @@ async fn run_tui(
                         }
 
                         KeyCode::Right | KeyCode::Down => {
-                            let sv = state.active_session_view_mut();
-                            focus_next(&mut sv.tabs[sv.active_tab], true);
+                            let si = state.active_session;
+                            let ti = state.sessions[si].active_tab;
+                            focus_next(&mut state.sessions[si].tabs[ti], &state.slots, true);
                         }
 
                         KeyCode::Left | KeyCode::Up => {
-                            let sv = state.active_session_view_mut();
-                            focus_next(&mut sv.tabs[sv.active_tab], false);
+                            let si = state.active_session;
+                            let ti = state.sessions[si].active_tab;
+                            focus_next(&mut state.sessions[si].tabs[ti], &state.slots, false);
                         }
 
                         // Enter scrollback mode for focused pane (block ribbon)
@@ -2333,9 +2571,10 @@ async fn run_tui(
                             let sv = &state.sessions[state.active_session];
                             let tab = &sv.tabs[sv.active_tab];
                             if let Some(slot_idx) = slot_at(&tab.root, &tab.focus_path) {
-                                let slot = &mut state.slots[slot_idx];
-                                let last = slot.recent_blocks.len().saturating_sub(1);
-                                slot.ribbon_cursor = Some(last);
+                                if let Some(slot) = state.slots[slot_idx].as_mut() {
+                                    let last = slot.recent_blocks.len().saturating_sub(1);
+                                    slot.ribbon_cursor = Some(last);
+                                }
                             }
                         }
 
@@ -2344,7 +2583,9 @@ async fn run_tui(
                             let sv = &state.sessions[state.active_session];
                             let tab = &sv.tabs[sv.active_tab];
                             if let Some(slot_idx) = slot_at(&tab.root, &tab.focus_path) {
-                                state.slots[slot_idx].ribbon_cursor = None;
+                                if let Some(slot) = state.slots[slot_idx].as_mut() {
+                                    slot.ribbon_cursor = None;
+                                }
                             }
                         }
 
@@ -2375,39 +2616,50 @@ async fn run_tui(
                             let sv = &state.sessions[state.active_session];
                             let tab = &sv.tabs[sv.active_tab];
                             if let Some(slot_idx) = slot_at(&tab.root, &tab.focus_path) {
-                                let slot = &state.slots[slot_idx];
-                                if let Some(last_block) = slot.recent_blocks.last() {
-                                    let block_id = last_block.id;
-                                    match state
-                                        .control
-                                        .get_block_stdout(tarpc::context::current(), block_id)
-                                        .await
-                                    {
-                                        Ok(Ok(bytes)) => {
-                                            let text = String::from_utf8_lossy(&bytes);
-                                            match clipboard::copy_to_clipboard(&text) {
-                                                Ok(()) => {
-                                                    state.status_msg =
-                                                        Some("copied to clipboard".to_owned());
-                                                }
-                                                Err(e) => {
-                                                    tracing::warn!("clipboard: {e}");
-                                                    state.status_msg =
-                                                        Some(format!("clipboard error: {e}"));
+                                if let Some(slot) = state.slots[slot_idx].as_ref() {
+                                    if let Some(last_block) = slot.recent_blocks.last() {
+                                        let block_id = last_block.id;
+                                        match state
+                                            .control
+                                            .get_block_stdout(tarpc::context::current(), block_id)
+                                            .await
+                                        {
+                                            Ok(Ok(bytes)) => {
+                                                let text = String::from_utf8_lossy(&bytes);
+                                                match clipboard::copy_to_clipboard(&text) {
+                                                    Ok(()) => {
+                                                        state.status_msg =
+                                                            Some("copied to clipboard".to_owned());
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::warn!("clipboard: {e}");
+                                                        state.status_msg =
+                                                            Some(format!("clipboard error: {e}"));
+                                                    }
                                                 }
                                             }
+                                            Ok(Err(e)) => {
+                                                state.status_msg =
+                                                    Some(format!("get_block_stdout rpc: {e}"));
+                                            }
+                                            Err(e) => {
+                                                state.status_msg =
+                                                    Some(format!("rpc transport: {e}"));
+                                            }
                                         }
-                                        Ok(Err(e)) => {
-                                            state.status_msg =
-                                                Some(format!("get_block_stdout rpc: {e}"));
-                                        }
-                                        Err(e) => {
-                                            state.status_msg = Some(format!("rpc transport: {e}"));
-                                        }
+                                    } else {
+                                        state.status_msg = Some("no blocks".to_owned());
                                     }
-                                } else {
-                                    state.status_msg = Some("no blocks".to_owned());
-                                }
+                                } // if let Some(slot)
+                            }
+                        }
+
+                        // Close focused pane (Ctrl-B x)
+                        KeyCode::Char('x') => {
+                            close_focused_pane(&mut state);
+                            // If all sessions are gone, exit the TUI loop.
+                            if state.sessions.is_empty() {
+                                break;
                             }
                         }
 
@@ -2446,7 +2698,8 @@ async fn run_tui(
                                 leaves_in_order(&tab.root, &mut tmp, &mut all_paths);
                                 let found_path = all_paths.iter().find(|p| {
                                     slot_at(&tab.root, p)
-                                        .map(|idx| state.slots[idx].pane_id == target_pane)
+                                        .and_then(|idx| state.slots[idx].as_ref())
+                                        .map(|s| s.pane_id == target_pane)
                                         .unwrap_or(false)
                                 });
                                 if let Some(path) = found_path {
@@ -2454,12 +2707,14 @@ async fn run_tui(
                                     let slot_idx = slot_at(&tab.root, &path).expect("just found");
                                     tab.focus_path = path;
                                     let block_id = hit.block.id;
-                                    let maybe_cursor = state.slots[slot_idx]
-                                        .recent_blocks
-                                        .iter()
-                                        .position(|b| b.id == block_id);
+                                    let maybe_cursor =
+                                        state.slots[slot_idx].as_ref().and_then(|s| {
+                                            s.recent_blocks.iter().position(|b| b.id == block_id)
+                                        });
                                     if let Some(c) = maybe_cursor {
-                                        state.slots[slot_idx].ribbon_cursor = Some(c);
+                                        if let Some(slot) = state.slots[slot_idx].as_mut() {
+                                            slot.ribbon_cursor = Some(c);
+                                        }
                                     }
                                 } else {
                                     state.status_msg =
@@ -2513,7 +2768,8 @@ async fn run_tui(
                                 leaves_in_order(&tab.root, &mut tmp, &mut all_paths);
                                 let found = all_paths.iter().find(|p| {
                                     slot_at(&tab.root, p)
-                                        .map(|i| state.slots[i].pane_id == target)
+                                        .and_then(|i| state.slots[i].as_ref())
+                                        .map(|s| s.pane_id == target)
                                         .unwrap_or(false)
                                 });
                                 if let Some(path) = found {
@@ -2539,29 +2795,30 @@ async fn run_tui(
                     let sv = &state.sessions[state.active_session];
                     let tab = &sv.tabs[sv.active_tab];
                     if let Some(slot_idx) = slot_at(&tab.root, &tab.focus_path) {
-                        let slot = &mut state.slots[slot_idx];
-                        if slot.ribbon_cursor.is_some() {
-                            match code {
-                                KeyCode::Left | KeyCode::Char('h') => {
-                                    slot.ribbon_cursor =
-                                        slot.ribbon_cursor.map(|c| c.saturating_sub(1));
-                                    continue;
-                                }
-                                KeyCode::Right | KeyCode::Char('l') => {
-                                    let max = slot.recent_blocks.len().saturating_sub(1);
-                                    slot.ribbon_cursor =
-                                        slot.ribbon_cursor.map(|c| (c + 1).min(max));
-                                    continue;
-                                }
-                                KeyCode::Enter | KeyCode::Esc => {
-                                    slot.ribbon_cursor = None;
-                                    continue;
-                                }
-                                _ => {
-                                    continue;
+                        if let Some(slot) = state.slots[slot_idx].as_mut() {
+                            if slot.ribbon_cursor.is_some() {
+                                match code {
+                                    KeyCode::Left | KeyCode::Char('h') => {
+                                        slot.ribbon_cursor =
+                                            slot.ribbon_cursor.map(|c| c.saturating_sub(1));
+                                        continue;
+                                    }
+                                    KeyCode::Right | KeyCode::Char('l') => {
+                                        let max = slot.recent_blocks.len().saturating_sub(1);
+                                        slot.ribbon_cursor =
+                                            slot.ribbon_cursor.map(|c| (c + 1).min(max));
+                                        continue;
+                                    }
+                                    KeyCode::Enter | KeyCode::Esc => {
+                                        slot.ribbon_cursor = None;
+                                        continue;
+                                    }
+                                    _ => {
+                                        continue;
+                                    }
                                 }
                             }
-                        }
+                        } // if let Some(slot)
                     }
                 }
 
@@ -2571,36 +2828,42 @@ async fn run_tui(
                     let tab = &sv.tabs[sv.active_tab];
                     if let Some(slot_idx) = slot_at(&tab.root, &tab.focus_path) {
                         let half_page = (body_area.height / 2).max(1) as usize;
-                        let slot = &mut state.slots[slot_idx];
-                        match code {
-                            KeyCode::PageUp => {
-                                let max_offset = slot.scrollback.len();
-                                slot.scroll_offset =
-                                    (slot.scroll_offset + half_page).min(max_offset);
-                                continue;
+                        if let Some(slot) = state.slots[slot_idx].as_mut() {
+                            match code {
+                                KeyCode::PageUp => {
+                                    let max_offset = slot.scrollback.len();
+                                    slot.scroll_offset =
+                                        (slot.scroll_offset + half_page).min(max_offset);
+                                    continue;
+                                }
+                                KeyCode::PageDown => {
+                                    slot.scroll_offset =
+                                        slot.scroll_offset.saturating_sub(half_page);
+                                    continue;
+                                }
+                                _ => {}
                             }
-                            KeyCode::PageDown => {
-                                slot.scroll_offset = slot.scroll_offset.saturating_sub(half_page);
-                                continue;
-                            }
-                            _ => {}
-                        }
+                        } // if let Some(slot)
                     }
                 }
 
-                // Forward key to focused pane.
+                // Forward key to focused pane (skip if pane is dead).
                 if let Some(bytes) = key_to_bytes(code, mods) {
                     let sv = &state.sessions[state.active_session];
                     let tab = &sv.tabs[sv.active_tab];
                     if let Some(slot_idx) = slot_at(&tab.root, &tab.focus_path) {
-                        state.slots[slot_idx].scroll_offset = 0;
-                        let _ = state.slots[slot_idx].input_tx.send(bytes).await;
+                        if let Some(slot) = state.slots[slot_idx].as_mut() {
+                            if !slot.dead {
+                                slot.scroll_offset = 0;
+                                let _ = slot.input_tx.send(bytes).await;
+                            }
+                        }
                     }
                 }
             }
 
             Event::Resize(new_cols, new_rows) => {
-                for slot in &mut state.slots {
+                for slot in state.slots.iter_mut().flatten() {
                     slot.parser.set_size(new_rows, new_cols);
                 }
                 tracing::debug!("terminal resized to {new_cols}x{new_rows}");
