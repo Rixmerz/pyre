@@ -1,0 +1,102 @@
+id: pyre-s0
+name: Pyre S0 Bootstrap
+version: 1.0.0
+description: |
+  Bootstrap pyre workspace (Sprint 0). Six phases, each with a validable milestone:
+    1. scaffold      — workspace dirs + Cargo.toml + crate stubs       (validate: `cargo check --workspace`)
+    2. docs          — README/SPEC/ARCHITECTURE/ROADMAP/CLAUDE         (validate: files exist non-empty)
+    3. proto-draft   — pyre-proto types (Session/Pane/Block/Command)   (validate: `cargo check -p pyre-proto`)
+    4. adr-ipc       — ADR-001 tonic vs tarpc decision                  (validate: docs/adr/ADR-001-ipc.md exists)
+    5. ci            — .github/workflows/ci.yml (check + clippy + fmt)  (validate: yaml parses + jobs declared)
+    6. commit        — conventional commit `chore: bootstrap pyre`      (validate: `git log -1` shows commit)
+
+nodes:
+  - id: scaffold
+    name: Scaffold workspace
+    is_start: true
+    prompt_injection: |
+      Phase 1 — scaffold. Create on disk:
+        - /home/rixmerz/Projects/pyre/Cargo.toml (workspace, resolver=2, members: 5 crates)
+        - /home/rixmerz/Projects/pyre/.gitignore (target/, *.swp, .DS_Store)
+        - /home/rixmerz/Projects/pyre/crates/{pyre-proto,pyred,pyrec,pyre-tui,pyre-gpu}/
+          each with Cargo.toml + src/lib.rs (pyred & pyrec → src/main.rs)
+      Run `git init` if .git missing.
+      MILESTONE: `cd /home/rixmerz/Projects/pyre && cargo check --workspace` exits 0.
+      Then graph_traverse to docs.
+
+  - id: docs
+    name: Write project docs
+    prompt_injection: |
+      Phase 2 — docs. Create:
+        - README.md (tagline + vision + quickstart, ≥30 lines)
+        - SPEC.md (detailed feature spec from user plan, ≥80 lines)
+        - ARCHITECTURE.md (crate map + stack table + diagram ASCII, ≥40 lines)
+        - ROADMAP.md (S0–S6 table + risks + MVP criterion, ≥30 lines)
+        - CLAUDE.md (handoff for next session: next step, files to read, rules, expected blockers)
+      MILESTONE: `wc -l README.md SPEC.md ARCHITECTURE.md ROADMAP.md CLAUDE.md` shows all ≥ thresholds.
+      Then graph_traverse to proto-draft.
+
+  - id: proto-draft
+    name: Draft pyre-proto types
+    prompt_injection: |
+      Phase 3 — proto-draft. In crates/pyre-proto/src/lib.rs define:
+        - SessionId, PaneId, BlockId (newtype Uuid)
+        - Session { id, name, panes: Vec<PaneId>, created_at }
+        - Pane { id, session: SessionId, cwd, shell, size: (cols,rows), block_ids: Vec<BlockId> }
+        - Block { id, pane: PaneId, command, cwd, stdout, exit_code: Option<i32>, started_at, ended_at: Option<_> }
+        - Command request/response enum (Spawn, Attach, Detach, Resize, Kill, ListSessions)
+      Use serde derives + uuid + chrono. Add deps to crates/pyre-proto/Cargo.toml.
+      MILESTONE: `cargo check -p pyre-proto` exits 0.
+      Then graph_traverse to adr-ipc.
+
+  - id: adr-ipc
+    name: ADR-001 IPC decision
+    prompt_injection: |
+      Phase 4 — ADR-001 tonic vs tarpc.
+        - Create docs/adr/ADR-001-ipc.md
+        - Compare: latency over UDS, codegen ergonomics, schema versioning, dep weight
+        - Decide one. Document rationale + revisit-trigger.
+      MILESTONE: file docs/adr/ADR-001-ipc.md exists, includes ## Decision section.
+      Then graph_traverse to ci.
+
+  - id: ci
+    name: CI workflow
+    prompt_injection: |
+      Phase 5 — CI. Write .github/workflows/ci.yml with jobs:
+        - check  (cargo check --workspace --all-targets)
+        - fmt    (cargo fmt --all -- --check)
+        - clippy (cargo clippy --workspace --all-targets -- -D warnings)
+      Trigger on push + PR to main. Use stable toolchain via dtolnay/rust-toolchain@stable.
+      MILESTONE: `python3 -c "import yaml; yaml.safe_load(open('.github/workflows/ci.yml'))"` parses; jobs.check/fmt/clippy declared.
+      Then graph_traverse to commit.
+
+  - id: commit
+    name: Conventional commit
+    is_end: true
+    prompt_injection: |
+      Phase 6 — commit. Stage everything, commit:
+        chore: bootstrap pyre workspace
+
+        Why: S0 scaffolding — workspace, docs, proto draft, IPC ADR, CI. Sets foundation for S1 daemon work.
+
+        Co-Authored-By: Claude <noreply@anthropic.com>
+      Do NOT push (user must use `!` prefix per global rules).
+      MILESTONE: `git log -1 --pretty=%s` returns `chore: bootstrap pyre workspace`.
+      Workflow complete.
+
+edges:
+  - id: e_scaffold_docs
+    from: scaffold
+    to: docs
+  - id: e_docs_proto
+    from: docs
+    to: proto-draft
+  - id: e_proto_adr
+    from: proto-draft
+    to: adr-ipc
+  - id: e_adr_ci
+    from: adr-ipc
+    to: ci
+  - id: e_ci_commit
+    from: ci
+    to: commit

@@ -1,0 +1,120 @@
+metadata:
+  name: "Feature Development"
+  description: "Structured 6-phase feature development: orient, design, implement, test, validate, commit."
+  version: "1.0.0"
+  type: "graph"
+  author: "jig"
+
+nodes:
+  - id: "orient"
+    name: "Orient"
+    is_start: true
+    prompt_injection: |
+      PHASE: ORIENT
+      Read-only exploration. Understand the codebase context before touching anything.
+      1. Read CLAUDE.md and relevant source files.
+      2. Run experience_query and graph_timeline to surface prior learnings.
+      3. State the feature goal and acceptance criteria clearly.
+      Signal: say "oriented" when ready to design.
+
+  - id: "design"
+    name: "Design"
+    prompt_injection: |
+      PHASE: DESIGN
+      Decide the implementation approach. No code yet.
+      1. Identify files to create/modify and their responsibilities.
+      2. Define public interfaces and data shapes.
+      3. Note dependencies, migrations, or config changes needed.
+      Signal: say "design complete" when ready to implement.
+
+  - id: "implement"
+    name: "Implement"
+    prompt_injection: |
+      PHASE: IMPLEMENT
+      Write the code following the design. Use Edit/Write/Bash freely.
+      1. Implement layer by layer: data → service → handler.
+      2. Match existing naming and error-handling conventions.
+      3. Keep changes focused — avoid unrelated refactors.
+      Signal: say "implementation done" when code is complete.
+
+  - id: "test"
+    name: "Test"
+    prompt_injection: |
+      PHASE: TEST
+      Add or update tests covering the new behavior.
+      1. Write unit tests for business logic.
+      2. Add integration tests for API/DB boundaries.
+      3. Run the test suite and confirm all pass.
+      Signal: say "tests passing" when suite is green.
+
+  - id: "validate"
+    name: "Validate"
+    prompt_injection: |
+      PHASE: VALIDATE
+      Final quality check before committing.
+      1. Run linter and type checker (ruff, mypy, tsc, cargo clippy).
+      2. Review DCC smells if available — address critical/high ones.
+      3. Confirm no regressions in the broader test suite.
+      Signal: say "validated" when all checks pass.
+
+  - id: "commit"
+    name: "Commit"
+    is_end: true
+    prompt_injection: |
+      PHASE: COMMIT
+      Create a well-formed commit following project conventions.
+      1. Stage only the files changed for this feature.
+      2. Use conventional commit format: feat: <description>
+      3. Include a "Why:" body line explaining the motivation.
+      Signal: commit created — workflow complete.
+
+edges:
+  - id: "orient-to-design"
+    from: "orient"
+    to: "design"
+    condition:
+      type: "phrase"
+      phrases:
+        - "oriented"
+        - "next phase"
+        - "advance"
+
+  - id: "design-to-implement"
+    from: "design"
+    to: "implement"
+    condition:
+      type: "phrase"
+      phrases:
+        - "design complete"
+        - "next phase"
+        - "advance"
+
+  - id: "implement-to-test"
+    from: "implement"
+    to: "test"
+    condition:
+      type: "phrase"
+      phrases:
+        - "implementation done"
+        - "next phase"
+        - "advance"
+
+  - id: "test-to-validate"
+    from: "test"
+    to: "validate"
+    condition:
+      type: "phrase"
+      phrases:
+        - "tests passing"
+        - "next phase"
+        - "advance"
+
+  - id: "validate-to-commit"
+    from: "validate"
+    to: "commit"
+    condition:
+      type: "phrase"
+      phrases:
+        - "validated"
+        - "next phase"
+        - "advance"
