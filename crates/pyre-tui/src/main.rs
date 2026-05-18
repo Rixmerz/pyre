@@ -294,6 +294,10 @@ struct PaneSlot {
 
     /// 0 = live view; N = N lines scrolled back via vt100 native scrollback.
     scroll_offset: usize,
+    /// Total scrollback lines available as of the last render (cached via peek/restore).
+    /// vt100::Screen::scrollback() returns the *current offset*, not the capacity;
+    /// we peek by setting MAX and reading the clamped value, then restore.
+    scrollback_capacity: usize,
     /// The screen rect captured during the last render, used for mouse hit-test.
     last_screen_rect: Rect,
     /// Ribbon chip rects captured during last render: (block_idx, rect).
@@ -742,6 +746,7 @@ async fn attach_pane(socket: &Path, session: SessionId, pane_id: PaneId) -> Resu
             .checked_sub(std::time::Duration::from_secs(10))
             .unwrap_or_else(std::time::Instant::now),
         scroll_offset: 0,
+        scrollback_capacity: 0,
         last_screen_rect: Rect::default(),
         ribbon_chip_rects: Vec::new(),
     })
@@ -797,6 +802,12 @@ fn render_pane(
     slot.last_screen_rect = content_area;
 
     // ── Unified render: set_scrollback shifts the vt100 view; 0 = live ──
+    // Peek the total scrollback capacity: vt100 clamps set_scrollback to the actual
+    // buffer length, so setting MAX then reading back the offset gives us the true max.
+    slot.parser.set_scrollback(usize::MAX);
+    slot.scrollback_capacity = slot.parser.screen().scrollback();
+    // Clamp current offset in case old lines aged out of the ring buffer.
+    slot.scroll_offset = slot.scroll_offset.min(slot.scrollback_capacity);
     slot.parser.set_scrollback(slot.scroll_offset);
 
     // When scrolled back, reserve 1 column on the right for a scrollbar.
@@ -891,7 +902,7 @@ fn render_pane(
 
     // Scrollbar when scrolled back.
     if let Some(sb_rect) = sb_area {
-        let total_scrollback = slot.parser.screen().scrollback();
+        let total_scrollback = slot.scrollback_capacity;
         let virtual_total = total_scrollback.max(1);
         let position = virtual_total.saturating_sub(slot.scroll_offset);
         let mut sb_state = ScrollbarState::new(virtual_total).position(position);
@@ -1802,8 +1813,7 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
                 if rect_contains(*rect, col, row) {
                     focus_slot(state, *slot_idx);
                     if let Some(slot) = state.slots[*slot_idx].as_mut() {
-                        let max_offset = slot.parser.screen().scrollback();
-                        slot.scroll_offset = (slot.scroll_offset + 3).min(max_offset);
+                        slot.scroll_offset = (slot.scroll_offset + 3).min(slot.scrollback_capacity);
                     }
                     return true;
                 }
@@ -2754,9 +2764,8 @@ async fn run_tui(
                         if let Some(slot) = state.slots[slot_idx].as_mut() {
                             match code {
                                 KeyCode::PageUp => {
-                                    let max_offset = slot.parser.screen().scrollback();
-                                    slot.scroll_offset =
-                                        (slot.scroll_offset + half_page).min(max_offset);
+                                    slot.scroll_offset = (slot.scroll_offset + half_page)
+                                        .min(slot.scrollback_capacity);
                                     continue;
                                 }
                                 KeyCode::PageDown => {
