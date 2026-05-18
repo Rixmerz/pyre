@@ -8,6 +8,7 @@
 
 mod parser;
 mod pty;
+mod ringbuf;
 mod server;
 mod session;
 mod store;
