@@ -27,7 +27,6 @@
 use std::collections::VecDeque;
 use std::io::stdout;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -54,8 +53,6 @@ use ratatui::widgets::{
     ScrollbarOrientation, ScrollbarState,
 };
 use ratatui::Terminal;
-use regex::Regex;
-
 mod clipboard;
 mod theme;
 use tarpc::client;
@@ -66,32 +63,6 @@ use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tokio_serde::formats::SymmetricalBincode;
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// ANSI strip helper
-//
-// Conservative regex: matches ESC [ followed by optional parameter/intermediate
-// bytes (0x20–0x3F) and a final byte (0x40–0x7E). This covers SGR, cursor
-// movement, and most CSI sequences without risking eating printable text.
-// OSC and other non-CSI sequences are left in place; the line splitter will
-// simply include the raw bytes as non-printable, which is harmless for the
-// plain-text scrollback view.
-// ─────────────────────────────────────────────────────────────────────────────
-
-static ANSI_RE: OnceLock<Regex> = OnceLock::new();
-
-fn ansi_regex() -> &'static Regex {
-    ANSI_RE.get_or_init(|| {
-        Regex::new(r"\x1b\[[\x20-\x3f]*[\x40-\x7e]").expect("static regex is valid")
-    })
-}
-
-/// Strip CSI ANSI escape sequences from a byte slice and return a UTF-8 string.
-/// Non-UTF-8 bytes are lossily replaced.
-fn strip_ansi(raw: &[u8]) -> String {
-    let lossy = String::from_utf8_lossy(raw);
-    ansi_regex().replace_all(&lossy, "").into_owned()
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI
@@ -322,18 +293,13 @@ struct PaneSlot {
     /// Wall-clock instant of the last block-poll so we throttle to ~500 ms.
     last_block_poll: std::time::Instant,
 
-    // ── Scrollback line buffer ──
-    /// Accumulated output lines, oldest at front. Capacity: scrollback_cap.
-    scrollback: VecDeque<String>,
-    /// Maximum number of lines retained in the scrollback buffer.
-    scrollback_cap: usize,
-    /// 0 = live view; N = N lines back from the bottom of scrollback.
+    // ── Raw-byte scrollback buffer ──
+    /// All raw bytes received from the PTY, including CSI sequences. Oldest at front.
+    raw_history: VecDeque<u8>,
+    /// Byte capacity cap, default 256 KB.
+    raw_cap: usize,
+    /// 0 = live view; N = N lines scrolled back from the bottom of raw_history.
     scroll_offset: usize,
-    /// Incomplete line accumulator for the line splitter.
-    current_line: String,
-    /// One-byte lookahead flag: set when the last byte was `\r`. Cleared on the
-    /// next byte. Allows correct CRLF handling without buffering extra bytes.
-    last_was_cr: bool,
     /// The screen rect captured during the last render, used for mouse hit-test.
     last_screen_rect: Rect,
     /// Ribbon chip rects captured during last render: (block_idx, rect).
@@ -341,61 +307,21 @@ struct PaneSlot {
 }
 
 impl PaneSlot {
-    /// Feed raw bytes into both the vt100 parser and the side-channel line buffer.
+    /// Feed raw bytes into both the vt100 parser and the raw history buffer.
     fn process_output(&mut self, data: &[u8]) {
         self.parser.process(data);
-        self.feed_line_buffer(data);
+        // Append to raw history, evicting oldest bytes if over cap.
+        for &b in data {
+            self.raw_history.push_back(b);
+        }
+        while self.raw_history.len() > self.raw_cap {
+            self.raw_history.pop_front();
+        }
     }
 
-    /// Append bytes to the plain-text line buffer, stripping ANSI sequences.
-    ///
-    /// Uses a one-byte lookahead (`last_was_cr`) to handle CRLF correctly:
-    /// - `\r\n` (CRLF): `\r` sets the flag; `\n` pushes the full line.
-    /// - `\rX` (CR overwrite, progress-bar style): clears `current_line` then
-    ///   collects `X` and subsequent printable bytes.
-    /// - Lone `\r` with no follow-up byte in this chunk: flag stays set and is
-    ///   resolved on the next call.
-    fn feed_line_buffer(&mut self, raw: &[u8]) {
-        let stripped = strip_ansi(raw);
-        for &b in stripped.as_bytes() {
-            match b {
-                b'\n' => {
-                    // Either a bare LF or the \n half of CRLF — either way
-                    // push whatever is in current_line (which is the real
-                    // content, since \r only set the flag without clearing).
-                    let line = std::mem::take(&mut self.current_line);
-                    self.scrollback.push_back(line);
-                    while self.scrollback.len() > self.scrollback_cap {
-                        self.scrollback.pop_front();
-                        // If user is scrolled back, keep their view stable.
-                        if self.scroll_offset > 0 {
-                            self.scroll_offset = self.scroll_offset.saturating_sub(1);
-                        }
-                    }
-                    self.last_was_cr = false;
-                }
-                b'\r' => {
-                    // Defer: just set the flag. If the next byte is \n we
-                    // handle CRLF in the branch above (current_line untouched).
-                    // If the next byte is printable we handle CR-overwrite below.
-                    self.last_was_cr = true;
-                }
-                c if c.is_ascii_control() => {
-                    // Skip other control bytes (BEL, FF, etc.).
-                    // Do NOT reset last_was_cr — the flag resolves on next non-control.
-                }
-                c => {
-                    if self.last_was_cr {
-                        // A printable byte arrived after a lone \r (no \n followed).
-                        // This is a real carriage-return overwrite (progress bars,
-                        // spinner updates). Clear the line and start fresh.
-                        self.current_line.clear();
-                        self.last_was_cr = false;
-                    }
-                    self.current_line.push(c as char);
-                }
-            }
-        }
+    /// Count newline bytes in raw_history (approximation of line count).
+    fn raw_line_count(&self) -> usize {
+        self.raw_history.iter().filter(|&&b| b == b'\n').count()
     }
 }
 
@@ -833,11 +759,9 @@ async fn attach_pane(socket: &Path, session: SessionId, pane_id: PaneId) -> Resu
         last_block_poll: std::time::Instant::now()
             .checked_sub(std::time::Duration::from_secs(10))
             .unwrap_or_else(std::time::Instant::now),
-        scrollback: VecDeque::new(),
-        scrollback_cap: 10_000,
+        raw_history: VecDeque::new(),
+        raw_cap: 256 * 1024,
         scroll_offset: 0,
-        current_line: String::new(),
-        last_was_cr: false,
         last_screen_rect: Rect::default(),
         ribbon_chip_rects: Vec::new(),
     })
@@ -968,7 +892,7 @@ fn render_pane(
             }
         }
     } else {
-        // ── Scrollback render ──
+        // ── Scrollback render (raw-byte replay) ──
         // Reserve 1 column on the right for the scrollbar.
         let (sb_area, text_area) = if content_area.width > 1 {
             let split = Layout::default()
@@ -980,57 +904,93 @@ fn render_pane(
             (None, content_area)
         };
 
-        let height = text_area.height as usize;
-        // Include current_line (in-flight, no trailing \n yet) in the virtual buffer
-        // so scroll_offset=1 doesn't make the bottom row disappear.
-        let has_partial = !slot.current_line.is_empty();
-        let virtual_total = slot.scrollback.len() + usize::from(has_partial);
-        let offset = slot.scroll_offset.min(virtual_total);
-        let window_end = virtual_total.saturating_sub(offset);
-        let window_start = window_end.saturating_sub(height);
+        // Convert raw_history to a contiguous slice for processing.
+        let raw: Vec<u8> = slot.raw_history.iter().copied().collect();
+        let total_lines = raw.iter().filter(|&&b| b == b'\n').count();
 
-        let lines: Vec<Line> = slot
-            .scrollback
-            .iter()
-            .map(|s| s.as_str())
-            .chain(std::iter::once(slot.current_line.as_str()).filter(|_| has_partial))
-            .skip(window_start)
-            .take(window_end - window_start)
-            .map(Line::from)
-            .collect();
+        // Clamp scroll_offset to valid range.
+        let offset = slot.scroll_offset.min(total_lines);
 
-        frame.render_widget(Paragraph::new(lines), text_area);
-
-        // Overlay selection highlight on scrollback view.
-        if let Some(sel) = selection {
-            if sel.pane_idx == slot_idx {
-                if let SelectionBase::Scrollback(_) = sel.base {
-                    let ((r0, c0), (r1, c1)) = sel.normalized();
-                    for row in r0..=r1.min(text_area.height.saturating_sub(1)) {
-                        let col_start = if row == r0 { c0 } else { 0 };
-                        let col_end = if row == r1 {
-                            c1.min(text_area.width.saturating_sub(1))
-                        } else {
-                            text_area.width.saturating_sub(1)
-                        };
-                        for col in col_start..=col_end {
-                            let sx = text_area.x + col;
-                            let sy = text_area.y + row;
-                            if sx < text_area.x + text_area.width
-                                && sy < text_area.y + text_area.height
-                            {
-                                if let Some(cell) = frame.buffer_mut().cell_mut((sx, sy)) {
-                                    cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
-                                }
-                            }
-                        }
+        // Find the byte index that is `offset` newlines from the end.
+        // This is the exclusive end of the historical slice we feed to replay.
+        let slice_end = if offset == 0 {
+            raw.len()
+        } else {
+            let mut nl_count = 0usize;
+            let mut idx = raw.len();
+            while idx > 0 {
+                idx -= 1;
+                if raw[idx] == b'\n' {
+                    nl_count += 1;
+                    if nl_count == offset {
+                        break;
                     }
                 }
             }
-        }
+            idx
+        };
 
+        // Take up to (height * 200) bytes before slice_end so the replay parser
+        // sees enough context to fill the viewport without re-processing all history.
+        let height_usize = text_area.height as usize;
+        let slice_start = slice_end.saturating_sub(height_usize * 200);
+        let replay_bytes = &raw[slice_start..slice_end];
+
+        // Build a fresh parser sized to the pane and replay the slice.
+        let mut hist_parser = vt100::Parser::new(text_area.height, text_area.width, 0);
+        hist_parser.process(replay_bytes);
+
+        // Render the replay parser's screen using the same cell loop as live view.
+        let screen = hist_parser.screen();
+        let mut lines: Vec<Line> = Vec::with_capacity(height_usize);
+        for row in 0..text_area.height {
+            let mut spans: Vec<Span> = Vec::new();
+            let mut current_text = String::new();
+            let mut current_style = Style::default();
+
+            for col in 0..text_area.width {
+                let cell = screen.cell(row, col);
+                let (ch, fg, bg) = match cell {
+                    Some(c) => {
+                        let ch = if c.contents().is_empty() {
+                            ' '
+                        } else {
+                            c.contents().chars().next().unwrap_or(' ')
+                        };
+                        let fg = vt100_color(c.fgcolor());
+                        let bg = vt100_color(c.bgcolor());
+                        (ch, fg, bg)
+                    }
+                    None => (' ', None, None),
+                };
+
+                let style = Style::default()
+                    .fg(fg.unwrap_or(Color::Reset))
+                    .bg(bg.unwrap_or(Color::Reset));
+
+                if style == current_style {
+                    current_text.push(ch);
+                } else {
+                    if !current_text.is_empty() {
+                        spans.push(Span::styled(current_text.clone(), current_style));
+                        current_text.clear();
+                    }
+                    current_text.push(ch);
+                    current_style = style;
+                }
+            }
+            if !current_text.is_empty() {
+                spans.push(Span::styled(current_text, current_style));
+            }
+            lines.push(Line::from(spans));
+        }
+        frame.render_widget(Paragraph::new(lines), text_area);
+
+        // Scrollbar: position reflects how far back we are in total_lines.
         if let Some(sb_rect) = sb_area {
-            let mut sb_state = ScrollbarState::new(virtual_total).position(window_end);
+            let virtual_total = total_lines.max(1);
+            let position = virtual_total.saturating_sub(offset);
+            let mut sb_state = ScrollbarState::new(virtual_total).position(position);
             frame.render_stateful_widget(
                 Scrollbar::new(ScrollbarOrientation::VerticalRight)
                     .style(EMBER.border())
@@ -1939,8 +1899,7 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
                 if rect_contains(*rect, col, row) {
                     focus_slot(state, *slot_idx);
                     if let Some(slot) = state.slots[*slot_idx].as_mut() {
-                        let max_offset =
-                            slot.scrollback.len() + usize::from(!slot.current_line.is_empty());
+                        let max_offset = slot.raw_line_count();
                         slot.scroll_offset = (slot.scroll_offset + 3).min(max_offset);
                     }
                     return true;
@@ -2892,8 +2851,7 @@ async fn run_tui(
                         if let Some(slot) = state.slots[slot_idx].as_mut() {
                             match code {
                                 KeyCode::PageUp => {
-                                    let max_offset = slot.scrollback.len()
-                                        + usize::from(!slot.current_line.is_empty());
+                                    let max_offset = slot.raw_line_count();
                                     slot.scroll_offset =
                                         (slot.scroll_offset + half_page).min(max_offset);
                                     continue;
