@@ -278,7 +278,7 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
 
         // Register the initial pane in PaneIndex BEFORE spawning so that any
         // follow-up RPC (e.g. close_pane) can resolve the PaneId immediately.
-        let (pane_uuid, _slot_idx) = self.registry.alloc_pane(&session_id_str).await;
+        let (pane_uuid, slot_idx) = self.registry.alloc_pane(&session_id_str).await;
 
         // Insert a oneshot BEFORE spawning so register_worker can never race
         // against us — it always finds the sender in the map.
@@ -320,6 +320,30 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
                 )));
             }
         }
+
+        // Actually create the PTY on the worker for slot_idx.  alloc_pane above
+        // only reserves the PaneId↔slot mapping in the supervisor's PaneIndex;
+        // without this call the worker has no entry in its panes map, so the
+        // first stream connection returns "pane not found slot_idx=0" and the
+        // worker immediately exits (all panes closed), causing a respawn loop.
+        let shell = req.shell.clone().unwrap_or_default();
+        let cwd = req
+            .cwd
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let ctrl_client = self
+            .registry
+            .get_ctrl_client(&session_id_str)
+            .await
+            .ok_or_else(|| {
+                PyreError::SpawnFailed("worker deregistered immediately after registration".into())
+            })?;
+        ctrl_client
+            .open_pane(context::current(), slot_idx, shell, cwd)
+            .await
+            .map_err(|e| PyreError::SpawnFailed(e.to_string()))?
+            .map_err(|e| PyreError::SpawnFailed(e.to_string()))?;
 
         let pane_id = PaneId(pane_uuid);
         Ok(SpawnResp {

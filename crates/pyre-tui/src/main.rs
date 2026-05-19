@@ -365,7 +365,12 @@ fn vt100_color(color: vt100::Color) -> Option<Color> {
 /// Events flowing from the net→UI background task to the main loop.
 enum PaneEvent {
     Output(Bytes),
-    Closed,
+    /// Stream ended. `frames_received` is the total number of `OutputFrame`
+    /// messages successfully decoded before the stream closed. A value of 0
+    /// means the connection was rejected at the handshake level (e.g. worker
+    /// returned "pane not found") rather than a real pane exit; in that case
+    /// the TUI should skip the `close_pane` RPC to avoid a respawn loop.
+    Closed { frames_received: u64 },
 }
 
 /// One attached PTY pane with its I/O channels and VT parser.
@@ -383,6 +388,11 @@ struct PaneSlot {
 
     /// Last PTY size successfully sent to the daemon, to avoid spamming per frame.
     last_sent_size: (u16, u16),
+
+    /// Number of OutputFrame messages received from the daemon on this stream.
+    /// Used to distinguish a connection-level failure (zero frames → do not fire
+    /// close_pane RPC) from a legitimate pane exit (≥1 frames → fire close_pane).
+    frames_received: u64,
 
     /// 0 = live view; N = N lines scrolled back via vt100 native scrollback.
     scroll_offset: usize,
@@ -831,9 +841,11 @@ async fn attach_pane(
 
     // net → UI
     tokio::spawn(async move {
+        let mut frames: u64 = 0;
         while let Some(frame) = output_frames.next().await {
             match frame {
                 Ok(f) => {
+                    frames += 1;
                     if let Err(e) = net_tx.try_send(PaneEvent::Output(f.data)) {
                         match e {
                             mpsc::error::TrySendError::Full(_) => {
@@ -847,8 +859,9 @@ async fn attach_pane(
                 Err(_) => break,
             }
         }
-        // Stream ended (daemon closed or pane exited) — notify UI.
-        let _ = net_tx.try_send(PaneEvent::Closed);
+        // Stream ended. Carry frame count so the UI can distinguish a
+        // connection-level failure (0 frames) from a real pane exit (≥1 frames).
+        let _ = net_tx.try_send(PaneEvent::Closed { frames_received: frames });
     });
 
     // UI → net
@@ -869,6 +882,7 @@ async fn attach_pane(
         recent_blocks: Vec::new(),
         ribbon_cursor: None,
         last_sent_size: (cols, rows),
+        frames_received: 0,
         scroll_offset: 0,
         scrollback_capacity: 0,
         last_screen_rect: Rect::default(),
@@ -2631,18 +2645,19 @@ async fn run_tui(
 
     loop {
         // Drain all pane output into their parsers and scrollback buffers.
-        // Collect slot indices that received a Closed event so we can auto-close
-        // them after the borrow on state.slots ends.
-        let mut closed_slots: Vec<usize> = Vec::new();
+        // Collect (slot_idx, frames_received) for Closed events so we can
+        // decide whether to fire close_pane RPC after the borrow ends.
+        let mut closed_slots: Vec<(usize, u64)> = Vec::new();
         for (slot_idx, slot_opt) in state.slots.iter_mut().enumerate() {
             if let Some(slot) = slot_opt {
                 while let Ok(event) = slot.output_rx.try_recv() {
                     match event {
                         PaneEvent::Output(data) => {
+                            slot.frames_received += 1;
                             slot.process_output(&data);
                         }
-                        PaneEvent::Closed => {
-                            closed_slots.push(slot_idx);
+                        PaneEvent::Closed { frames_received } => {
+                            closed_slots.push((slot_idx, frames_received));
                             // Stop draining this pane; it will be removed below.
                             break;
                         }
@@ -2650,8 +2665,21 @@ async fn run_tui(
                 }
             }
         }
-        for slot_idx in closed_slots {
-            close_pane_by_slot_idx(&mut state, slot_idx);
+        for (slot_idx, frames_received) in closed_slots {
+            if frames_received == 0 {
+                // The stream was rejected before any output arrived — the
+                // worker did not have this pane (e.g. "pane not found").
+                // Firing close_pane here would tell the worker to close a
+                // slot it never opened, causing it to exit and triggering a
+                // supervisor respawn loop.  Just remove the TUI slot; the
+                // session-sync loop will reconcile daemon state on the next tick.
+                tracing::warn!(slot_idx, "stream closed with 0 frames; skipping close_pane RPC");
+                if slot_idx < state.slots.len() {
+                    state.slots[slot_idx] = None;
+                }
+            } else {
+                close_pane_by_slot_idx(&mut state, slot_idx);
+            }
         }
 
         // Drain latest block snapshot from the background poll task (non-blocking).
