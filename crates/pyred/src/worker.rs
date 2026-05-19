@@ -19,6 +19,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::ringbuf::RingBuf;
+
 use anyhow::{bail, Context, Result};
 use futures::StreamExt;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
@@ -87,6 +89,8 @@ struct PaneHandle {
     master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
     /// Channel for writing input bytes into the PTY.
     input_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    /// In-memory ring buffer: last 256 KiB of raw PTY output.
+    ring_buf: Arc<Mutex<RingBuf>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -160,13 +164,6 @@ impl WorkerShard {
             .await
             .context("delete pane")?;
         Ok(())
-    }
-
-    /// Return the last captured snapshot bytes for `slot_idx`, or empty vec if none.
-    async fn load_pane_snapshot(&self, _slot_idx: u32) -> Result<Vec<u8>> {
-        // Snapshot persistence is deferred to S3. Return empty bytes for now;
-        // capture_pane will return an empty result rather than an error.
-        Ok(Vec::new())
     }
 
     async fn load_panes(&self) -> Result<Vec<(u32, String, String)>> {
@@ -278,9 +275,13 @@ impl WorkerState {
             })
             .context("spawn pty reader thread")?;
 
-        // Async relay: raw_rx → supervisor block_event (fire-and-forget).
+        // Per-pane ring buffer: 256 KiB.
+        let ring_buf = Arc::new(Mutex::new(RingBuf::new(256 * 1024)));
+
+        // Async relay: raw_rx → ring buffer + supervisor block_event (fire-and-forget).
         let sv = self.sv_client.clone();
         let session_id = self.session_id.clone();
+        let ring_buf_relay = ring_buf.clone();
         let now_ms = || {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -289,6 +290,8 @@ impl WorkerState {
         };
         tokio::spawn(async move {
             while let Some(bytes) = raw_rx.recv().await {
+                // Tee into the ring buffer.
+                ring_buf_relay.lock().await.push(&bytes);
                 let ev = BlockEvent {
                     session_id: session_id.clone(),
                     slot_idx,
@@ -306,6 +309,7 @@ impl WorkerState {
             child_pid,
             master,
             input_tx,
+            ring_buf,
         };
 
         self.panes.write().await.insert(slot_idx, handle);
@@ -463,13 +467,14 @@ impl WorkerControl for WorkerControlImpl {
             Regex::new(r"\x1b\[[\x20-\x3f]*[\x40-\x7e]").expect("static regex is valid")
         });
 
-        // Read recent bytes from the worker shard for this pane.
-        let raw = self
-            .state
-            .shard
-            .load_pane_snapshot(slot_idx)
-            .await
-            .map_err(|e| RpcError::Internal(e.to_string()))?;
+        // Read from the in-memory ring buffer of the live pane.
+        let raw = {
+            let panes = self.state.panes.read().await;
+            match panes.get(&slot_idx) {
+                Some(h) => h.ring_buf.lock().await.snapshot().to_vec(),
+                None => return Err(RpcError::UnknownSlot(slot_idx)),
+            }
+        };
 
         let lossy = String::from_utf8_lossy(&raw);
         let stripped = re.replace_all(&lossy, "");
