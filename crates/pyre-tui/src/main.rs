@@ -3277,9 +3277,33 @@ async fn main() -> Result<()> {
                 .map_err(|e| anyhow!("daemon list_sessions: {e}"))?;
 
             let (session, session_name, pane) = if let Some(sess) = existing.into_iter().next() {
-                let pane = first_pane(&client, sess.id).await?;
+                // Session exists — try to find an existing pane. If the session
+                // has zero panes (e.g. freshly booted daemon with a bare session
+                // container), open one automatically so the TUI always starts
+                // with an attachable pane.
+                let pane = match first_pane(&client, sess.id).await {
+                    Ok(p) => p,
+                    Err(_) => {
+                        let req = OpenPaneReq {
+                            session: sess.id,
+                            shell: shell.clone(),
+                            cwd: std::env::current_dir()
+                                .ok()
+                                .or_else(|| std::env::var("HOME").ok().map(PathBuf::from)),
+                            cols,
+                            rows,
+                            env: std::env::vars().collect(),
+                        };
+                        client
+                            .open_pane(tarpc::context::current(), req)
+                            .await
+                            .context("rpc transport")?
+                            .map_err(|e| anyhow!("daemon open_pane: {e}"))?
+                    }
+                };
                 (sess.id, sess.name, pane)
             } else {
+                // No sessions at all — spawn a fresh one (creates session + pane).
                 let req = SpawnReq {
                     shell: shell.clone(),
                     cwd: std::env::current_dir().ok(),
