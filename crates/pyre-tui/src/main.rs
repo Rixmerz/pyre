@@ -410,6 +410,8 @@ struct PaneSlot {
     /// True once the parser has been sized to the actual pane area and
     /// `pending_output` has been flushed. Set on the first `render_pane` call.
     parser_sized: bool,
+    /// Timestamp of the last `process_output` debug log emission (50 ms throttle).
+    last_output_log: Option<Instant>,
 }
 
 impl PaneSlot {
@@ -419,6 +421,22 @@ impl PaneSlot {
     /// being processed at the wrong terminal dimensions. `render_pane` drains
     /// the buffer once it knows the correct area size.
     fn process_output(&mut self, data: &[u8]) {
+        // Throttled debug log: at most once per 50 ms to avoid flooding.
+        let now = Instant::now();
+        let emit = match self.last_output_log {
+            None => true,
+            Some(t) => now.duration_since(t) >= Duration::from_millis(50),
+        };
+        if emit {
+            tracing::debug!(
+                bytes = data.len(),
+                parser_sized = self.parser_sized,
+                pane_id = %self.pane_id.0,
+                "process_output: chunk"
+            );
+            self.last_output_log = Some(now);
+        }
+
         if self.parser_sized {
             self.parser.process(data);
         } else {
@@ -816,6 +834,7 @@ async fn attach_pane(
     cols: u16,
     rows: u16,
 ) -> Result<PaneSlot> {
+    tracing::debug!(cols, rows, pane_id = %pane_id.0, "attach_pane: entry");
 
     let mut stream_sock = UnixStream::connect(socket)
         .await
@@ -874,6 +893,7 @@ async fn attach_pane(
         }
     });
 
+    tracing::debug!(rows, cols, pane_id = %pane_id.0, "attach_pane: creating vt100::Parser");
     Ok(PaneSlot {
         pane_id,
         parser: vt100::Parser::new(rows, cols, 10_000),
@@ -889,6 +909,7 @@ async fn attach_pane(
         ribbon_chip_rects: Vec::new(),
         pending_output: Vec::new(),
         parser_sized: false,
+        last_output_log: None,
     })
 }
 
@@ -970,7 +991,29 @@ fn render_pane(
         let target_rows = text_area.height;
         let target_cols = text_area.width;
         let (cur_rows, cur_cols) = slot.parser.screen().size();
+
+        // Log on first call only (before parser_sized is set).
+        if !slot.parser_sized {
+            let (p_rows, p_cols) = (cur_rows, cur_cols);
+            tracing::debug!(
+                slot_idx,
+                text_area.width,
+                text_area.height,
+                parser_rows = p_rows,
+                parser_cols = p_cols,
+                "render_pane: first call"
+            );
+        }
+
         if cur_rows != target_rows || cur_cols != target_cols {
+            tracing::debug!(
+                slot_idx,
+                old_rows = cur_rows,
+                old_cols = cur_cols,
+                new_rows = target_rows,
+                new_cols = target_cols,
+                "render_pane: parser resize"
+            );
             slot.parser.set_size(target_rows, target_cols);
         }
         // On the first render we now know the real pane area. Drain any bytes
@@ -2643,6 +2686,11 @@ async fn run_tui(
     let mut terminal = Terminal::new(backend)?;
     let mut prefix_active = false;
 
+    // Observability counters for the 1 s periodic debug log.
+    let mut loop_frames_drawn: u64 = 0;
+    let mut loop_bytes_processed: u64 = 0;
+    let mut loop_stats_at = Instant::now();
+
     loop {
         // Drain all pane output into their parsers and scrollback buffers.
         // Collect (slot_idx, frames_received) for Closed events so we can
@@ -2654,6 +2702,7 @@ async fn run_tui(
                     match event {
                         PaneEvent::Output(data) => {
                             slot.frames_received += 1;
+                            loop_bytes_processed += data.len() as u64;
                             slot.process_output(&data);
                         }
                         PaneEvent::Closed { frames_received } => {
@@ -2941,6 +2990,19 @@ async fn run_tui(
 
         // Draw — pass state as mut so render_pane can store last_screen_rect.
         draw_frame(&mut terminal, &mut state, prefix_active)?;
+        loop_frames_drawn += 1;
+
+        // 1 s periodic stats log.
+        if loop_stats_at.elapsed() >= Duration::from_secs(1) {
+            tracing::debug!(
+                frames_drawn = loop_frames_drawn,
+                bytes_processed = loop_bytes_processed,
+                "event-loop: 1s stats"
+            );
+            loop_frames_drawn = 0;
+            loop_bytes_processed = 0;
+            loop_stats_at = Instant::now();
+        }
 
         // Drain pending resize RPCs collected by render_pane (fire-and-forget).
         let resizes = std::mem::take(&mut state.pending_resizes);
@@ -3373,7 +3435,16 @@ async fn run_tui(
                     if let Some(slot_idx) = slot_at(&tab.root, &tab.focus_path) {
                         if let Some(slot) = state.slots[slot_idx].as_mut() {
                             slot.scroll_offset = 0;
-                            let _ = slot.input_tx.send(bytes).await;
+                            let t0 = Instant::now();
+                            let send_result = slot.input_tx.send(bytes.clone()).await;
+                            let elapsed_us = t0.elapsed().as_micros();
+                            tracing::debug!(
+                                slot_idx,
+                                key_bytes = bytes.len(),
+                                elapsed_us,
+                                send_ok = send_result.is_ok(),
+                                "send_keys: input_tx.send (inline await)"
+                            );
                         }
                     }
                 }

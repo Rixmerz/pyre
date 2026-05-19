@@ -214,6 +214,7 @@ impl WorkerState {
         cols: u16,
         rows: u16,
     ) -> Result<()> {
+        tracing::debug!(slot_idx, cols, rows, shell = %shell, cwd = %cwd, "open_pane: entry");
         let (cols, rows) = if cols == 0 || rows == 0 {
             tracing::warn!(
                 slot_idx,
@@ -422,6 +423,7 @@ impl WorkerControl for WorkerControlImpl {
         cols: u16,
         rows: u16,
     ) -> Result<(), RpcError> {
+        tracing::debug!(slot_idx, cols, rows, "resize_pane: PTY resize");
         let panes = self.state.panes.read().await;
         let handle = panes
             .get(&slot_idx)

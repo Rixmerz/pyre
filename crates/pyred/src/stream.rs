@@ -66,6 +66,11 @@ pub async fn handle_stream(mut sock: UnixStream, registry: Arc<SessionRegistry>)
         tokio_serde::SymmetricallyFramed::new(frame_write, SymmetricalBincode::default());
 
     // Send snapshot as seq=0 frame (always, even if empty — uniform client path).
+    tracing::debug!(
+        pane_id = %pane_id.0,
+        snapshot_bytes = snap.len(),
+        "stream_connect: sending ringbuf snapshot as seq=0"
+    );
     output_frames
         .send(OutputFrame {
             session,
