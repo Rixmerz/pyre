@@ -884,10 +884,23 @@ async fn attach_pane(
     });
 
     // UI → net
+    // Batch keystrokes: after the first byte arrives, drain all queued bytes
+    // into a single concatenated buffer and send one InputFrame per tick.
+    // This converts N sequential framed UDS writes down to 1 per render tick,
+    // eliminating per-keystroke serialization latency for fast typists.
     tokio::spawn(async move {
-        while let Some(data) = key_rx.recv().await {
-            let frame = InputFrame { session, data };
-            if input_frames.send(frame).await.is_err() {
+        while let Some(first) = key_rx.recv().await {
+            // Drain any additional bytes already queued in the channel.
+            let mut buf: Vec<u8> = first.to_vec();
+            while let Ok(more) = key_rx.try_recv() {
+                buf.extend_from_slice(&more);
+            }
+            let batch_len = buf.len();
+            let t0 = std::time::Instant::now();
+            let send_result = input_frames.send(InputFrame { session, data: Bytes::from(buf) }).await;
+            let elapsed_us = t0.elapsed().as_micros();
+            tracing::debug!(batch_bytes = batch_len, elapsed_us, send_ok = send_result.is_ok(), "send_keys: input_frames RPC send");
+            if send_result.is_err() {
                 break;
             }
         }
