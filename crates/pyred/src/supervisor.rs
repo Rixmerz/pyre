@@ -240,8 +240,10 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
             .await
             .map_err(|e| PyreError::SpawnFailed(e.to_string()))?;
 
-        // Placeholder pane id — worker allocates real pane id on register (S2).
-        let pane_id = PaneId(uuid::Uuid::new_v4());
+        // Register the initial pane in PaneIndex BEFORE returning the PaneId
+        // so that any follow-up RPC (e.g. close_pane) can resolve it immediately.
+        let (pane_uuid, _slot_idx) = self.registry.alloc_pane(&session_id_str).await;
+        let pane_id = PaneId(pane_uuid);
         Ok(SpawnResp {
             session: sid,
             pane: pane_id,
