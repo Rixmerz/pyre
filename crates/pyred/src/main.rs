@@ -146,7 +146,7 @@ async fn main() -> Result<()> {
         for s in shutdown_registry.all_sessions().await {
             let panes: Vec<_> = s.panes.lock().await.values().cloned().collect();
             for p in panes {
-                let _ = p.kill().await;
+                let _ = p.kill();
             }
         }
         let _ = std::fs::remove_file(&shutdown_path);

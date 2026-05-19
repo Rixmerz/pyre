@@ -12,6 +12,9 @@ use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
+#[cfg(unix)]
+use nix::sys::signal::{kill as nix_kill, Signal};
+
 use crate::pty::spawn_pty;
 use crate::state::PaneStateTracker;
 use crate::store::Store;
@@ -30,7 +33,15 @@ pub struct PaneState {
     #[allow(dead_code)] // phase 6+: stream connections subscribe to block events
     pub events_tx: broadcast::Sender<BlockEvent>,
     pub input_tx: mpsc::Sender<Bytes>,
+    #[allow(dead_code)] // Arc is captured by the child-wait task in pty.rs; field keeps it alive
     child: Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
+    /// OS PID of the child process. Stored separately so `kill()` can send
+    /// SIGTERM without acquiring the `child` mutex — which is held by the
+    /// child-wait task for the lifetime of the process (blocking on `wait()`).
+    /// Acquiring `child` from `kill()` while the wait task holds it would
+    /// deadlock: `wait()` blocks until the child exits, but the kill signal
+    /// can only be sent after `child.lock()` is acquired.
+    pub child_pid: u32,
     pub ringbuf: Arc<StdMutex<crate::ringbuf::RingBuf>>,
     /// State tracker — updated by output path and parser; polled by state engine.
     pub state_tracker: Arc<StdMutex<PaneStateTracker>>,
@@ -54,6 +65,7 @@ impl PaneState {
         events_tx: broadcast::Sender<BlockEvent>,
         input_tx: mpsc::Sender<Bytes>,
         child: Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
+        child_pid: u32,
         ringbuf: Arc<StdMutex<crate::ringbuf::RingBuf>>,
         state_tracker: Arc<StdMutex<PaneStateTracker>>,
         close_token: CancellationToken,
@@ -71,6 +83,7 @@ impl PaneState {
             events_tx,
             input_tx,
             child,
+            child_pid,
             ringbuf,
             state_tracker,
             close_token,
@@ -83,9 +96,28 @@ impl PaneState {
         self.output_tx.subscribe()
     }
 
-    pub async fn kill(&self) -> Result<()> {
-        let mut child = self.child.lock().await;
-        let _ = child.kill();
+    /// Send SIGTERM to the child process.
+    ///
+    /// Does NOT acquire the `child` mutex.  The child-wait task holds that
+    /// mutex for the entire lifetime of the process (blocking inside
+    /// `portable_pty::Child::wait()`), so locking it here would deadlock:
+    /// `wait()` blocks until the child exits, but the kill signal can only
+    /// be delivered after `child.lock()` is acquired.  Instead we use the
+    /// stored PID and send the signal directly via nix — which is safe
+    /// because the PID is immutable for the lifetime of this `PaneState`.
+    pub fn kill(&self) -> Result<()> {
+        #[cfg(unix)]
+        {
+            let pid = nix::unistd::Pid::from_raw(self.child_pid as i32);
+            // SIGTERM first; the child-wait task will observe the exit and
+            // call remove_pane (which handles session eviction).
+            nix_kill(pid, Signal::SIGTERM)
+                .map_err(|e| anyhow!("kill(SIGTERM) pid {}: {e}", self.child_pid))?;
+        }
+        #[cfg(not(unix))]
+        {
+            anyhow::bail!("kill() not supported on non-unix");
+        }
         Ok(())
     }
 }
@@ -189,7 +221,7 @@ impl SessionRegistry {
             .await
             .ok_or_else(|| anyhow!("no such pane {pane_id}"))?;
 
-        pane.kill().await?;
+        pane.kill()?;
         *pane.closed_at.lock().await = Some(Utc::now());
         session.panes.lock().await.remove(&pane_id);
         self.evict_session_if_empty(session.id).await;
@@ -287,7 +319,7 @@ impl SessionRegistry {
             map.values().cloned().collect()
         };
         for p in panes {
-            if let Err(e) = p.kill().await {
+            if let Err(e) = p.kill() {
                 tracing::warn!("kill pane {}: {e:#}", p.id);
             }
         }
