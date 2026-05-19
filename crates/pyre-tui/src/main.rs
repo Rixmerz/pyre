@@ -624,6 +624,8 @@ struct AppState {
     tab_plus_rect: Option<Rect>,
     /// Queued resize RPCs collected by render_pane (sync); drained after each draw.
     pending_resizes: Vec<(PaneId, pyre_proto::PaneSize)>,
+    /// Last time the session list was refreshed from the daemon.
+    session_list_last_poll: Instant,
 }
 
 impl AppState {
@@ -2454,6 +2456,8 @@ fn initial_app_state(
         session_plus_rect: None,
         tab_plus_rect: None,
         pending_resizes: Vec::new(),
+        // Force an immediate session-list sync on the first loop iteration.
+        session_list_last_poll: Instant::now() - Duration::from_secs(10),
     }
 }
 
@@ -2467,6 +2471,46 @@ async fn run_tui(
 ) -> Result<()> {
     let initial_slot = attach_pane(&socket, session, pane).await?;
     let mut state = initial_app_state(session, session_name, initial_slot, control, socket, shell);
+
+    // Eagerly discover all other sessions the daemon already knows about so
+    // the top bar is populated before the first draw, not 1 s later.
+    if let Ok(Ok(daemon_sessions)) = state
+        .control
+        .list_sessions(tarpc::context::current())
+        .await
+    {
+        for info in daemon_sessions {
+            if info.id == session {
+                continue; // already the active session
+            }
+            if let Ok(Ok(panes)) = state
+                .control
+                .list_panes(tarpc::context::current(), info.id)
+                .await
+            {
+                if let Some(p) = panes.into_iter().next() {
+                    if let Ok(slot) = attach_pane(&state.socket, info.id, p.id).await {
+                        let slot_idx = state.slots.len();
+                        state.slots.push(Some(slot));
+                        state.sessions.push(SessionView {
+                            id: info.id,
+                            name: info.name,
+                            tabs: vec![Tab {
+                                root: LayoutNode::Leaf(slot_idx),
+                                focus_path: vec![],
+                                zoomed: None,
+                                boundaries: Vec::new(),
+                                drag: None,
+                            }],
+                            active_tab: 0,
+                        });
+                    }
+                }
+            }
+        }
+        // Mark poll time so the in-loop poll won't fire again for 1 s.
+        state.session_list_last_poll = Instant::now();
+    }
 
     let _guard = TermGuard::enter()?;
     let backend = CrosstermBackend::new(stdout());
@@ -2567,6 +2611,82 @@ async fn run_tui(
                 state.sidebar_cursor = state
                     .sidebar_cursor
                     .min(state.sidebar_data.len().saturating_sub(1));
+            }
+        }
+
+        // Session-list sync — 1s poll to discover sessions created by other clients
+        // (e.g. pyre_mcp::session_spawn) or to prune sessions removed elsewhere.
+        if state.session_list_last_poll.elapsed() >= Duration::from_secs(1) {
+            state.session_list_last_poll = Instant::now();
+            if let Ok(Ok(daemon_sessions)) = state
+                .control
+                .list_sessions(tarpc::context::current())
+                .await
+            {
+                // Add sessions that appeared in the daemon but are unknown to TUI.
+                let known_ids: Vec<SessionId> =
+                    state.sessions.iter().map(|s| s.id).collect();
+                for info in &daemon_sessions {
+                    if !known_ids.contains(&info.id) {
+                        // Attach to the first pane of the new session (if any).
+                        match state
+                            .control
+                            .list_panes(tarpc::context::current(), info.id)
+                            .await
+                        {
+                            Ok(Ok(panes)) if !panes.is_empty() => {
+                                let pane_id = panes[0].id;
+                                match attach_pane(&state.socket, info.id, pane_id).await {
+                                    Ok(slot) => {
+                                        let slot_idx = state.slots.len();
+                                        state.slots.push(Some(slot));
+                                        state.sessions.push(SessionView {
+                                            id: info.id,
+                                            name: info.name.clone(),
+                                            tabs: vec![Tab {
+                                                root: LayoutNode::Leaf(slot_idx),
+                                                focus_path: vec![],
+                                                zoomed: None,
+                                                boundaries: Vec::new(),
+                                                drag: None,
+                                            }],
+                                            active_tab: 0,
+                                        });
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "session-sync: attach_pane for session {} failed: {e}",
+                                            info.id
+                                        );
+                                    }
+                                }
+                            }
+                            _ => {
+                                // Session has no panes yet; skip until it does.
+                            }
+                        }
+                    }
+                }
+
+                // Prune sessions that disappeared from the daemon.
+                let daemon_ids: Vec<SessionId> =
+                    daemon_sessions.iter().map(|s| s.id).collect();
+                // Collect indices to remove (in reverse order so removal is safe).
+                let to_remove: Vec<usize> = state
+                    .sessions
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, sv)| !daemon_ids.contains(&sv.id))
+                    .map(|(i, _)| i)
+                    .collect();
+                for &idx in to_remove.iter().rev() {
+                    state.sessions.remove(idx);
+                    if state.active_session >= state.sessions.len()
+                        && !state.sessions.is_empty()
+                    {
+                        state.active_session = state.sessions.len() - 1;
+                    }
+                }
             }
         }
 
