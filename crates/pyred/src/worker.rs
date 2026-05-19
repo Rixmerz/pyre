@@ -212,8 +212,11 @@ impl WorkerState {
     ///
     /// `cols` and `rows` set the initial PTY dimensions. Passing 0 for either
     /// falls back to the 80×24 default (a warning is logged).
+    ///
+    /// Takes `Arc<Self>` so the pty-reader thread can hold an owned reference
+    /// and call `close_pane` when the shell exits naturally.
     async fn open_pane(
-        &self,
+        self: &Arc<Self>,
         slot_idx: u32,
         shell: String,
         cwd: String,
@@ -259,6 +262,11 @@ impl WorkerState {
             .with_context(|| format!("spawn shell {resolved_shell}"))?;
 
         let child_pid = child.process_id().unwrap_or(0);
+
+        // Wrap child in Mutex so the PTY-reader thread can call wait() on it.
+        // The Mutex is not shared; only the reader thread touches child after
+        // this point.  We wrap it solely to satisfy Arc's Sync bound.
+        let child = Arc::new(Mutex::new(child));
 
         // Wrap master in Arc<Mutex> for shared resize + input access.
         let master = Arc::new(Mutex::new(pair.master));
@@ -312,6 +320,10 @@ impl WorkerState {
         // that has no reactor of its own; calling Handle::current() from inside
         // it would panic with "no reactor running".
         let rt = tokio::runtime::Handle::current();
+        // Clone the Arc so the pty-reader thread owns an independent reference
+        // and can call close_pane when the shell exits naturally (e.g. `exit`).
+        let state_arc_reader = Arc::clone(self);
+        let child_for_reader = child.clone();
         std::thread::Builder::new()
             .name(format!("pty-reader-{slot_idx}"))
             .spawn(move || {
@@ -353,7 +365,24 @@ impl WorkerState {
                         Err(_) => break,
                     }
                 }
-                tracing::info!(slot_idx, "pane pty-reader thread ended");
+                tracing::info!(slot_idx, "pane pty-reader thread ended — shell exited");
+
+                // Drop the broadcast Sender so all stream subscribers wake up
+                // with RecvError::Closed immediately, rather than waiting for
+                // the PaneHandle to be removed from the map.
+                drop(output_tx_reader);
+
+                // Reap the child to avoid a zombie process.
+                let _ = child_for_reader.blocking_lock().wait();
+
+                // Trigger the same cleanup path as an explicit close_pane call:
+                // remove from pane map, persist, notify supervisor, and signal
+                // worker shutdown if no panes remain.
+                rt.spawn(async move {
+                    if let Err(e) = state_arc_reader.close_pane(slot_idx).await {
+                        tracing::warn!(slot_idx, "pane EOF close_pane failed: {e:#}");
+                    }
+                });
             })
             .context("spawn pty reader thread")?;
 
@@ -372,19 +401,27 @@ impl WorkerState {
     }
 
     /// Kill the PTY for `slot_idx`, remove from map, persist, and notify supervisor.
+    ///
+    /// Idempotent: if the pane is already absent (e.g. already closed by the
+    /// pty-reader thread's EOF handler), returns `Ok(())` without re-notifying.
     async fn close_pane(&self, slot_idx: u32) -> Result<()> {
         let handle = {
             let mut panes = self.panes.write().await;
             panes.remove(&slot_idx)
         };
-        if let Some(h) = handle {
-            // SIGTERM the child.
-            #[cfg(unix)]
-            {
-                let pid = nix::unistd::Pid::from_raw(h.child_pid as i32);
-                let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
-            }
+        let Some(h) = handle else {
+            // Already removed — nothing to do.
+            tracing::debug!(slot_idx, "close_pane: pane already absent, skipping");
+            return Ok(());
+        };
+
+        // SIGTERM the child (best-effort; it may have already exited).
+        #[cfg(unix)]
+        {
+            let pid = nix::unistd::Pid::from_raw(h.child_pid as i32);
+            let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
         }
+
         self.shard.delete_pane(slot_idx).await?;
         // Notify supervisor.
         let _ = self
