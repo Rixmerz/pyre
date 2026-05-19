@@ -1,7 +1,7 @@
 # ADR-002: Daemon Process Architecture
 
 ## Status
-Accepted — 2026-05-18. Option A in production; Option C reserved as upgrade path.
+Implemented — 2026-05-18. Option C (hybrid supervisor + per-session workers) landed behind `pyred.process_model = "hybrid"` config flag. Default remains `"single"` (Option A) for v0.1.0 back-compat. See `crates/pyred/src/{supervisor,worker,migration,config}.rs` for impl; `.claude/notions/supervisor-impl-plan.md` for design notes.
 Supersedes the earlier 0002-daemon-architecture.md stub.
 
 ## Context

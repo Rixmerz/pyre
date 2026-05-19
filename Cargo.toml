@@ -45,6 +45,7 @@ ratatui = "0.30"
 crossterm = "0.29"
 tantivy = "0.26"
 toml = "0.8"
+clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [profile.release-prod]

@@ -186,8 +186,7 @@ fn propagate(
     for y in 0..heat_rows.saturating_sub(1) {
         for x in 0..cols {
             // Coherent horizontal offset from wind field.
-            let src_x = (x as i32 + wind_at(x, y, frame, cols))
-                .clamp(0, cols as i32 - 1) as usize;
+            let src_x = (x as i32 + wind_at(x, y, frame, cols)).clamp(0, cols as i32 - 1) as usize;
 
             // Vertical spike: ~12% chance to pull from y+2 instead of y+1.
             let src_y = if y + 2 < heat_rows && rng.range(8) == 0 {
@@ -246,8 +245,7 @@ fn run_fire() -> io::Result<()> {
     //   ceil(120 / 14) = 9 passes/frame × 14 frames = 126 steps → tops out.
     // For 24-row terminal (48 heat_rows): 4 passes.
     // For 120-row terminal (240 heat_rows): clamped at 16.
-    let passes_per_frame_a =
-        ((heat_rows as f32 / PHASE_A_END as f32).ceil() as usize).clamp(2, 16);
+    let passes_per_frame_a = ((heat_rows as f32 / PHASE_A_END as f32).ceil() as usize).clamp(2, 16);
 
     // Heat buffer: row-major, index = y * cols + x.
     // y=0 is top (cold), y=heat_rows-1 is bottom (seed row).
@@ -275,8 +273,7 @@ fn run_fire() -> io::Result<()> {
                 let v = MAX_HEAT.saturating_sub(rng.range(3) as u8 + bias as u8);
                 heat[bottom * cols + x] = v;
                 if bottom >= 1 {
-                    heat[(bottom - 1) * cols + x] =
-                        v.saturating_sub(rng.range(2) as u8);
+                    heat[(bottom - 1) * cols + x] = v.saturating_sub(rng.range(2) as u8);
                 }
             }
 

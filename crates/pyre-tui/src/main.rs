@@ -55,6 +55,7 @@ use ratatui::Terminal;
 mod clipboard;
 mod splash;
 mod theme;
+use std::process::Stdio;
 use tarpc::client;
 use tarpc::tokio_serde::formats::Bincode;
 use theme::EMBER;
@@ -62,7 +63,6 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::process::Command as TokioCommand;
 use tokio::sync::mpsc;
-use std::process::Stdio;
 use tokio_serde::formats::SymmetricalBincode;
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 
@@ -71,11 +71,7 @@ use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Parser, Debug)]
-#[command(
-    name = "pyre",
-    version,
-    about = "Pyre TUI — ratatui terminal frontend"
-)]
+#[command(name = "pyre", version, about = "Pyre TUI — ratatui terminal frontend")]
 struct Cli {
     /// Override socket path
     #[arg(long, global = true)]
@@ -155,7 +151,11 @@ async fn control_client(socket: &Path) -> Result<PyreDaemonClient> {
         "pyred".to_owned()
     });
 
-    tracing::info!("pyred not reachable at {}; spawning {}", socket.display(), pyred_bin);
+    tracing::info!(
+        "pyred not reachable at {}; spawning {}",
+        socket.display(),
+        pyred_bin
+    );
     let mut child = TokioCommand::new(&pyred_bin)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1125,7 +1125,15 @@ fn render_layout(
         LayoutNode::Leaf(slot_idx) => {
             if let Some(slot) = slots[*slot_idx].as_mut() {
                 let focused = current_path == focus_path;
-                render_pane(frame, area, slot, focused, selection, *slot_idx, pending_resizes);
+                render_pane(
+                    frame,
+                    area,
+                    slot,
+                    focused,
+                    selection,
+                    *slot_idx,
+                    pending_resizes,
+                );
             }
         }
         LayoutNode::HSplit(children) => {
@@ -2099,10 +2107,8 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
                     if let Some(slot) = state.slots[sel.pane_idx].as_ref() {
                         let content = slot.last_screen_rect;
                         if rect_contains(content, col, row) {
-                            sel.end = (
-                                row.saturating_sub(content.y),
-                                col.saturating_sub(content.x),
-                            );
+                            sel.end =
+                                (row.saturating_sub(content.y), col.saturating_sub(content.x));
                             return true;
                         }
                     }
@@ -2479,11 +2485,7 @@ async fn run_tui(
 
     // Eagerly discover all other sessions the daemon already knows about so
     // the top bar is populated before the first draw, not 1 s later.
-    if let Ok(Ok(daemon_sessions)) = state
-        .control
-        .list_sessions(tarpc::context::current())
-        .await
-    {
+    if let Ok(Ok(daemon_sessions)) = state.control.list_sessions(tarpc::context::current()).await {
         for info in daemon_sessions {
             if info.id == session {
                 continue; // already the active session
@@ -2623,14 +2625,11 @@ async fn run_tui(
         // (e.g. pyre_mcp::session_spawn) or to prune sessions removed elsewhere.
         if state.session_list_last_poll.elapsed() >= Duration::from_secs(1) {
             state.session_list_last_poll = Instant::now();
-            if let Ok(Ok(daemon_sessions)) = state
-                .control
-                .list_sessions(tarpc::context::current())
-                .await
+            if let Ok(Ok(daemon_sessions)) =
+                state.control.list_sessions(tarpc::context::current()).await
             {
                 // Add sessions that appeared in the daemon but are unknown to TUI.
-                let known_ids: Vec<SessionId> =
-                    state.sessions.iter().map(|s| s.id).collect();
+                let known_ids: Vec<SessionId> = state.sessions.iter().map(|s| s.id).collect();
                 for info in &daemon_sessions {
                     if !known_ids.contains(&info.id) {
                         // Attach to the first pane of the new session (if any).
@@ -2778,8 +2777,7 @@ async fn run_tui(
                 }
 
                 // Prune sessions that disappeared from the daemon.
-                let daemon_ids: Vec<SessionId> =
-                    daemon_sessions.iter().map(|s| s.id).collect();
+                let daemon_ids: Vec<SessionId> = daemon_sessions.iter().map(|s| s.id).collect();
                 // Collect indices to remove (in reverse order so removal is safe).
                 let to_remove: Vec<usize> = state
                     .sessions
@@ -2790,9 +2788,7 @@ async fn run_tui(
                     .collect();
                 for &idx in to_remove.iter().rev() {
                     state.sessions.remove(idx);
-                    if state.active_session >= state.sessions.len()
-                        && !state.sessions.is_empty()
-                    {
+                    if state.active_session >= state.sessions.len() && !state.sessions.is_empty() {
                         state.active_session = state.sessions.len() - 1;
                     }
                 }
@@ -2814,9 +2810,7 @@ async fn run_tui(
             tokio::spawn(async move {
                 for (pane_id, size) in resizes {
                     let req = pyre_proto::ResizePaneReq { pane_id, size };
-                    let _ = client
-                        .resize_pane(tarpc::context::current(), req)
-                        .await;
+                    let _ = client.resize_pane(tarpc::context::current(), req).await;
                 }
             });
         }

@@ -3,6 +3,7 @@
 pub mod blocks;
 pub mod service;
 pub mod sessions;
+pub mod supervisor;
 pub use blocks::{BlockEvent, BlockHit, ListBlocksReq, SearchBlocksReq};
 pub use service::{
     AttachAck, InputFrame, OutputFrame, PidInspect, PyreDaemon, PyreDaemonClient, PyreError,
@@ -11,6 +12,10 @@ pub use service::{
 pub use sessions::{
     OpenPaneReq, PaneInfo, PaneStateKind, ReplayBlocks, ResizePaneReq, ResizePaneRes, SessionInfo,
     SpawnResp,
+};
+pub use supervisor::{
+    BlockEvent as SupervisorBlockEvent, BlockKind, RegisterAck, RpcError as SupervisorRpcError,
+    SupervisorWorkerClient, WorkerControlClient,
 };
 
 use chrono::{DateTime, Utc};

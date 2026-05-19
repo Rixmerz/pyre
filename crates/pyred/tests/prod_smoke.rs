@@ -244,8 +244,7 @@ async fn run_prod_smoke() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires built pyred binary; run with --ignored"]
 async fn close_pane_evicts_empty_session() {
-    let result =
-        tokio::time::timeout(Duration::from_secs(30), run_close_pane_eviction()).await;
+    let result = tokio::time::timeout(Duration::from_secs(30), run_close_pane_eviction()).await;
     match result {
         Ok(Ok(())) => {}
         Ok(Err(e)) => panic!("close_pane_evicts_empty_session failed: {e:#}"),
@@ -290,7 +289,11 @@ async fn run_close_pane_eviction() -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("tarpc: {e}"))?
         .map_err(|e| anyhow::anyhow!("list_sessions: {e:?}"))?;
-    assert_eq!(sessions.len(), 1, "expected 1 session before close, got {sessions:?}");
+    assert_eq!(
+        sessions.len(),
+        1,
+        "expected 1 session before close, got {sessions:?}"
+    );
 
     // ── 4. Close the only pane via close_pane() RPC (TUI path) ────────────────
     rpc.close_pane(tarpc::context::current(), pane)
