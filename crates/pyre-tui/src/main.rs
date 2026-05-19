@@ -2668,6 +2668,110 @@ async fn run_tui(
                     }
                 }
 
+                // Sync panes within sessions that already exist in both TUI and
+                // daemon — handles panes added by external clients (e.g. MCP
+                // pane_open) after the session was first attached.
+                for info in &daemon_sessions {
+                    // Only sessions the TUI already knows about.
+                    let sv_idx = match state.sessions.iter().position(|s| s.id == info.id) {
+                        Some(i) => i,
+                        None => continue,
+                    };
+
+                    // Collect all pane IDs currently tracked in this SessionView.
+                    let local_pane_ids: Vec<PaneId> = {
+                        let sv = &state.sessions[sv_idx];
+                        let mut ids = Vec::new();
+                        for tab in &sv.tabs {
+                            let mut tmp = Vec::new();
+                            let mut paths: Vec<Vec<usize>> = Vec::new();
+                            leaves_in_order(&tab.root, &mut tmp, &mut paths);
+                            for path in &paths {
+                                if let Some(slot_idx) = slot_at(&tab.root, path) {
+                                    if let Some(Some(slot)) = state.slots.get(slot_idx) {
+                                        ids.push(slot.pane_id);
+                                    }
+                                }
+                            }
+                        }
+                        ids
+                    };
+
+                    // Ask daemon which panes belong to this session.
+                    let daemon_panes = match state
+                        .control
+                        .list_panes(tarpc::context::current(), info.id)
+                        .await
+                    {
+                        Ok(Ok(p)) => p,
+                        _ => continue,
+                    };
+
+                    // Attach panes the daemon knows about but TUI does not.
+                    for pane_info in &daemon_panes {
+                        if local_pane_ids.contains(&pane_info.id) {
+                            continue;
+                        }
+                        match attach_pane(&state.socket, info.id, pane_info.id).await {
+                            Ok(slot) => {
+                                let slot_idx = state.slots.len();
+                                state.slots.push(Some(slot));
+                                // Add as a new tab in the existing session, mirroring
+                                // open_new_tab's plumbing (new leaf, no split).
+                                let sv = &mut state.sessions[sv_idx];
+                                let tab_n = sv.tabs.len() + 1;
+                                sv.tabs.push(Tab {
+                                    root: LayoutNode::Leaf(slot_idx),
+                                    focus_path: vec![],
+                                    zoomed: None,
+                                    boundaries: Vec::new(),
+                                    drag: None,
+                                });
+                                tracing::info!(
+                                    "pane-sync: attached new pane {} to session {} as tab-{}",
+                                    pane_info.id,
+                                    info.id,
+                                    tab_n,
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "pane-sync: attach_pane for pane {} in session {} failed: {e}",
+                                    pane_info.id,
+                                    info.id,
+                                );
+                            }
+                        }
+                    }
+
+                    // Prune panes the daemon no longer reports (they closed externally).
+                    let daemon_ids_for_session: Vec<PaneId> =
+                        daemon_panes.iter().map(|p| p.id).collect();
+                    // Collect slot indices to null-out for panes that vanished.
+                    let slots_to_drop: Vec<usize> = {
+                        let sv = &state.sessions[sv_idx];
+                        let mut to_drop = Vec::new();
+                        for tab in &sv.tabs {
+                            let mut tmp = Vec::new();
+                            let mut paths: Vec<Vec<usize>> = Vec::new();
+                            leaves_in_order(&tab.root, &mut tmp, &mut paths);
+                            for path in &paths {
+                                if let Some(slot_idx) = slot_at(&tab.root, path) {
+                                    if let Some(Some(slot)) = state.slots.get(slot_idx) {
+                                        if !daemon_ids_for_session.contains(&slot.pane_id) {
+                                            to_drop.push(slot_idx);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        to_drop
+                    };
+                    for slot_idx in slots_to_drop {
+                        state.slots[slot_idx] = None;
+                    }
+                }
+
                 // Prune sessions that disappeared from the daemon.
                 let daemon_ids: Vec<SessionId> =
                     daemon_sessions.iter().map(|s| s.id).collect();
