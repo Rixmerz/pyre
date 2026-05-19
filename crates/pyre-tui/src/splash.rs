@@ -4,6 +4,14 @@
 //! (`▀`) to achieve double vertical resolution. Each terminal row renders two
 //! heat-buffer rows stacked: foreground = top pixel, background = bottom pixel.
 //!
+//! Two-phase animation:
+//!   Phase A — Eruption (frames 0..PHASE_A_END): bottom seeded MAX_HEAT,
+//!             double propagation pass per frame so fire reaches full height fast.
+//!   Phase B — Launch & consume (frames PHASE_A_END..FRAMES_TOTAL): seeding
+//!             stops; each frame translates the buffer upward by 1 row then
+//!             applies cooling propagation, making the bottom clear as the body
+//!             rises off the top of the screen.
+//!
 //! The animation is skipped when:
 //! - stdout is not a TTY
 //! - `PYRE_NO_SPLASH=1` is set
@@ -61,12 +69,17 @@ const PALETTE: [(u8, u8, u8); 37] = [
 
 const MAX_HEAT: u8 = 36;
 
-// ─── Timing ───────────────────────────────────────────────────────────────────
+// ─── Timing & phase constants ─────────────────────────────────────────────────
 
-const FRAME_DELAY: Duration = Duration::from_millis(14);
-const FRAMES_TOTAL: usize = 90;
-const FRAMES_RAMPUP: usize = 15;
-const FRAMES_SUSTAIN: usize = 65; // sustain ends here, fadeout begins
+/// Frame interval in milliseconds (~100 fps).
+const FRAME_DELAY: Duration = Duration::from_millis(9);
+
+/// Last frame of Phase A (eruption). By this frame the flame should fill ~100%
+/// of screen height. Range [0, PHASE_A_END).
+const PHASE_A_END: usize = 14;
+
+/// Total frames in the animation. Phase B runs [PHASE_A_END, FRAMES_TOTAL).
+const FRAMES_TOTAL: usize = 65;
 
 // ─── Inline xorshift32 RNG (no external deps) ─────────────────────────────────
 
@@ -119,6 +132,44 @@ pub fn play_splash(no_splash: bool) {
     let _ = run_fire();
 }
 
+// ─── Propagation helper ───────────────────────────────────────────────────────
+
+/// One full upward-propagation pass over the heat buffer.
+///
+/// Wind jitter is ±2 cols (wider than original ±1 for turbulence).
+/// Occasionally propagates from y+2 instead of y+1 for vertical spikes.
+/// `wind_bias` shifts the horizontal jitter left or right each call.
+/// `cooling_base` adds extra cooling on top of the per-cell random amount
+/// (used in Phase B to accelerate dissipation as the body rises).
+fn propagate(
+    heat: &mut [u8],
+    cols: usize,
+    heat_rows: usize,
+    rng: &mut Rng,
+    wind_bias: i32,
+    cooling_base: u8,
+) {
+    for y in 0..heat_rows.saturating_sub(1) {
+        for x in 0..cols {
+            // Horizontal jitter: ±2 + wind bias for extra turbulence.
+            let jitter = rng.range(5) as i32 - 2 + wind_bias;
+            let src_x = (x as i32 + jitter).clamp(0, cols as i32 - 1) as usize;
+
+            // Vertical spike: ~12% chance to pull from y+2 instead of y+1.
+            let src_y = if y + 2 < heat_rows && rng.range(8) == 0 {
+                y + 2
+            } else {
+                y + 1
+            };
+
+            let per_cell_cooling = rng.range(3) as u8; // 0-2
+            let total_cooling = per_cell_cooling.saturating_add(cooling_base);
+            let src_heat = heat[src_y * cols + src_x];
+            heat[y * cols + x] = src_heat.saturating_sub(total_cooling);
+        }
+    }
+}
+
 // ─── Core fire loop ───────────────────────────────────────────────────────────
 
 fn run_fire() -> io::Result<()> {
@@ -144,51 +195,50 @@ fn run_fire() -> io::Result<()> {
     out.flush()?;
 
     for frame in 0..FRAMES_TOTAL {
-        // Determine seed strength for this frame.
-        let seed_strength: u8 = if frame < FRAMES_RAMPUP {
-            // Ramp up: explode from base.
-            let ratio = frame as u32 * MAX_HEAT as u32 / FRAMES_RAMPUP as u32;
-            ratio.min(MAX_HEAT as u32) as u8
-        } else if frame < FRAMES_SUSTAIN {
-            MAX_HEAT
-        } else {
-            // Fadeout: linearly decay seed to 0.
-            let elapsed = frame - FRAMES_SUSTAIN;
-            let total = FRAMES_TOTAL - FRAMES_SUSTAIN;
-            let decay = elapsed as u32 * MAX_HEAT as u32 / total as u32;
-            MAX_HEAT.saturating_sub(decay as u8)
-        };
+        // Wind direction flips every 8 frames (was 15) — more chaotic gusts.
+        let wind_bias: i32 = if (frame / 8) % 2 == 0 { 1 } else { -1 };
 
-        // Seed bottom two heat rows for a thick base.
-        let bottom1 = heat_rows - 1;
-        let bottom2 = heat_rows.saturating_sub(2);
-        for x in 0..cols {
-            let flicker = rng.range(3) as u8; // 0-2
-            let val = seed_strength.saturating_sub(flicker.saturating_sub(1));
-            heat[bottom1 * cols + x] = val.min(MAX_HEAT);
-            heat[bottom2 * cols + x] = val.min(MAX_HEAT);
-        }
-
-        // Propagate fire upward (from second-to-last row up to row 0).
-        // Wind bias changes direction every ~15 frames for gusts.
-        let wind_bias: i32 = if (frame / 15) % 2 == 0 { 1 } else { -1 };
-        for y in 0..heat_rows.saturating_sub(1) {
+        if frame < PHASE_A_END {
+            // ── Phase A: Eruption ───────────────────────────────────────────
+            // Seed the bottom 2 rows at MAX_HEAT with flicker.
+            let bottom1 = heat_rows - 1;
+            let bottom2 = heat_rows.saturating_sub(2);
             for x in 0..cols {
-                let jitter = rng.range(3) as i32 - 1 + wind_bias;
-                let cooling = rng.range(3) as u8; // 0-2
-                let src_x = (x as i32 + jitter).clamp(0, cols as i32 - 1) as usize;
-                let src_heat = heat[(y + 1) * cols + src_x];
-                heat[y * cols + x] = src_heat.saturating_sub(cooling);
+                let flicker = rng.range(3) as u8; // 0-2
+                let val = MAX_HEAT.saturating_sub(flicker.saturating_sub(1));
+                heat[bottom1 * cols + x] = val;
+                heat[bottom2 * cols + x] = val;
             }
+
+            // Double propagation pass: heat reaches top in ~14 frames instead of ~30.
+            propagate(&mut heat, cols, heat_rows, &mut rng, wind_bias, 0);
+            propagate(&mut heat, cols, heat_rows, &mut rng, wind_bias, 0);
+        } else {
+            // ── Phase B: Launch & consume ───────────────────────────────────
+            // 1. Translate buffer upward by 1 row.
+            //    heat[y] = heat[y+1] for y in 0..total_pixels-1; new bottom = 0.
+            heat.copy_within(cols.., 0);
+            // Zero the new bottom row (position heat_rows-1).
+            let bottom_start = (heat_rows - 1) * cols;
+            for cell in &mut heat[bottom_start..] {
+                *cell = 0;
+            }
+
+            // 2. Apply propagation + increasing cooling so flame dies out.
+            //    cooling_base grows from 0 toward 3 over Phase B duration.
+            let phase_b_len = FRAMES_TOTAL - PHASE_A_END;
+            let phase_b_frame = frame - PHASE_A_END;
+            let cooling_base = (phase_b_frame * 3 / phase_b_len) as u8;
+            propagate(&mut heat, cols, heat_rows, &mut rng, wind_bias, cooling_base);
         }
 
-        // Render frame into a single buffer.
+        // ── Render frame into a single output buffer ─────────────────────────
         // Each terminal row (tr) renders heat rows tr*2 (top) and tr*2+1 (bottom).
         // Char = '▀', fg = palette[top_heat], bg = palette[bot_heat].
-        let mut buf = String::with_capacity(cols * term_rows as usize * 32);
+        let mut buf = Vec::with_capacity(cols * term_rows as usize * 26);
 
         // Move cursor home.
-        buf.push_str("\x1b[H");
+        buf.extend_from_slice(b"\x1b[H");
 
         for tr in 0..term_rows as usize {
             let top_row = tr * 2;
@@ -205,21 +255,24 @@ fn run_fire() -> io::Result<()> {
                 let (fr, fg, fb) = PALETTE[top_heat];
                 let (br, bg, bb) = PALETTE[bot_heat];
 
-                // fg (38;2) + bg (48;2) + half-block glyph
-                buf.push_str(&format!(
+                // fg (38;2) + bg (48;2) + half-block glyph (UTF-8: E2 96 80)
+                // Written manually to avoid per-cell String allocation.
+                write!(
+                    buf,
                     "\x1b[38;2;{fr};{fg};{fb}m\x1b[48;2;{br};{bg};{bb}m\u{2580}"
-                ));
+                )
+                .expect("Vec write is infallible");
             }
 
             // Reset at end of each row, move to next line (avoid scroll on last row).
             if tr + 1 < term_rows as usize {
-                buf.push_str("\x1b[0m\r\n");
+                buf.extend_from_slice(b"\x1b[0m\r\n");
             }
         }
 
-        buf.push_str("\x1b[0m");
+        buf.extend_from_slice(b"\x1b[0m");
 
-        out.write_all(buf.as_bytes())?;
+        out.write_all(&buf)?;
         out.flush()?;
 
         thread::sleep(FRAME_DELAY);
