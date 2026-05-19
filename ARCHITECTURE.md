@@ -14,6 +14,8 @@ Process model: see [docs/adr/0002-daemon-process-architecture.md](docs/adr/0002-
 
 ## Process / socket diagram
 
+### Single mode (default, `process_model = "single"`)
+
 ```
    +----------+      UDS (0700)       +-----------------------+
    |  pyrec   |  <----------------->  |                       |       PTY        +-------+
@@ -28,8 +30,34 @@ Process model: see [docs/adr/0002-daemon-process-architecture.md](docs/adr/0002-
    +----------+                       +-----------------------+
 ```
 
-All three client crates speak `pyre-proto` over the same UDS. `pyred`
-is the only process that ever touches a PTY file descriptor.
+### Hybrid mode (`process_model = "hybrid"`, ADR-002 Accepted)
+
+```
+                       supervisor.sock                   session-<id>.sock
+   +----------+    ($XDG_RUNTIME_DIR/pyre.sock)     ($XDG_RUNTIME_DIR/pyre/...)
+   |  pyrec   |  <-------------------------+          +--------+    PTY    +-------+
+   +----------+                            |          |        | <-------> | shell |
+                                           v          v        |  worker  |+-------+
+   +----------+                       +----+----------+----+   |  (one    |
+   | pyre-tui |  <----------------->  |    supervisor      | <-+  per     | <-+
+   +----------+                       |  (proxy + index +  |   |  session)|   |
+                                      |   SessionRegistry) | --+----------+   |
+                                      +--------+-----------+                  |
+                                               | <--- sqlite ---> state.db    |
+                                               | <--- tantivy --> index/      |
+                                               +------------------------------+
+                                            stream mode (0x02) proxied to worker
+```
+
+In hybrid, the supervisor binds the single public socket and proxies
+RPCs to the right per-session worker. Stream frames flow
+worker → supervisor → client. Workers own PTYs; the supervisor owns
+the aggregated Tantivy index and `SessionRegistry`.
+
+All three client crates speak `pyre-proto` over the same public UDS.
+In single mode `pyred` is the only process that ever touches a PTY;
+in hybrid mode that role moves to the per-session worker, and the
+supervisor never opens a PTY directly.
 
 ## Block lifecycle (dataflow)
 

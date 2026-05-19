@@ -41,6 +41,26 @@ SQLite store, and streams updated grid frames + block deltas back to
 attached clients. The wire format is defined in the `pyre-proto` crate
 and versioned from day one (`proto_version: u32`).
 
+### Process model (single vs hybrid)
+
+`pyred` ships two process models, selectable via
+`pyred.process_model = "single" | "hybrid"` (default `"single"`).
+
+- **Single** (Option A in ADR-002): one `pyred` process owns the
+  public socket, the `SessionRegistry`, all PTYs, the SQLite pool, and
+  the Tantivy writer. Simplest, lowest memory, no crash isolation.
+- **Hybrid** (Option C in ADR-002, accepted 2026-05-19): a thin
+  supervisor binds the public `pyre.sock` and owns the aggregated
+  Tantivy index. Each session runs as a worker process, owning its own
+  PTYs and a per-session UDS at
+  `$XDG_RUNTIME_DIR/pyre/session-<id>.sock`. Stream-mode (`0x02`)
+  attaches are proxied transparently from the supervisor to the
+  worker. Worker crashes evict only that session; the supervisor
+  survives.
+
+See [docs/adr/0002-daemon-process-architecture.md](docs/adr/0002-daemon-process-architecture.md)
+for the full decision record and migration triggers.
+
 ## Block model (OSC 133)
 
 Blocks are demarcated by the standard OSC 133 prompt sequences emitted

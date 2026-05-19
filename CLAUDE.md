@@ -5,19 +5,24 @@ on `pyre`. Read it first, then follow the links below.
 
 ## Next step
 
-Sprint **S0** is wrapping up: workspace scaffold + the five spec docs
-(`README.md`, `SPEC.md`, `ARCHITECTURE.md`, `ROADMAP.md`, this file).
-Once the S0 commit lands, the next session opens **S1 — daemon + PTY**:
+S1 (daemon + PTY) and S2 (Blocks + persistence) have landed. The
+active surface is **S3 — multi-pane + reattach**, now unblocked by
+the hybrid daemon (ADR-002 Accepted, 2026-05-19): supervisor on
+`pyre.sock` + per-session workers on `pyre/session-<id>.sock`,
+selectable via `pyred.process_model = "single" | "hybrid"`.
 
-- Wire `pyred` to spawn a PTY via `portable-pty` and bridge it to one
-  `pyrec` over a UDS at `$XDG_RUNTIME_DIR/pyre.sock` (mode 0700).
-- Implement the minimum `pyre-proto` surface: `Spawn`, `Attach`,
-  `Detach`, `Kill`, and the `OutputFrame` stream (raw bytes both ways,
-  no parsing yet).
-- Resolve **ADR-001** (`tonic` vs `tarpc`) before writing the
-  transport layer — do not start coding the IPC until the ADR is
-  merged.
-- No persistence, no parser, no Blocks in S1. Those are S2.
+Current work front:
+
+- Drive the TUI dogfood loop on hybrid: multi-pane within a session,
+  multi-session switching, scrollback + block ribbon polish.
+- Harden reattach: grid snapshot + last-N block replay over the
+  proxied stream-mode (`0x02`) path.
+- Multi-client mirror mode with serialized input through the
+  supervisor → worker proxy.
+- S4 (TUI dogfood / MVP criterion) follows once S3 stabilises.
+
+Hybrid is opt-in; `"single"` remains the default for v0.1.0. AI/MCP
+work is still blocked until S5.
 
 ## Files to read first
 
@@ -27,8 +32,11 @@ Once the S0 commit lands, the next session opens **S1 — daemon + PTY**:
    Block lifecycle, decision points.
 3. [ROADMAP.md](ROADMAP.md) — sprint table, MVP criterion, risks,
    catalog-overlap verification.
-4. `docs/adr/0001-ipc-transport.md` (to be written in S0) — the
+4. [docs/adr/ADR-001-ipc.md](docs/adr/ADR-001-ipc.md) — the
    `tonic` vs `tarpc` decision record.
+5. [docs/adr/0002-daemon-process-architecture.md](docs/adr/0002-daemon-process-architecture.md) —
+   single vs hybrid daemon (Accepted 2026-05-19, hybrid implemented
+   behind `pyred.process_model = "hybrid"`).
 
 ## Project rules
 

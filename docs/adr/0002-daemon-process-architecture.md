@@ -1,8 +1,13 @@
 # ADR-002: Daemon Process Architecture
 
 ## Status
-Implemented — 2026-05-18. Option C (hybrid supervisor + per-session workers) landed behind `pyred.process_model = "hybrid"` config flag. Default remains `"single"` (Option A) for v0.1.0 back-compat. See `crates/pyred/src/{supervisor,worker,migration,config}.rs` for impl; `.claude/notions/supervisor-impl-plan.md` for design notes.
+Accepted — 2026-05-19. Option C (hybrid supervisor + per-session workers) is implemented and functional behind `pyred.process_model = "hybrid"` config flag. Default remains `"single"` (Option A) for v0.1.0 back-compat. See `crates/pyred/src/{supervisor,worker,migration,config}.rs` for impl; `.claude/notions/supervisor-impl-plan.md` for design notes.
 Supersedes the earlier 0002-daemon-architecture.md stub.
+
+### Implementation note
+- `388a461` — initial hybrid supervisor + worker scaffolding (supervisor.sock, per-session worker sockets, RPC proxy).
+- `6bb85ba` — root-cause fix: single PTY reader per pane with broadcast fanout, replacing the dual-reader race that broke `MODE_STREAM` under hybrid.
+- `27f4f8d` — pane eviction on shell EOF restored after the fanout refactor, so worker lifecycles close cleanly.
 
 ## Context
 
