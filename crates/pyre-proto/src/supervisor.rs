@@ -141,9 +141,18 @@ pub trait WorkerControl {
 
     /// Spawn a new PTY for `slot_idx` with the given shell and working directory.
     ///
+    /// `cols` and `rows` set the initial PTY dimensions; pass 0 to fall back to
+    /// the 80×24 default (logged as a warning).
+    ///
     /// The worker registers the pane internally and begins streaming output to
     /// the supervisor via `SupervisorWorkerClient::block_event`.
-    async fn open_pane(slot_idx: u32, shell: String, cwd: String) -> Result<(), RpcError>;
+    async fn open_pane(
+        slot_idx: u32,
+        shell: String,
+        cwd: String,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), RpcError>;
 
     /// Kill the PTY for `slot_idx` and remove it from the worker's pane map.
     ///

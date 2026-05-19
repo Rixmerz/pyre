@@ -203,12 +203,33 @@ struct WorkerState {
 
 impl WorkerState {
     /// Spawn a PTY for `slot_idx` and register it. Also persists to the shard.
-    async fn open_pane(&self, slot_idx: u32, shell: String, cwd: String) -> Result<()> {
+    ///
+    /// `cols` and `rows` set the initial PTY dimensions. Passing 0 for either
+    /// falls back to the 80×24 default (a warning is logged).
+    async fn open_pane(
+        &self,
+        slot_idx: u32,
+        shell: String,
+        cwd: String,
+        cols: u16,
+        rows: u16,
+    ) -> Result<()> {
+        let (cols, rows) = if cols == 0 || rows == 0 {
+            tracing::warn!(
+                slot_idx,
+                cols,
+                rows,
+                "open_pane: zero PTY dimension received, falling back to 80×24"
+            );
+            (80, 24)
+        } else {
+            (cols, rows)
+        };
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
-                cols: 80,
-                rows: 24,
+                cols,
+                rows,
                 pixel_width: 0,
                 pixel_height: 0,
             })
@@ -443,9 +464,11 @@ impl WorkerControl for WorkerControlImpl {
         slot_idx: u32,
         shell: String,
         cwd: String,
+        cols: u16,
+        rows: u16,
     ) -> Result<(), RpcError> {
         self.state
-            .open_pane(slot_idx, shell, cwd)
+            .open_pane(slot_idx, shell, cwd, cols, rows)
             .await
             .map_err(|e| RpcError::Internal(e.to_string()))
     }
@@ -706,7 +729,7 @@ pub async fn run() -> Result<()> {
         let persisted = state.shard.load_panes().await.unwrap_or_default();
         for (slot_idx, shell, cwd) in persisted {
             tracing::info!(slot_idx, shell, cwd, "recovering persisted pane");
-            if let Err(e) = state.open_pane(slot_idx, shell, cwd).await {
+            if let Err(e) = state.open_pane(slot_idx, shell, cwd, 80, 24).await {
                 tracing::warn!(slot_idx, "pane recovery failed: {e:#}");
             }
         }

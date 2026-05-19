@@ -332,6 +332,8 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
+        let cols = req.cols;
+        let rows = req.rows;
         let ctrl_client = self
             .registry
             .get_ctrl_client(&session_id_str)
@@ -340,7 +342,7 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
                 PyreError::SpawnFailed("worker deregistered immediately after registration".into())
             })?;
         ctrl_client
-            .open_pane(context::current(), slot_idx, shell, cwd)
+            .open_pane(context::current(), slot_idx, shell, cwd, cols, rows)
             .await
             .map_err(|e| PyreError::SpawnFailed(e.to_string()))?
             .map_err(|e| PyreError::SpawnFailed(e.to_string()))?;
@@ -511,8 +513,10 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
+        let cols = req.cols;
+        let rows = req.rows;
         client
-            .open_pane(context::current(), slot_idx, shell, cwd)
+            .open_pane(context::current(), slot_idx, shell, cwd, cols, rows)
             .await
             .map_err(|e| PyreError::Io(e.to_string()))?
             .map_err(|e| PyreError::Io(e.to_string()))?;
