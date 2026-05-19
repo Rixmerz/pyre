@@ -71,7 +71,7 @@ use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "pyre-tui",
+    name = "pyre",
     version,
     about = "Pyre TUI — ratatui terminal frontend"
 )]

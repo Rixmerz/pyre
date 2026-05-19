@@ -6,7 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [[bin]]
-name = "pyre-tui"
+name = "pyre"
 path = "src/main.rs"
 
 [dependencies]

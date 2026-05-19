@@ -98,7 +98,7 @@ pyrec kill-session <session-id>
 
 ### split-window
 
-Open a new pane in the same session (layout is managed by pyre-tui).
+Open a new pane in the same session (layout is managed by `pyre`).
 
 ```sh
 pyrec split-window --session <id>
@@ -129,11 +129,11 @@ pyrec display-message "hello from script"
 | `tmux select-pane -t <pane>` | TUI-only; no CLI equivalent in S1–S4 |
 | `tmux display-message "msg"` | `pyrec display-message "msg"` |
 | `tmux attach-session -t <session>` | `pyrec attach <session>` |
-| `tmux detach-client` | `Ctrl-B d` in pyre-tui, or close the pyrec process |
+| `tmux detach-client` | `Ctrl-B d` in `pyre`, or close the pyrec process |
 
 ---
 
-## pyre-tui key bindings
+## pyre key bindings
 
 ### Prefix: `Ctrl-B`
 
@@ -201,7 +201,7 @@ Enable OSC 133 in your shell:
 - **zsh**: use the `precmd`/`preexec` hooks; many zsh prompt frameworks (Starship, Powerlevel10k) emit OSC 133 automatically.
 - **fish**: add `function fish_prompt; printf '\033]133;A\007'; end` to `config.fish`.
 
-### pyre-tui shows garbled characters
+### pyre shows garbled characters
 
 Ensure your terminal emulator is set to UTF-8 and that `$TERM` is `xterm-256color`
-or `tmux-256color`. `pyre-tui` requires true-color support for the Ember palette.
+or `tmux-256color`. `pyre` requires true-color support for the Ember palette.

@@ -34,7 +34,7 @@
 
 ## Architecture overview
 
-`pyrec` (CLI) and `pyre-tui` (renderer) are clients of `pyred` over a
+`pyrec` (CLI) and `pyre` (renderer) are clients of `pyred` over a
 local Unix domain socket. `pyred` owns every PTY via `portable-pty`,
 runs the ANSI parser (`alacritty_terminal`), emits Block events to the
 SQLite store, and streams updated grid frames + block deltas back to

@@ -9,14 +9,14 @@ Daemon-owned terminal multiplexer with block-level history, full-text search, an
 
 - **Block model (OSC 133)** — every command is a first-class `Block`: command string, cwd, stdout, exit code, timestamps; persisted to SQLite and indexed in Tantivy.
 - **Persistent sessions** — `pyred` owns every PTY; client crashes and SSH drops do not kill the session. Reattach and restore scrollback + block history instantly.
-- **Multi-pane with mirror** — split the terminal into independent panes within a session; pyre-tui renders them in a ratatui grid.
+- **Multi-pane with mirror** — split the terminal into independent panes within a session; the `pyre` TUI renders them in a ratatui grid.
 - **Full-text search** — Tantivy indexes all block output; `pyrec search <query>` returns ranked hits with snippets in milliseconds.
 - **Agent state monitoring** — a dedicated state tracker classifies each pane as idle, running, waiting for input, or error; exposed to AI agents via the MCP server.
 - **MCP server (`pyre-mcp`)** — exposes sessions, panes, and blocks as MCP resources; tools like `jig` can read terminal output and drive panes programmatically.
-- **Mouse-first TUI (Ember theme)** — `pyre-tui` renders with ratatui + crossterm; Ember palette (dark amber/orange on near-black), mouse click-to-focus, scroll with wheel.
+- **Mouse-first TUI (Ember theme)** — `pyre` renders with ratatui + crossterm; Ember palette (dark amber/orange on near-black), mouse click-to-focus, scroll with wheel.
 - **tmux-compatible CLI** — `pyrec` accepts `list-sessions`, `new-session`, `kill-session`, `send-keys`, `split-window`, and more; scripts that drive tmux need minimal changes.
 - **Clipboard integration** — `pyrec capture-pane --copy` copies output to the system clipboard via `wl-copy` (Wayland) or `xclip` (X11).
-- **Searchable scrollback** — ring buffer per pane with configurable depth; `PgUp`/`PgDn` in pyre-tui or `capture-pane -S` in pyrec.
+- **Searchable scrollback** — ring buffer per pane with configurable depth; `PgUp`/`PgDn` in `pyre` or `capture-pane -S` in pyrec.
 
 ## Quickstart
 
@@ -26,7 +26,7 @@ Daemon-owned terminal multiplexer with block-level history, full-text search, an
 git clone https://github.com/<TODO>/pyre.git
 cd pyre
 cargo build --release
-# binaries: target/release/{pyred,pyrec,pyre-tui,pyre-mcp}
+# binaries: target/release/{pyred,pyrec,pyre,pyre-mcp}
 ```
 
 For a size- and performance-optimised binary use the `release-prod` profile:
@@ -47,8 +47,8 @@ systemctl --user enable --now pyred
 ### 3. Spawn your first session
 
 ```sh
-# Open pyre-tui (recommended for interactive use)
-pyre-tui
+# Open pyre (recommended for interactive use)
+pyre
 
 # Or use pyrec directly
 pyrec              # spawn + attach default shell
@@ -56,7 +56,7 @@ pyrec sessions     # list active sessions
 pyrec list         # list recent blocks
 ```
 
-## Key bindings (pyre-tui)
+## Key bindings (pyre)
 
 Prefix: `Ctrl-B`
 

@@ -64,7 +64,7 @@ socket at **$XDG_RUNTIME_DIR/pyre.sock**.
 : Terminate SESSION and all its panes.
 
 **split-window** --session *SESSION*
-: Open a new pane in SESSION (layout managed by pyre-tui).
+: Open a new pane in SESSION (layout managed by `pyre`).
 
 **display-message** *MSG*
 : Print MSG to stderr (tmux-compat stub).
@@ -109,4 +109,4 @@ Capture pane output and copy to clipboard:
 
 # SEE ALSO
 
-**pyred**(1), **pyre-tui**(1), **pyre-mcp**(1)
+**pyred**(1), **pyre**(1), **pyre-mcp**(1)
