@@ -2409,6 +2409,7 @@ dependencies = [
  "regex",
  "reqwest",
  "serde",
+ "serde_bytes",
  "serde_json",
  "sqlx",
  "tantivy",
@@ -2421,6 +2422,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "vt100",
  "zstd",
 ]
 

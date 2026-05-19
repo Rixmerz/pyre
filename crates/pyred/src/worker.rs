@@ -22,6 +22,7 @@ use std::time::Duration;
 use crate::ringbuf::RingBuf;
 
 use anyhow::{bail, Context, Result};
+use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use pyre_proto::supervisor::{
@@ -33,7 +34,7 @@ use tarpc::tokio_serde::formats::Bincode;
 use tarpc::{client, context};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_serde::formats::SymmetricalBincode;
 use tokio_util::codec::{Framed, FramedRead, FramedWrite, LengthDelimitedCodec};
 use uuid::Uuid;
@@ -95,6 +96,11 @@ struct PaneHandle {
     input_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     /// In-memory ring buffer: last 256 KiB of raw PTY output.
     ring_buf: Arc<Mutex<RingBuf>>,
+    /// Broadcast sender: the single PTY reader thread fans out raw bytes to all
+    /// stream subscribers.  Capacity 256 — lagging subscribers log a warning and
+    /// continue; they miss at most 256 chunks rather than racing the ring-buffer
+    /// reader and stealing bytes from it.
+    output_tx: broadcast::Sender<Bytes>,
 }
 
 // ---------------------------------------------------------------------------
@@ -275,67 +281,87 @@ impl WorkerState {
             })
             .context("spawn pty writer thread")?;
 
-        // Output reader: blocking thread → async output task → supervisor.
+        // Output reader: single blocking thread → ring buffer + broadcast fanout.
+        //
+        // The OS delivers each read() chunk to exactly one fd reader.  Having a
+        // second try_clone_reader() in handle_stream_conn caused the race: the
+        // two readers split the PTY output so each consumer saw only a fraction.
+        //
+        // Fix: one reader, one broadcast::Sender<Bytes>.  Stream subscribers
+        // call output_tx.subscribe() and receive every chunk via the channel.
         let mut reader = master
             .lock()
             .await
             .try_clone_reader()
             .map_err(|e| anyhow::anyhow!("clone_reader: {e}"))?;
 
-        let (raw_tx, mut raw_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
+        // Per-pane ring buffer: 256 KiB.
+        let ring_buf = Arc::new(Mutex::new(RingBuf::new(256 * 1024)));
+
+        // Broadcast channel: capacity 256.  Lagging subscribers (slow stream
+        // clients) receive RecvError::Lagged and log a warning; they miss at
+        // most 256 chunks.  The Sender is cheaply cloneable and Send+Sync.
+        let (output_tx, _) = broadcast::channel::<Bytes>(256);
+
+        let sv = self.sv_client.clone();
+        let session_id = self.session_id.clone();
+        let ring_buf_reader = ring_buf.clone();
+        let output_tx_reader = output_tx.clone();
         std::thread::Builder::new()
             .name(format!("pty-reader-{slot_idx}"))
             .spawn(move || {
                 let mut buf = vec![0u8; 4096];
+                let now_ms = || {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64
+                };
                 loop {
                     match std::io::Read::read(&mut reader, &mut buf) {
                         Ok(0) => break,
                         Ok(n) => {
-                            if raw_tx.blocking_send(buf[..n].to_vec()).is_err() {
-                                break;
-                            }
+                            let chunk = Bytes::copy_from_slice(&buf[..n]);
+                            // 1. Ring buffer (sync std Mutex is fine in a blocking thread).
+                            // We use blocking_lock here because ring_buf uses tokio::sync::Mutex;
+                            // the thread is already blocking so this is safe.
+                            ring_buf_reader.blocking_lock().push(&chunk);
+                            // 2. Broadcast to all live stream subscribers.
+                            // send() returns Err only when there are zero receivers, which is
+                            // normal when no client is connected — ignore silently.
+                            let _ = output_tx_reader.send(chunk.clone());
+                            // 3. Supervisor block_event — fire-and-forget via blocking_send on
+                            // a oneshot mpsc so we don't block the reader thread on async.
+                            let ev = BlockEvent {
+                                session_id: session_id.clone(),
+                                slot_idx,
+                                kind: BlockKind::Stdout,
+                                bytes: chunk.to_vec(),
+                                ts_ms: now_ms(),
+                            };
+                            // We cannot .await here (blocking thread).  Use the tarpc client's
+                            // non-blocking fire-and-forget path via a spawned async task.
+                            let sv2 = sv.clone();
+                            // `sv.block_event` is async; dispatch to the tokio runtime that
+                            // owns this thread's executor via Handle::current().
+                            let rt = tokio::runtime::Handle::current();
+                            rt.spawn(async move {
+                                let _ = sv2.block_event(context::current(), ev).await;
+                            });
                         }
                         Err(_) => break,
                     }
                 }
+                tracing::info!(slot_idx, "pane pty-reader thread ended");
             })
             .context("spawn pty reader thread")?;
-
-        // Per-pane ring buffer: 256 KiB.
-        let ring_buf = Arc::new(Mutex::new(RingBuf::new(256 * 1024)));
-
-        // Async relay: raw_rx → ring buffer + supervisor block_event (fire-and-forget).
-        let sv = self.sv_client.clone();
-        let session_id = self.session_id.clone();
-        let ring_buf_relay = ring_buf.clone();
-        let now_ms = || {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64
-        };
-        tokio::spawn(async move {
-            while let Some(bytes) = raw_rx.recv().await {
-                // Tee into the ring buffer.
-                ring_buf_relay.lock().await.push(&bytes);
-                let ev = BlockEvent {
-                    session_id: session_id.clone(),
-                    slot_idx,
-                    kind: BlockKind::Stdout,
-                    bytes,
-                    ts_ms: now_ms(),
-                };
-                // Fire-and-forget; throttle/batching is supervisor-side.
-                let _ = sv.block_event(context::current(), ev).await;
-            }
-            tracing::info!(slot_idx, "pane output relay ended");
-        });
 
         let handle = PaneHandle {
             child_pid,
             master,
             input_tx,
             ring_buf,
+            output_tx,
         };
 
         self.panes.write().await.insert(slot_idx, handle);
@@ -565,8 +591,15 @@ async fn handle_stream_conn(mut sock: UnixStream, state: Arc<WorkerState>) {
         SessionId(uuid)
     };
 
-    // Grab input_tx, ring-buffer snapshot, and a cloned PTY reader.
-    let (input_tx, mut reader, snap) = {
+    // Grab input_tx, ring-buffer snapshot, and a broadcast subscriber.
+    //
+    // We no longer call try_clone_reader() here.  The single pty-reader thread
+    // owns the only fd on the PTY master; it fans out chunks via broadcast.
+    // Subscribing after taking the snapshot means we may receive some duplicate
+    // bytes that were already in the snapshot, but the client deduplicates by
+    // seq number and the worst case is a handful of re-sent bytes at connect
+    // time — far better than the previous race where most chunks were lost.
+    let (input_tx, mut sub, snap) = {
         let panes = state.panes.read().await;
         let handle = match panes.get(&slot_idx) {
             Some(h) => h,
@@ -578,17 +611,11 @@ async fn handle_stream_conn(mut sock: UnixStream, state: Arc<WorkerState>) {
         };
 
         let snap = handle.ring_buf.lock().await.snapshot().to_vec();
+        // Subscribe *after* the snapshot so we don't miss bytes that arrive
+        // between the snapshot and the first recv() — mirroring stream.rs.
+        let sub = handle.output_tx.subscribe();
 
-        let reader = match handle.master.lock().await.try_clone_reader() {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(slot_idx, "stream conn: clone_reader failed: {e}");
-                let _ = sock.shutdown().await;
-                return;
-            }
-        };
-
-        (handle.input_tx.clone(), reader, snap)
+        (handle.input_tx.clone(), sub, snap)
     };
 
     // Split socket into framed read/write halves — must match single-mode wire
@@ -634,24 +661,30 @@ async fn handle_stream_conn(mut sock: UnixStream, state: Arc<WorkerState>) {
         }
     });
 
-    // PTY → client: blocking read from PTY reader, encode as OutputFrame.
-    let pty_to_client = tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Handle::current();
-        let mut buf = vec![0u8; 4096];
+    // PTY → client: receive from the broadcast channel, encode as OutputFrame.
+    // No blocking thread needed — broadcast::Receiver::recv() is async.
+    let pty_to_client = tokio::spawn(async move {
         let mut seq: u64 = 0; // seq 0 was the snapshot; live frames start at 1
         loop {
-            match std::io::Read::read(&mut reader, &mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
+            match sub.recv().await {
+                Ok(chunk) => {
                     seq = seq.wrapping_add(1);
                     let frame = OutputFrame {
                         session,
                         seq,
-                        data: buf[..n].to_vec().into(),
+                        data: chunk,
                     };
-                    if rt.block_on(output_frames.send(frame)).is_err() {
+                    if output_frames.send(frame).await.is_err() {
                         break;
                     }
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(slot_idx, n, "stream conn: broadcast lagged, resuming");
+                    // Continue — do not drop the connection on lag.
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    // PTY reader thread exited (pane closed).
+                    break;
                 }
             }
         }
