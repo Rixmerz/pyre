@@ -183,6 +183,21 @@ impl Store {
         Ok(out)
     }
 
+    /// Return all session IDs that have a row in the `sessions` table.
+    pub async fn list_session_ids(&self) -> Result<Vec<SessionId>> {
+        let rows = sqlx::query("SELECT id FROM sessions ORDER BY created_at ASC")
+            .fetch_all(&self.pool)
+            .await?;
+        let mut ids = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: String = row.try_get("id")?;
+            if let Ok(uuid) = uuid::Uuid::parse_str(&id) {
+                ids.push(SessionId(uuid));
+            }
+        }
+        Ok(ids)
+    }
+
     pub async fn list_blocks_for_pane(&self, pane: PaneId, limit: u32) -> Result<Vec<Block>> {
         let rows = sqlx::query(
             "SELECT id, pane_id, session_id, command, started_at, ended_at, exit_code, cwd, stdout_len

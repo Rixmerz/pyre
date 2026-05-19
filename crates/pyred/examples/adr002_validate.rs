@@ -448,7 +448,136 @@ async fn test4_stream_lag() -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Main — runs all four tests against the already-running daemon
+// TEST 2.5 — Worker reattach after daemon restart
+// ---------------------------------------------------------------------------
+
+/// Spawn 2 sessions, restart pyred, assert list_sessions returns 2.
+/// This tests the S2 feature: supervisor re-spawns workers for all persisted
+/// sessions on startup, so list_sessions is non-empty immediately after restart.
+async fn test25_reattach_after_restart() -> bool {
+    println!("\n=== TEST 2.5: Worker reattach after daemon restart ===");
+
+    let sock = sock_path();
+    let rt_dir = runtime_dir();
+    let data_dir = std::env::var("PYRE_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| dirs::data_dir().unwrap_or_else(|| PathBuf::from("/tmp")).join("pyre"));
+    let cfg_dir = std::env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| dirs::config_dir().unwrap().join("pyre"));
+
+    // Spawn 2 named sessions.
+    let mut session_ids = vec![];
+    for i in 0..2u32 {
+        let client = match connect(&sock).await {
+            Ok(c) => c,
+            Err(e) => { println!("  FAIL: connect: {e}"); return false; }
+        };
+        let mut req = spawn_default();
+        req.name = Some(format!("reattach-{i}"));
+        match client.spawn(tarpc::context::current(), req).await {
+            Ok(Ok(r)) => {
+                println!("  spawned session {}", r.session);
+                session_ids.push(r.session);
+            }
+            Ok(Err(e)) => { println!("  FAIL: spawn: {e}"); return false; }
+            Err(e) => { println!("  FAIL: transport: {e}"); return false; }
+        }
+    }
+    let expected = session_ids.len();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // SIGTERM pyred.
+    let pyred_pids: Vec<u32> = if let Ok(pid_str) = std::env::var("PYRED_PID") {
+        pid_str.trim().parse::<u32>().ok().into_iter().collect()
+    } else {
+        let mut pids = vec![];
+        if let Ok(rd) = std::fs::read_dir("/proc") {
+            for entry in rd.flatten() {
+                let name = entry.file_name();
+                if name.to_string_lossy().chars().all(|c| c.is_ascii_digit()) {
+                    let exe = entry.path().join("exe");
+                    if let Ok(target) = std::fs::read_link(&exe) {
+                        if target.to_string_lossy().ends_with("/pyred") {
+                            if let Ok(pid) = name.to_string_lossy().parse::<u32>() {
+                                pids.push(pid);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        pids
+    };
+    println!("  stopping pyred pids: {pyred_pids:?}");
+    for pid in &pyred_pids {
+        unsafe { libc::kill(*pid as libc::pid_t, libc::SIGTERM) };
+    }
+
+    // Wait for socket to vanish.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline && sock.exists() {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Remove stale socket if it lingers.
+    if sock.exists() { let _ = std::fs::remove_file(&sock); }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Restart pyred.
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/pyred-adr002.log")
+        .unwrap();
+    let log_clone = log_file.try_clone().unwrap();
+    let _child = std::process::Command::new(pyred_exe())
+        .env("RUST_LOG", "info")
+        .env("XDG_RUNTIME_DIR", rt_dir.as_os_str())
+        .env("PYRE_DATA_DIR", data_dir.as_os_str())
+        .env("XDG_CONFIG_HOME", cfg_dir.as_os_str())
+        .stdout(log_file)
+        .stderr(log_clone)
+        .spawn()
+        .expect("spawn pyred");
+
+    if !wait_for_socket(&sock, 5000).await {
+        println!("  FAIL: pyred did not restart within 5 s");
+        return false;
+    }
+    println!("  pyred restarted");
+
+    // Give workers time to register (each takes up to ~500 ms on registration).
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let client = match connect(&sock).await {
+        Ok(c) => c,
+        Err(e) => { println!("  FAIL: connect after restart: {e}"); return false; }
+    };
+
+    let sessions = match client.list_sessions(tarpc::context::current()).await {
+        Ok(Ok(ss)) => ss,
+        Ok(Err(e)) => { println!("  FAIL: list_sessions: {e}"); return false; }
+        Err(e) => { println!("  FAIL: transport: {e}"); return false; }
+    };
+
+    let got = sessions.len();
+    println!("  expected {expected} sessions, got {got}");
+    for s in &sessions {
+        println!("    session {} pane_count={}", s.id, s.pane_count);
+    }
+
+    if got >= expected {
+        println!("  PASS: all {expected} sessions reattached after restart");
+        true
+    } else {
+        println!("  FAIL: only {got}/{expected} sessions visible after restart");
+        false
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main — runs all tests against the already-running daemon
 // ---------------------------------------------------------------------------
 
 #[tokio::main]
@@ -472,22 +601,33 @@ async fn main() -> Result<()> {
     // Ensure socket is back.
     if !wait_for_socket(&sock, 3000).await {
         println!("\nFATAL: socket not back after test2 restart");
-        println_results(r1, r2, false, false);
+        println_results(r1, r2, false, false, false);
+        return Ok(());
+    }
+
+    let r25 = test25_reattach_after_restart().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Ensure socket is back after test2.5 restart.
+    if !wait_for_socket(&sock, 3000).await {
+        println!("\nFATAL: socket not back after test2.5 restart");
+        println_results(r1, r2, r25, false, false);
         return Ok(());
     }
 
     let r3 = test3_block_detection().await;
     let r4 = test4_stream_lag().await;
 
-    println_results(r1, r2, r3, r4);
+    println_results(r1, r2, r25, r3, r4);
     Ok(())
 }
 
-fn println_results(r1: bool, r2: bool, r3: bool, r4: bool) {
+fn println_results(r1: bool, r2: bool, r25: bool, r3: bool, r4: bool) {
     fn label(b: bool) -> &'static str { if b { "PASS" } else { "FAIL" } }
     println!("\n=== RESULTS ===");
-    println!("Test 1 (worker crash recovery):      {}", label(r1));
-    println!("Test 2 (daemon restart persistence): {}", label(r2));
-    println!("Test 3 (block detection):            {}", label(r3));
-    println!("Test 4 (stream lag tolerance):       {}", label(r4));
+    println!("Test 1   (worker crash recovery):        {}", label(r1));
+    println!("Test 2   (daemon restart persistence):   {}", label(r2));
+    println!("Test 2.5 (worker reattach after restart):{}", label(r25));
+    println!("Test 3   (block detection):              {}", label(r3));
+    println!("Test 4   (stream lag tolerance):         {}", label(r4));
 }

@@ -40,7 +40,8 @@ use tokio_serde::formats::SymmetricalBincode;
 use tokio_util::codec::{Framed, FramedRead, FramedWrite, LengthDelimitedCodec};
 
 use crate::index::BlockIndex;
-use crate::store::Store;
+use crate::parser::BlockParser;
+use crate::store::{BlobWriter, Store};
 
 // ---------------------------------------------------------------------------
 // Worker registry
@@ -860,42 +861,238 @@ impl SupervisorWorker for SupervisorWorkerImpl {
 // Block event batcher → Tantivy
 // ---------------------------------------------------------------------------
 
+/// Per-(session_id, slot_idx) parser + in-progress block state.
+struct PaneParserState {
+    parser: BlockParser,
+    /// Writers keyed by in-progress BlockId.
+    writers: HashMap<pyre_proto::BlockId, BlobWriter>,
+    /// Stdout accumulator for Tantivy (capped at 256 KiB per block).
+    stdout_bufs: HashMap<pyre_proto::BlockId, Vec<u8>>,
+    /// Block metadata needed at BlockEnd.
+    block_meta: HashMap<pyre_proto::BlockId, pyre_proto::Block>,
+    /// Stable PaneId for this slot (resolved once on first event).
+    pane_id: Option<pyre_proto::PaneId>,
+}
+
+impl PaneParserState {
+    fn new(session_id: pyre_proto::SessionId) -> Self {
+        Self {
+            parser: BlockParser::new(session_id),
+            writers: HashMap::new(),
+            stdout_bufs: HashMap::new(),
+            block_meta: HashMap::new(),
+            pane_id: None,
+        }
+    }
+}
+
 async fn block_event_batcher(
     mut event_rx: mpsc::Receiver<BlockEvent>,
     block_index: Arc<BlockIndex>,
+    store: Arc<Store>,
+    registry: Arc<WorkerRegistry>,
 ) {
-    let mut batch: Vec<BlockEvent> = Vec::new();
+    // Parser state keyed by (session_id_str, slot_idx).
+    let mut pane_parsers: HashMap<(String, u32), PaneParserState> = HashMap::new();
     let flush_interval = Duration::from_millis(50);
     let mut interval = tokio::time::interval(flush_interval);
+    // Pending raw events collected between ticks.
+    let mut pending: Vec<BlockEvent> = Vec::new();
 
     loop {
         tokio::select! {
             maybe_ev = event_rx.recv() => {
                 match maybe_ev {
-                    Some(ev) => batch.push(ev),
+                    Some(ev) => pending.push(ev),
                     None => {
-                        if !batch.is_empty() {
-                            flush_batch(&batch, &block_index);
-                            batch.clear();
+                        // Channel closed — flush remaining and finalize open blocks.
+                        let evs = std::mem::take(&mut pending);
+                        for ev in evs {
+                            process_raw_event(ev, &mut pane_parsers, &store, &block_index, &registry).await;
                         }
+                        finalize_open_blocks(&mut pane_parsers, &store, &block_index).await;
                         return;
                     }
                 }
             }
             _ = interval.tick() => {
-                if !batch.is_empty() {
-                    flush_batch(&batch, &block_index);
-                    batch.clear();
+                let evs = std::mem::take(&mut pending);
+                if !evs.is_empty() {
+                    for ev in evs {
+                        process_raw_event(ev, &mut pane_parsers, &store, &block_index, &registry).await;
+                    }
                 }
             }
         }
     }
 }
 
-fn flush_batch(batch: &[BlockEvent], _block_index: &BlockIndex) {
-    // TODO(S2): convert BlockEvent → Block and write to Tantivy via add_block.
-    // Full conversion requires session/pane metadata which is deferred to S2.
-    tracing::debug!(count = batch.len(), "flushed block event batch (noop — S2)");
+/// Feed one raw supervisor `BlockEvent` (PTY bytes) through the per-pane parser
+/// and persist any finalized blocks to the store and Tantivy index.
+async fn process_raw_event(
+    raw: BlockEvent,
+    pane_parsers: &mut HashMap<(String, u32), PaneParserState>,
+    store: &Arc<Store>,
+    block_index: &Arc<BlockIndex>,
+    registry: &Arc<WorkerRegistry>,
+) {
+    use pyre_proto::blocks::BlockEvent as ParsedEvent;
+
+    let key = (raw.session_id.clone(), raw.slot_idx);
+
+    // Resolve session UUID — skip event on invalid UUID.
+    let session_uuid = match uuid::Uuid::parse_str(&raw.session_id) {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::warn!(session_id = raw.session_id, "block_event_batcher: invalid session uuid: {e}");
+            return;
+        }
+    };
+    let session_id = pyre_proto::SessionId(session_uuid);
+
+    // Get-or-create parser state for this pane slot.
+    let state = pane_parsers
+        .entry(key)
+        .or_insert_with(|| PaneParserState::new(session_id));
+
+    // Resolve PaneId once per slot.
+    if state.pane_id.is_none() {
+        let pane_uuid = registry
+            .get_or_alloc_pane_by_slot(&raw.session_id, raw.slot_idx)
+            .await;
+        state.pane_id = Some(pyre_proto::PaneId(pane_uuid));
+    }
+    let pane_id = state.pane_id.expect("pane_id set above");
+
+    // Feed bytes through the VTE parser.
+    let mut parsed_events: Vec<ParsedEvent> = Vec::new();
+    if !raw.bytes.is_empty() {
+        state.parser.feed(&raw.bytes, &mut parsed_events);
+    }
+
+    for ev in parsed_events {
+        match ev {
+            ParsedEvent::PromptStart { .. } => {}
+            ParsedEvent::CommandStart {
+                block,
+                ref command,
+                ref cwd,
+                ..
+            } => {
+                let proto_block = pyre_proto::Block {
+                    id: block,
+                    pane: pane_id,
+                    session: session_id,
+                    command: command.clone(),
+                    cwd: cwd.clone(),
+                    started_at: Utc::now(),
+                    ended_at: None,
+                    exit_code: None,
+                    stdout_len: 0,
+                };
+                if let Err(e) = store.create_block(&proto_block).await {
+                    tracing::warn!(?block, "block_event_batcher: create_block: {e:#}");
+                    continue;
+                }
+                let blob_path = store.blob_path_for(block);
+                match tokio::task::spawn_blocking(move || BlobWriter::open(&blob_path)).await {
+                    Ok(Ok(bw)) => {
+                        state.writers.insert(block, bw);
+                    }
+                    Ok(Err(e)) => tracing::warn!(?block, "BlobWriter::open: {e:#}"),
+                    Err(e) => tracing::warn!(?block, "spawn_blocking BlobWriter::open: {e}"),
+                }
+                state.stdout_bufs.insert(block, Vec::new());
+                state.block_meta.insert(block, proto_block);
+            }
+            ParsedEvent::OutputChunk { block, data } => {
+                if let Some(buf) = state.stdout_bufs.get_mut(&block) {
+                    const INDEX_CAP: usize = 256 * 1024;
+                    let remaining = INDEX_CAP.saturating_sub(buf.len());
+                    if remaining > 0 {
+                        let take = data.len().min(remaining);
+                        buf.extend_from_slice(&data[..take]);
+                    }
+                }
+                if let Some(mut bw) = state.writers.remove(&block) {
+                    let bytes_vec = data.to_vec();
+                    let result = tokio::task::spawn_blocking(move || {
+                        bw.write(&bytes_vec).map(|_| bw)
+                    })
+                    .await;
+                    match result {
+                        Ok(Ok(bw)) => {
+                            state.writers.insert(block, bw);
+                        }
+                        Ok(Err(e)) => tracing::warn!(?block, "BlobWriter::write: {e:#}"),
+                        Err(e) => tracing::warn!(?block, "spawn_blocking write: {e}"),
+                    }
+                }
+            }
+            ParsedEvent::BlockEnd { block, exit_code } => {
+                let bw = state.writers.remove(&block);
+                let stdout_len = if let Some(bw) = bw {
+                    tokio::task::spawn_blocking(move || bw.close().unwrap_or(0))
+                        .await
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+                if let Err(e) = store
+                    .finalize_block(block, Utc::now(), exit_code, stdout_len)
+                    .await
+                {
+                    tracing::warn!(?block, "finalize_block: {e:#}");
+                }
+                let stdout_text = state
+                    .stdout_bufs
+                    .remove(&block)
+                    .and_then(|b| String::from_utf8(b).ok())
+                    .unwrap_or_default();
+                if let Some(meta) = state.block_meta.remove(&block) {
+                    let idx = block_index.clone();
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(e) = idx.add_block(&meta, &stdout_text) {
+                            tracing::warn!("block_index.add_block: {e:#}");
+                        }
+                    });
+                }
+                tracing::debug!(?block, ?exit_code, "block finalized");
+            }
+        }
+    }
+}
+
+/// Finalize any in-progress blocks (best-effort on shutdown).
+async fn finalize_open_blocks(
+    pane_parsers: &mut HashMap<(String, u32), PaneParserState>,
+    store: &Arc<Store>,
+    block_index: &Arc<BlockIndex>,
+) {
+    for state in pane_parsers.values_mut() {
+        let open_blocks: Vec<pyre_proto::BlockId> = state.writers.keys().cloned().collect();
+        for block in open_blocks {
+            if let Some(bw) = state.writers.remove(&block) {
+                let stdout_len = tokio::task::spawn_blocking(move || bw.close().unwrap_or(0))
+                    .await
+                    .unwrap_or(0);
+                let _ = store
+                    .finalize_block(block, Utc::now(), None, stdout_len)
+                    .await;
+            }
+            let stdout_text = state
+                .stdout_bufs
+                .remove(&block)
+                .and_then(|b| String::from_utf8(b).ok())
+                .unwrap_or_default();
+            if let Some(meta) = state.block_meta.remove(&block) {
+                let idx = block_index.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _ = idx.add_block(&meta, &stdout_text);
+                });
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1022,7 +1219,12 @@ pub async fn run(
         supervisor_sock.display()
     );
 
-    tokio::spawn(block_event_batcher(event_rx, block_index.clone()));
+    tokio::spawn(block_event_batcher(
+        event_rx,
+        block_index.clone(),
+        store.clone(),
+        registry.clone(),
+    ));
     tokio::spawn(heartbeat_monitor(registry.clone(), supervisor_impl.clone()));
     start_sigchld_handler(registry.clone(), supervisor_impl.clone());
 
@@ -1059,6 +1261,56 @@ pub async fn run(
                 }
             }
         });
+    }
+
+    // Re-attach persisted sessions: query SQLite for all known sessions and spawn
+    // a worker for each.  Workers can't restore PTYs (the old processes are gone)
+    // but they will appear in list_sessions and their shard state is intact.
+    // Workers that had panes will re-open shells via WorkerShard::load_panes.
+    {
+        let persisted = store.list_session_ids().await.unwrap_or_else(|e| {
+            tracing::warn!("reattach: list_session_ids: {e:#}");
+            vec![]
+        });
+        let count = persisted.len();
+        if count > 0 {
+            tracing::info!(count, "reattaching persisted sessions");
+        }
+        for sid in persisted {
+            let session_id_str = sid.0.to_string();
+            // Insert a oneshot so spawn_worker can await registration.
+            let (reg_tx, reg_rx) = oneshot::channel::<()>();
+            pending_registrations
+                .lock()
+                .await
+                .insert(session_id_str.clone(), reg_tx);
+
+            if let Err(e) = supervisor_impl.spawn_worker(&session_id_str).await {
+                tracing::warn!(session_id = session_id_str, "reattach: spawn_worker: {e:#}");
+                pending_registrations
+                    .lock()
+                    .await
+                    .remove(&session_id_str);
+                continue;
+            }
+
+            // Await registration with a 5 s timeout — same window as spawn RPC.
+            match tokio::time::timeout(Duration::from_secs(5), reg_rx).await {
+                Ok(Ok(())) => {
+                    tracing::info!(session_id = session_id_str, "reattached persisted session");
+                }
+                Ok(Err(_)) => {
+                    tracing::warn!(session_id = session_id_str, "reattach: registration channel closed");
+                }
+                Err(_) => {
+                    tracing::warn!(session_id = session_id_str, "reattach: worker did not register within 5 s");
+                    pending_registrations
+                        .lock()
+                        .await
+                        .remove(&session_id_str);
+                }
+            }
+        }
     }
 
     // Public socket accept loop (PyreDaemon trait — same tag protocol as single mode).
