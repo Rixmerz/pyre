@@ -1,18 +1,18 @@
-% PYRE-TUI(1) pyre 0.1.0 | pyre Manual
+% PYRE(1) pyre 0.1.0 | pyre Manual
 % pyre contributors
 % May 2026
 
 # NAME
 
-pyre-tui - pyre terminal multiplexer TUI renderer
+pyre - pyre terminal multiplexer TUI renderer
 
 # SYNOPSIS
 
-**pyre-tui** [--socket *PATH*]
+**pyre** [--socket *PATH*]
 
 # DESCRIPTION
 
-**pyre-tui** is the interactive TUI front end for the **pyre** terminal
+**pyre** is the interactive TUI front end for the **pyre** terminal
 multiplexer. It renders sessions and panes using **ratatui** and **crossterm**,
 using the Ember color theme (dark amber/orange on near-black). It connects to
 the running **pyred** daemon over the Unix domain socket.
@@ -21,7 +21,7 @@ Each session is displayed as a tab. Each pane within a session occupies a
 cell in a grid layout. The block ribbon at the bottom shows recent command
 blocks for the focused pane.
 
-pyre-tui is mouse-first: click to focus a pane, scroll to navigate output.
+pyre is mouse-first: click to focus a pane, scroll to navigate output.
 Keyboard control uses the Ctrl-B prefix, consistent with tmux muscle memory.
 
 # OPTIONS
@@ -73,7 +73,7 @@ Keyboard control uses the Ctrl-B prefix, consistent with tmux muscle memory.
 : Exit scroll mode.
 
 **Ctrl-B d**
-: Detach (leave daemon running, exit pyre-tui).
+: Detach (leave daemon running, exit pyre).
 
 **Ctrl-B ?**
 : Show key binding help overlay.
@@ -102,13 +102,13 @@ Keyboard control uses the Ctrl-B prefix, consistent with tmux muscle memory.
 
 # EXAMPLES
 
-Start pyre-tui connected to the default daemon socket:
+Start pyre connected to the default daemon socket:
 
-    pyre-tui
+    pyre
 
 Start with a custom socket:
 
-    pyre-tui --socket /tmp/pyre-test.sock
+    pyre --socket /tmp/pyre-test.sock
 
 # SEE ALSO
 
