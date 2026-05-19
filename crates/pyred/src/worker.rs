@@ -22,18 +22,21 @@ use std::time::Duration;
 use crate::ringbuf::RingBuf;
 
 use anyhow::{bail, Context, Result};
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use pyre_proto::supervisor::{
     BlockEvent, BlockKind, RpcError, SupervisorWorkerClient, WorkerControl,
 };
+use pyre_proto::{InputFrame, OutputFrame, SessionId};
 use tarpc::server::{BaseChannel, Channel};
 use tarpc::tokio_serde::formats::Bincode;
 use tarpc::{client, context};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, RwLock};
-use tokio_util::codec::{Framed, LengthDelimitedCodec};
+use tokio_serde::formats::SymmetricalBincode;
+use tokio_util::codec::{Framed, FramedRead, FramedWrite, LengthDelimitedCodec};
+use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
 // Env config
@@ -524,9 +527,21 @@ async fn handle_stream_conn(mut sock: UnixStream, state: Arc<WorkerState>) {
     }
     let slot_idx = u32::from_le_bytes(slot_buf);
 
-    // Snapshot ring buffer and send as initial burst, then run bidi copy.
-    // We grab the input_tx and set up a dedicated reader via try_clone_reader.
-    let (input_tx, mut reader) = {
+    // Resolve session_id → SessionId for OutputFrame metadata.
+    let session = {
+        let uuid = match Uuid::parse_str(&state.session_id) {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::warn!("stream conn: invalid session_id uuid: {e}");
+                let _ = sock.shutdown().await;
+                return;
+            }
+        };
+        SessionId(uuid)
+    };
+
+    // Grab input_tx, ring-buffer snapshot, and a cloned PTY reader.
+    let (input_tx, mut reader, snap) = {
         let panes = state.panes.read().await;
         let handle = match panes.get(&slot_idx) {
             Some(h) => h,
@@ -537,7 +552,6 @@ async fn handle_stream_conn(mut sock: UnixStream, state: Arc<WorkerState>) {
             }
         };
 
-        // Send ring buffer snapshot first.
         let snap = handle.ring_buf.lock().await.snapshot().to_vec();
 
         let reader = match handle.master.lock().await.try_clone_reader() {
@@ -549,45 +563,68 @@ async fn handle_stream_conn(mut sock: UnixStream, state: Arc<WorkerState>) {
             }
         };
 
-        // Write snapshot directly to socket before entering bidi loop.
-        if !snap.is_empty() && sock.write_all(&snap).await.is_err() {
-            return;
-        }
-
-        (handle.input_tx.clone(), reader)
+        (handle.input_tx.clone(), reader, snap)
     };
 
-    // Split socket into read/write halves.
-    let (mut sock_rd, mut sock_wr) = sock.into_split();
+    // Split socket into framed read/write halves — must match single-mode wire
+    // format: length-delimited bincode OutputFrame (daemon→client) and
+    // InputFrame (client→daemon).
+    let (sock_rd, sock_wr) = sock.into_split();
 
-    // client → PTY: read from socket, send to input_tx.
+    let frame_read = FramedRead::new(sock_rd, LengthDelimitedCodec::new());
+    let frame_write = FramedWrite::new(sock_wr, LengthDelimitedCodec::new());
+
+    let mut input_frames: tokio_serde::SymmetricallyFramed<_, InputFrame, _> =
+        tokio_serde::SymmetricallyFramed::new(frame_read, SymmetricalBincode::default());
+    let mut output_frames: tokio_serde::SymmetricallyFramed<_, OutputFrame, _> =
+        tokio_serde::SymmetricallyFramed::new(frame_write, SymmetricalBincode::default());
+
+    // Send snapshot as seq=0 frame (always, even if empty — uniform client path).
+    if output_frames
+        .send(OutputFrame {
+            session,
+            seq: 0,
+            data: snap.into(),
+        })
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    // client → PTY: decode InputFrame, extract .data, forward to PTY.
     let client_to_pty = tokio::spawn(async move {
-        let mut buf = vec![0u8; 4096];
-        loop {
-            match tokio::io::AsyncReadExt::read(&mut sock_rd, &mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if input_tx.send(buf[..n].to_vec()).await.is_err() {
+        while let Some(frame) = input_frames.next().await {
+            match frame {
+                Ok(f) => {
+                    if input_tx.send(f.data.to_vec()).await.is_err() {
                         break;
                     }
+                }
+                Err(e) => {
+                    tracing::warn!(slot_idx, "input frame decode error: {e}");
+                    break;
                 }
             }
         }
     });
 
-    // PTY → client: blocking read from PTY reader, write to socket.
+    // PTY → client: blocking read from PTY reader, encode as OutputFrame.
     let pty_to_client = tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Handle::current();
         let mut buf = vec![0u8; 4096];
+        let mut seq: u64 = 0; // seq 0 was the snapshot; live frames start at 1
         loop {
             match std::io::Read::read(&mut reader, &mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    let chunk = buf[..n].to_vec();
-                    if rt
-                        .block_on(tokio::io::AsyncWriteExt::write_all(&mut sock_wr, &chunk))
-                        .is_err()
-                    {
+                    seq = seq.wrapping_add(1);
+                    let frame = OutputFrame {
+                        session,
+                        seq,
+                        data: buf[..n].to_vec().into(),
+                    };
+                    if rt.block_on(output_frames.send(frame)).is_err() {
                         break;
                     }
                 }
