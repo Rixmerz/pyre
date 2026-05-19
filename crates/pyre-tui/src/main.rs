@@ -2593,15 +2593,20 @@ async fn run_tui(
     control: PyreDaemonClient,
     shell: Option<String>,
 ) -> Result<()> {
-    let (term_cols, term_rows) = term_size();
-    // Guard: if crossterm hasn't initialised the terminal yet, defer one tick.
-    let (init_cols, init_rows) = if term_cols == 0 || term_rows == 0 {
-        tokio::time::sleep(Duration::from_millis(16)).await;
-        let (c, r) = term_size();
-        compute_pane_inner_size(c, r)
-    } else {
-        compute_pane_inner_size(term_cols, term_rows)
-    };
+    // Enter alternate screen FIRST so that crossterm::terminal::size() returns
+    // the full terminal dimensions when we compute the initial pane size below.
+    // Any size query before this point reflects the pre-alt-screen scroll-region
+    // height (typically 25 rows on most terminals), not the real window height.
+    let _guard = TermGuard::enter()?;
+    let backend = CrosstermBackend::new(stdout());
+    let mut terminal = Terminal::new(backend)?;
+
+    // Now that we are in alternate-screen mode, ratatui's terminal.size() gives
+    // the true frame dimensions. Use those to compute the initial inner pane area
+    // so the PTY is spawned at the right size from the very first frame.
+    let term_rect = terminal.size()?;
+    let (init_cols, init_rows) = compute_pane_inner_size(term_rect.width, term_rect.height);
+
     let initial_slot = attach_pane(&socket, session, pane, init_cols, init_rows).await?;
 
     // ── Background block-poll task (Bug 2 fix) ──────────────────────────────
@@ -2646,7 +2651,10 @@ async fn run_tui(
 
     // Eagerly discover all other sessions the daemon already knows about so
     // the top bar is populated before the first draw, not 1 s later.
+    // Re-read terminal size here — we are already in alt-screen so the value is authoritative.
     if let Ok(Ok(daemon_sessions)) = state.control.list_sessions(tarpc::context::current()).await {
+        let eager_rect = terminal.size().unwrap_or(term_rect);
+        let (ec, er) = compute_pane_inner_size(eager_rect.width, eager_rect.height);
         for info in daemon_sessions {
             if info.id == session {
                 continue; // already the active session
@@ -2657,7 +2665,6 @@ async fn run_tui(
                 .await
             {
                 if let Some(p) = panes.into_iter().next() {
-                    let (ec, er) = compute_pane_inner_size(term_cols, term_rows);
                     if let Ok(slot) = attach_pane(&state.socket, info.id, p.id, ec, er).await {
                         let slot_idx = state.slots.len();
                         state.slots.push(Some(slot));
@@ -2681,9 +2688,6 @@ async fn run_tui(
         state.session_list_last_poll = Instant::now();
     }
 
-    let _guard = TermGuard::enter()?;
-    let backend = CrosstermBackend::new(stdout());
-    let mut terminal = Terminal::new(backend)?;
     let mut prefix_active = false;
 
     // Observability counters for the 1 s periodic debug log.
@@ -3505,16 +3509,13 @@ async fn main() -> Result<()> {
     match cli.command {
         None => {
             let client = control_client(&socket).await?;
-            // Read terminal size before alternate-screen is entered so crossterm
-            // can query the real dimensions. Guard against pre-init 0×0.
-            let raw_size = term_size();
-            let (raw_cols, raw_rows) = if raw_size.0 == 0 || raw_size.1 == 0 {
-                tokio::time::sleep(Duration::from_millis(16)).await;
-                term_size()
-            } else {
-                raw_size
-            };
-            let (cols, rows) = compute_pane_inner_size(raw_cols, raw_rows);
+            // Use a conservative placeholder for the daemon-side PTY creation.
+            // run_tui() enters alternate-screen before calling attach_pane, so
+            // it reads the true terminal size from ratatui and sends a resize RPC
+            // immediately on the first rendered frame.  These placeholder dims are
+            // never used for the vt100 parser — they only set the initial kernel
+            // PTY size, which is corrected within one frame.
+            let (cols, rows): (u16, u16) = (80, 24);
             // Check for existing sessions first; attach to first if present.
             let existing = client
                 .list_sessions(tarpc::context::current())
