@@ -307,6 +307,11 @@ impl WorkerState {
         let session_id = self.session_id.clone();
         let ring_buf_reader = ring_buf.clone();
         let output_tx_reader = output_tx.clone();
+        // Capture the Tokio runtime handle while we are still inside an async
+        // context (the spawning task).  The pty-reader is a plain sync thread
+        // that has no reactor of its own; calling Handle::current() from inside
+        // it would panic with "no reactor running".
+        let rt = tokio::runtime::Handle::current();
         std::thread::Builder::new()
             .name(format!("pty-reader-{slot_idx}"))
             .spawn(move || {
@@ -330,8 +335,9 @@ impl WorkerState {
                             // send() returns Err only when there are zero receivers, which is
                             // normal when no client is connected — ignore silently.
                             let _ = output_tx_reader.send(chunk.clone());
-                            // 3. Supervisor block_event — fire-and-forget via blocking_send on
-                            // a oneshot mpsc so we don't block the reader thread on async.
+                            // 3. Supervisor block_event — fire-and-forget.  Dispatch to the
+                            // Tokio runtime captured before this thread was spawned; we cannot
+                            // call Handle::current() here because the sync thread has no reactor.
                             let ev = BlockEvent {
                                 session_id: session_id.clone(),
                                 slot_idx,
@@ -339,12 +345,7 @@ impl WorkerState {
                                 bytes: chunk.to_vec(),
                                 ts_ms: now_ms(),
                             };
-                            // We cannot .await here (blocking thread).  Use the tarpc client's
-                            // non-blocking fire-and-forget path via a spawned async task.
                             let sv2 = sv.clone();
-                            // `sv.block_event` is async; dispatch to the tokio runtime that
-                            // owns this thread's executor via Handle::current().
-                            let rt = tokio::runtime::Handle::current();
                             rt.spawn(async move {
                                 let _ = sv2.block_event(context::current(), ev).await;
                             });
