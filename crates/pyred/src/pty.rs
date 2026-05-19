@@ -145,7 +145,13 @@ pub async fn spawn_pty(
         )
         .await?;
 
-    // Wrap child in Arc<Mutex<>> now that we've extracted the PID.
+    // Extract the child PID before wrapping in Arc<Mutex> so we can store it
+    // on PaneState without ever needing to re-lock the mutex later.  This PID
+    // is used by PaneState::kill() to send SIGTERM without acquiring the child
+    // lock (which is held by the child-wait task for the life of the process).
+    let child_pid: u32 = child.process_id().unwrap_or(0);
+
+    // Wrap child in Arc<Mutex<>> for the child-wait task.
     let child = Arc::new(Mutex::new(child));
 
     // close_token: cancelled when the child process exits so stream handlers
@@ -156,10 +162,9 @@ pub async fn spawn_pty(
 
     // Stash the child PID into the state tracker.
     {
-        let child_guard = child.lock().await;
-        if let Some(pid) = child_guard.process_id() {
+        if child_pid > 0 {
             if let Ok(mut t) = state_tracker_arc.lock() {
-                t.root_pid = pid;
+                t.root_pid = child_pid;
             }
         }
     }
@@ -346,6 +351,7 @@ pub async fn spawn_pty(
         events_tx,
         input_tx,
         child,
+        child_pid,
         ringbuf_arc,
         state_tracker_arc,
         close_token,
