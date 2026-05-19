@@ -113,7 +113,8 @@ impl PaneIndex {
         self.pane_to_slot
             .retain(|_, (sid, _)| sid.as_str() != session_id);
         self.next_slot.remove(session_id);
-        self.dead_slots.retain(|(sid, _)| sid.as_str() != session_id);
+        self.dead_slots
+            .retain(|(sid, _)| sid.as_str() != session_id);
     }
 
     /// Remove one pane slot mapping, mark it dead, and return the number of
@@ -121,8 +122,7 @@ impl PaneIndex {
     fn remove_pane_slot(&mut self, session_id: &str, slot_idx: u32) -> usize {
         self.pane_to_slot
             .retain(|_, (sid, s)| !(sid.as_str() == session_id && *s == slot_idx));
-        self.dead_slots
-            .insert((session_id.to_owned(), slot_idx));
+        self.dead_slots.insert((session_id.to_owned(), slot_idx));
         self.pane_to_slot
             .values()
             .filter(|(sid, _)| sid.as_str() == session_id)
@@ -938,10 +938,7 @@ impl SupervisorWorker for SupervisorWorkerImpl {
         // panes remain for the session.  If none remain, evict the session from
         // the registry *now* — before the worker process actually exits — so
         // that the SIGCHLD handler finds no registry entry and does not respawn.
-        let remaining = self
-            .registry
-            .remove_pane_slot(&session_id, slot_idx)
-            .await;
+        let remaining = self.registry.remove_pane_slot(&session_id, slot_idx).await;
         if remaining == 0 {
             tracing::info!(
                 session_id,
@@ -1045,7 +1042,10 @@ async fn process_raw_event(
     let session_uuid = match uuid::Uuid::parse_str(&raw.session_id) {
         Ok(u) => u,
         Err(e) => {
-            tracing::warn!(session_id = raw.session_id, "block_event_batcher: invalid session uuid: {e}");
+            tracing::warn!(
+                session_id = raw.session_id,
+                "block_event_batcher: invalid session uuid: {e}"
+            );
             return;
         }
     };
@@ -1122,10 +1122,8 @@ async fn process_raw_event(
                 }
                 if let Some(mut bw) = state.writers.remove(&block) {
                     let bytes_vec = data.to_vec();
-                    let result = tokio::task::spawn_blocking(move || {
-                        bw.write(&bytes_vec).map(|_| bw)
-                    })
-                    .await;
+                    let result =
+                        tokio::task::spawn_blocking(move || bw.write(&bytes_vec).map(|_| bw)).await;
                     match result {
                         Ok(Ok(bw)) => {
                             state.writers.insert(block, bw);
@@ -1405,10 +1403,7 @@ pub async fn run(
 
             if let Err(e) = supervisor_impl.spawn_worker(&session_id_str).await {
                 tracing::warn!(session_id = session_id_str, "reattach: spawn_worker: {e:#}");
-                pending_registrations
-                    .lock()
-                    .await
-                    .remove(&session_id_str);
+                pending_registrations.lock().await.remove(&session_id_str);
                 continue;
             }
 
@@ -1418,14 +1413,17 @@ pub async fn run(
                     tracing::info!(session_id = session_id_str, "reattached persisted session");
                 }
                 Ok(Err(_)) => {
-                    tracing::warn!(session_id = session_id_str, "reattach: registration channel closed");
+                    tracing::warn!(
+                        session_id = session_id_str,
+                        "reattach: registration channel closed"
+                    );
                 }
                 Err(_) => {
-                    tracing::warn!(session_id = session_id_str, "reattach: worker did not register within 5 s");
-                    pending_registrations
-                        .lock()
-                        .await
-                        .remove(&session_id_str);
+                    tracing::warn!(
+                        session_id = session_id_str,
+                        "reattach: worker did not register within 5 s"
+                    );
+                    pending_registrations.lock().await.remove(&session_id_str);
                 }
             }
         }
@@ -1629,11 +1627,7 @@ async fn proxy_stream_to_worker(
         let session = SessionId(session_uuid);
         tokio::spawn(async move {
             while let Some(data) = in_rx.recv().await {
-                if worker_in
-                    .send(InputFrame { session, data })
-                    .await
-                    .is_err()
-                {
+                if worker_in.send(InputFrame { session, data }).await.is_err() {
                     break;
                 }
             }
@@ -1672,7 +1666,11 @@ async fn proxy_stream_to_worker(
     let out_task = tokio::spawn(async move {
         // Always send the snapshot first (seq=0), even if empty — uniform client path.
         if client_out
-            .send(OutputFrame { session, seq: 0, data: snap })
+            .send(OutputFrame {
+                session,
+                seq: 0,
+                data: snap,
+            })
             .await
             .is_err()
         {
@@ -1747,8 +1745,12 @@ async fn handle_public_conn(
             Ok(())
         }
         MODE_STREAM => {
-            proxy_stream_to_worker(sock, supervisor_impl.registry, supervisor_impl.mirror_registry)
-                .await
+            proxy_stream_to_worker(
+                sock,
+                supervisor_impl.registry,
+                supervisor_impl.mirror_registry,
+            )
+            .await
         }
         other => anyhow::bail!("unknown mode tag {other:#04x}"),
     }

@@ -55,8 +55,8 @@ use ratatui::Terminal;
 mod clipboard;
 mod splash;
 mod theme;
-use std::process::Stdio;
 use std::collections::HashMap;
+use std::process::Stdio;
 use tarpc::client;
 use tarpc::tokio_serde::formats::Bincode;
 use theme::EMBER;
@@ -370,7 +370,9 @@ enum PaneEvent {
     /// means the connection was rejected at the handshake level (e.g. worker
     /// returned "pane not found") rather than a real pane exit; in that case
     /// the TUI should skip the `close_pane` RPC to avoid a respawn loop.
-    Closed { frames_received: u64 },
+    Closed {
+        frames_received: u64,
+    },
 }
 
 /// One attached PTY pane with its I/O channels and VT parser.
@@ -880,7 +882,9 @@ async fn attach_pane(
         }
         // Stream ended. Carry frame count so the UI can distinguish a
         // connection-level failure (0 frames) from a real pane exit (≥1 frames).
-        let _ = net_tx.try_send(PaneEvent::Closed { frames_received: frames });
+        let _ = net_tx.try_send(PaneEvent::Closed {
+            frames_received: frames,
+        });
     });
 
     // UI → net
@@ -897,9 +901,19 @@ async fn attach_pane(
             }
             let batch_len = buf.len();
             let t0 = std::time::Instant::now();
-            let send_result = input_frames.send(InputFrame { session, data: Bytes::from(buf) }).await;
+            let send_result = input_frames
+                .send(InputFrame {
+                    session,
+                    data: Bytes::from(buf),
+                })
+                .await;
             let elapsed_us = t0.elapsed().as_micros();
-            tracing::debug!(batch_bytes = batch_len, elapsed_us, send_ok = send_result.is_ok(), "send_keys: input_frames RPC send");
+            tracing::debug!(
+                batch_bytes = batch_len,
+                elapsed_us,
+                send_ok = send_result.is_ok(),
+                "send_keys: input_frames RPC send"
+            );
             if send_result.is_err() {
                 break;
             }
@@ -2679,10 +2693,7 @@ async fn run_tui(
                 env: std::env::vars().collect(),
                 name: None,
             };
-            let SpawnResp {
-                session,
-                pane,
-            } = control
+            let SpawnResp { session, pane } = control
                 .spawn(tarpc::context::current(), req)
                 .await
                 .context("rpc transport")?
@@ -2754,8 +2765,15 @@ async fn run_tui(
         });
     }
 
-    let mut state =
-        initial_app_state(session, session_name, initial_slot, control, socket, shell, blocks_rx);
+    let mut state = initial_app_state(
+        session,
+        session_name,
+        initial_slot,
+        control,
+        socket,
+        shell,
+        blocks_rx,
+    );
 
     // Eagerly discover all other sessions the daemon already knows about so
     // the top bar is populated before the first draw, not 1 s later.
@@ -2845,7 +2863,10 @@ async fn run_tui(
                 // slot it never opened, causing it to exit and triggering a
                 // supervisor respawn loop.  Just remove the TUI slot; the
                 // session-sync loop will reconcile daemon state on the next tick.
-                tracing::warn!(slot_idx, "stream closed with 0 frames; skipping close_pane RPC");
+                tracing::warn!(
+                    slot_idx,
+                    "stream closed with 0 frames; skipping close_pane RPC"
+                );
                 if slot_idx < state.slots.len() {
                     state.slots[slot_idx] = None;
                 }
@@ -2865,8 +2886,7 @@ async fn run_tui(
                     slot.recent_blocks = blocks.clone();
                     if let Some(cursor) = slot.ribbon_cursor {
                         if !slot.recent_blocks.is_empty() {
-                            slot.ribbon_cursor =
-                                Some(cursor.min(slot.recent_blocks.len() - 1));
+                            slot.ribbon_cursor = Some(cursor.min(slot.recent_blocks.len() - 1));
                         } else {
                             slot.ribbon_cursor = None;
                         }

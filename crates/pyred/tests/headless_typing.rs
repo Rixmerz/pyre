@@ -16,9 +16,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
-use pyre_proto::{
-    OutputFrame, PyreDaemonClient, SpawnReq, SpawnResp, MODE_CONTROL, MODE_STREAM,
-};
+use pyre_proto::{OutputFrame, PyreDaemonClient, SpawnReq, SpawnResp, MODE_CONTROL, MODE_STREAM};
 use tarpc::client;
 use tarpc::tokio_serde::formats::Bincode;
 use tokio::io::AsyncWriteExt;
@@ -30,8 +28,7 @@ use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn headless_typing_fastfetch() {
-    let result =
-        tokio::time::timeout(Duration::from_secs(60), run_headless_typing()).await;
+    let result = tokio::time::timeout(Duration::from_secs(60), run_headless_typing()).await;
     match result {
         Ok(Ok(())) => {}
         Ok(Err(e)) => panic!("headless_typing failed: {e:#}"),
@@ -176,22 +173,24 @@ async fn run_headless_typing() -> anyhow::Result<()> {
             .join(" ");
         let ascii: String = chunk
             .iter()
-            .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' })
+            .map(|&b| {
+                if b.is_ascii_graphic() || b == b' ' {
+                    b as char
+                } else {
+                    '.'
+                }
+            })
             .collect();
         eprintln!("{:04x}  {:47}  |{}|", i * 16, hex, ascii);
     }
 
     // Search for "fastfetch" in raw bytes
     let needle = b"fastfetch";
-    let raw_found = raw
-        .windows(needle.len())
-        .any(|w| w == needle);
+    let raw_found = raw.windows(needle.len()).any(|w| w == needle);
     eprintln!("\n'fastfetch' in raw bytes: {raw_found}");
 
     // Search for "bash:" in raw bytes (error message)
-    let bash_err_found = raw
-        .windows(b"bash:".len())
-        .any(|w| w == b"bash:");
+    let bash_err_found = raw.windows(b"bash:".len()).any(|w| w == b"bash:");
     eprintln!("'bash:' in raw bytes:     {bash_err_found}");
 
     // ── 9. Feed raw bytes into vt100::Parser and inspect screen ─────────────
@@ -226,10 +225,7 @@ async fn run_headless_typing() -> anyhow::Result<()> {
     // or PTY echo).
     if !raw_found && !screen_found {
         // Print whatever capture_pane returns for additional evidence.
-        if let Ok(cap) = ctrl
-            .capture_pane(tarpc::context::current(), pane, 50)
-            .await
-        {
+        if let Ok(cap) = ctrl.capture_pane(tarpc::context::current(), pane, 50).await {
             if let Ok(bytes) = cap {
                 eprintln!(
                     "\n--- capture_pane output ---\n{}",

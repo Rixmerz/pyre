@@ -53,7 +53,10 @@ async fn connect(sock: &PathBuf) -> Result<PyreDaemonClient> {
     let mut stream = UnixStream::connect(sock)
         .await
         .with_context(|| format!("connect {}", sock.display()))?;
-    stream.write_all(&[MODE_CONTROL]).await.context("write mode tag")?;
+    stream
+        .write_all(&[MODE_CONTROL])
+        .await
+        .context("write mode tag")?;
     let transport = tarpc::serde_transport::new(
         Framed::new(stream, LengthDelimitedCodec::new()),
         Bincode::default(),
@@ -93,22 +96,43 @@ async fn test1_worker_crash_recovery() -> bool {
     let sock = sock_path();
     let client = match connect(&sock).await {
         Ok(c) => c,
-        Err(e) => { println!("  FAIL: connect: {e}"); return false; }
+        Err(e) => {
+            println!("  FAIL: connect: {e}");
+            return false;
+        }
     };
 
     // Spawn a session.
-    let resp = match client.spawn(tarpc::context::current(), spawn_default()).await {
+    let resp = match client
+        .spawn(tarpc::context::current(), spawn_default())
+        .await
+    {
         Ok(Ok(r)) => r,
-        Ok(Err(e)) => { println!("  FAIL: spawn RPC: {e}"); return false; }
-        Err(e) => { println!("  FAIL: transport: {e}"); return false; }
+        Ok(Err(e)) => {
+            println!("  FAIL: spawn RPC: {e}");
+            return false;
+        }
+        Err(e) => {
+            println!("  FAIL: transport: {e}");
+            return false;
+        }
     };
     println!("  spawned session={} pane={}", resp.session, resp.pane);
 
     // Get worker PID via inspect_pid.
-    let pid_info = match client.inspect_pid(tarpc::context::current(), resp.pane).await {
+    let pid_info = match client
+        .inspect_pid(tarpc::context::current(), resp.pane)
+        .await
+    {
         Ok(Ok(p)) => p,
-        Ok(Err(e)) => { println!("  FAIL: inspect_pid: {e}"); return false; }
-        Err(e) => { println!("  FAIL: inspect_pid transport: {e}"); return false; }
+        Ok(Err(e)) => {
+            println!("  FAIL: inspect_pid: {e}");
+            return false;
+        }
+        Err(e) => {
+            println!("  FAIL: inspect_pid transport: {e}");
+            return false;
+        }
     };
     let worker_pid = pid_info.pid;
     println!("  worker pid from inspect_pid: {worker_pid}");
@@ -169,14 +193,21 @@ async fn test2_daemon_restart() -> bool {
     let rt_dir = runtime_dir();
     let data_dir = std::env::var("PYRE_DATA_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| dirs::data_dir().unwrap_or_else(|| PathBuf::from("/tmp")).join("pyre"));
+        .unwrap_or_else(|_| {
+            dirs::data_dir()
+                .unwrap_or_else(|| PathBuf::from("/tmp"))
+                .join("pyre")
+        });
 
     // Spawn 2 sessions.
     let mut session_ids = vec![];
     for i in 0..2u32 {
         let client = match connect(&sock).await {
             Ok(c) => c,
-            Err(e) => { println!("  FAIL: connect: {e}"); return false; }
+            Err(e) => {
+                println!("  FAIL: connect: {e}");
+                return false;
+            }
         };
         let mut req = spawn_default();
         req.name = Some(format!("persist-{i}"));
@@ -185,8 +216,14 @@ async fn test2_daemon_restart() -> bool {
                 println!("  spawned session {}", r.session);
                 session_ids.push(r.session);
             }
-            Ok(Err(e)) => { println!("  FAIL: spawn: {e}"); return false; }
-            Err(e) => { println!("  FAIL: transport: {e}"); return false; }
+            Ok(Err(e)) => {
+                println!("  FAIL: spawn: {e}");
+                return false;
+            }
+            Err(e) => {
+                println!("  FAIL: transport: {e}");
+                return false;
+            }
         }
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -256,7 +293,9 @@ async fn test2_daemon_restart() -> bool {
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // Remove stale socket if present.
-    if sock.exists() { let _ = std::fs::remove_file(&sock); }
+    if sock.exists() {
+        let _ = std::fs::remove_file(&sock);
+    }
 
     let _child = std::process::Command::new(pyred_exe())
         .env("RUST_LOG", "info")
@@ -276,13 +315,22 @@ async fn test2_daemon_restart() -> bool {
 
     let client = match connect(&sock).await {
         Ok(c) => c,
-        Err(e) => { println!("  FAIL: connect after restart: {e}"); return false; }
+        Err(e) => {
+            println!("  FAIL: connect after restart: {e}");
+            return false;
+        }
     };
 
     let sessions = match client.list_sessions(tarpc::context::current()).await {
         Ok(Ok(ss)) => ss,
-        Ok(Err(e)) => { println!("  list_sessions after restart: {e}"); vec![] }
-        Err(e) => { println!("  FAIL: transport: {e}"); return false; }
+        Ok(Err(e)) => {
+            println!("  list_sessions after restart: {e}");
+            vec![]
+        }
+        Err(e) => {
+            println!("  FAIL: transport: {e}");
+            return false;
+        }
     };
     let live_count = sessions.len();
     println!("  live sessions after restart: {live_count}");
@@ -303,13 +351,25 @@ async fn test3_block_detection() -> bool {
     let sock = sock_path();
     let client = match connect(&sock).await {
         Ok(c) => c,
-        Err(e) => { println!("  FAIL: connect: {e}"); return false; }
+        Err(e) => {
+            println!("  FAIL: connect: {e}");
+            return false;
+        }
     };
 
-    let resp = match client.spawn(tarpc::context::current(), spawn_default()).await {
+    let resp = match client
+        .spawn(tarpc::context::current(), spawn_default())
+        .await
+    {
         Ok(Ok(r)) => r,
-        Ok(Err(e)) => { println!("  FAIL: spawn: {e}"); return false; }
-        Err(e) => { println!("  FAIL: transport: {e}"); return false; }
+        Ok(Err(e)) => {
+            println!("  FAIL: spawn: {e}");
+            return false;
+        }
+        Err(e) => {
+            println!("  FAIL: transport: {e}");
+            return false;
+        }
     };
     let pane_id = resp.pane;
     let session_id = resp.session;
@@ -318,41 +378,86 @@ async fn test3_block_detection() -> bool {
     tokio::time::sleep(Duration::from_millis(400)).await;
 
     // Send `ls\n`.
-    match client.send_keys(tarpc::context::current(), pane_id, b"ls\n".to_vec()).await {
+    match client
+        .send_keys(tarpc::context::current(), pane_id, b"ls\n".to_vec())
+        .await
+    {
         Ok(Ok(())) => println!("  send_keys 'ls\\n' OK"),
-        Ok(Err(e)) => { println!("  FAIL: send_keys: {e}"); return false; }
-        Err(e) => { println!("  FAIL: send_keys transport: {e}"); return false; }
+        Ok(Err(e)) => {
+            println!("  FAIL: send_keys: {e}");
+            return false;
+        }
+        Err(e) => {
+            println!("  FAIL: send_keys transport: {e}");
+            return false;
+        }
     }
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     // list_blocks via supervisor store.
-    let blocks = match client.list_blocks(
-        tarpc::context::current(),
-        pyre_proto::blocks::ListBlocksReq { session: Some(session_id), limit: 20 },
-    ).await {
+    let blocks = match client
+        .list_blocks(
+            tarpc::context::current(),
+            pyre_proto::blocks::ListBlocksReq {
+                session: Some(session_id),
+                limit: 20,
+            },
+        )
+        .await
+    {
         Ok(Ok(b)) => b,
-        Ok(Err(e)) => { println!("  list_blocks: {e} (S2 scope)"); vec![] }
-        Err(e) => { println!("  list_blocks transport: {e}"); vec![] }
+        Ok(Err(e)) => {
+            println!("  list_blocks: {e} (S2 scope)");
+            vec![]
+        }
+        Err(e) => {
+            println!("  list_blocks transport: {e}");
+            vec![]
+        }
     };
     println!("  list_blocks count: {}", blocks.len());
 
     // search_blocks for "ls".
-    let hits = match client.search_blocks(
-        tarpc::context::current(),
-        pyre_proto::blocks::SearchBlocksReq { query: "ls".into(), limit: 10 },
-    ).await {
+    let hits = match client
+        .search_blocks(
+            tarpc::context::current(),
+            pyre_proto::blocks::SearchBlocksReq {
+                query: "ls".into(),
+                limit: 10,
+            },
+        )
+        .await
+    {
         Ok(Ok(h)) => h,
-        Ok(Err(e)) => { println!("  search_blocks: {e}"); vec![] }
-        Err(e) => { println!("  search_blocks transport: {e}"); vec![] }
+        Ok(Err(e)) => {
+            println!("  search_blocks: {e}");
+            vec![]
+        }
+        Err(e) => {
+            println!("  search_blocks transport: {e}");
+            vec![]
+        }
     };
     println!("  search_blocks('ls') hits: {}", hits.len());
 
     // capture_pane — reads ringbuf directly in worker.
-    let capture = match client.capture_pane(tarpc::context::current(), pane_id, 20).await {
-        Ok(Ok(b)) => { let s = String::from_utf8_lossy(&b).to_string(); s }
-        Ok(Err(e)) => { println!("  capture_pane: {e}"); String::new() }
-        Err(e) => { println!("  capture_pane transport: {e}"); String::new() }
+    let capture = match client
+        .capture_pane(tarpc::context::current(), pane_id, 20)
+        .await
+    {
+        Ok(Ok(b)) => {
+            let s = String::from_utf8_lossy(&b).to_string();
+            s
+        }
+        Ok(Err(e)) => {
+            println!("  capture_pane: {e}");
+            String::new()
+        }
+        Err(e) => {
+            println!("  capture_pane transport: {e}");
+            String::new()
+        }
     };
     let has_output = !capture.trim().is_empty();
     println!("  capture_pane bytes: {}", capture.len());
@@ -386,7 +491,10 @@ async fn test4_stream_lag() -> bool {
     let sock = sock_path();
     let client = match connect(&sock).await {
         Ok(c) => c,
-        Err(e) => { println!("  FAIL: connect: {e}"); return false; }
+        Err(e) => {
+            println!("  FAIL: connect: {e}");
+            return false;
+        }
     };
 
     let mut req = spawn_default();
@@ -394,8 +502,14 @@ async fn test4_stream_lag() -> bool {
     req.rows = 50;
     let resp = match client.spawn(tarpc::context::current(), req).await {
         Ok(Ok(r)) => r,
-        Ok(Err(e)) => { println!("  FAIL: spawn: {e}"); return false; }
-        Err(e) => { println!("  FAIL: transport: {e}"); return false; }
+        Ok(Err(e)) => {
+            println!("  FAIL: spawn: {e}");
+            return false;
+        }
+        Err(e) => {
+            println!("  FAIL: transport: {e}");
+            return false;
+        }
     };
     let pane_id = resp.pane;
     println!("  spawned pane={pane_id}");
@@ -404,28 +518,46 @@ async fn test4_stream_lag() -> bool {
 
     // Burst: `yes | head -c 1048576\n` (1 MiB of 'y\n').
     let cmd = b"yes | head -c 1048576\n";
-    match client.send_keys(tarpc::context::current(), pane_id, cmd.to_vec()).await {
+    match client
+        .send_keys(tarpc::context::current(), pane_id, cmd.to_vec())
+        .await
+    {
         Ok(Ok(())) => println!("  sent burst command (yes | head -c 1048576)"),
-        Ok(Err(e)) => { println!("  FAIL: send_keys: {e}"); return false; }
-        Err(e) => { println!("  FAIL: send_keys transport: {e}"); return false; }
+        Ok(Err(e)) => {
+            println!("  FAIL: send_keys: {e}");
+            return false;
+        }
+        Err(e) => {
+            println!("  FAIL: send_keys transport: {e}");
+            return false;
+        }
     }
 
     // Let it run for 3 s.
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     // Capture from ringbuf.
-    let capture = match client.capture_pane(tarpc::context::current(), pane_id, 50).await {
+    let capture = match client
+        .capture_pane(tarpc::context::current(), pane_id, 50)
+        .await
+    {
         Ok(Ok(b)) => b,
-        Ok(Err(e)) => { println!("  capture_pane: {e}"); vec![] }
-        Err(e) => { println!("  FAIL: capture transport: {e}"); return false; }
+        Ok(Err(e)) => {
+            println!("  capture_pane: {e}");
+            vec![]
+        }
+        Err(e) => {
+            println!("  FAIL: capture transport: {e}");
+            return false;
+        }
     };
     let captured_bytes = capture.len();
     println!("  capture_pane returned {captured_bytes} bytes");
 
     let log = std::fs::read_to_string("/tmp/pyred-adr002.log").unwrap_or_default();
-    let has_panic     = log.contains("panicked at");
-    let has_lagged    = log.contains("Lagged(") || log.contains("RecvError::Lagged");
-    let has_overflow  = log.contains("channel overflow") || log.contains("broadcast lagged");
+    let has_panic = log.contains("panicked at");
+    let has_lagged = log.contains("Lagged(") || log.contains("RecvError::Lagged");
+    let has_overflow = log.contains("channel overflow") || log.contains("broadcast lagged");
 
     println!("  panic in log:           {has_panic}");
     println!("  RecvError::Lagged:      {has_lagged}");
@@ -461,7 +593,11 @@ async fn test25_reattach_after_restart() -> bool {
     let rt_dir = runtime_dir();
     let data_dir = std::env::var("PYRE_DATA_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| dirs::data_dir().unwrap_or_else(|| PathBuf::from("/tmp")).join("pyre"));
+        .unwrap_or_else(|_| {
+            dirs::data_dir()
+                .unwrap_or_else(|| PathBuf::from("/tmp"))
+                .join("pyre")
+        });
     let cfg_dir = std::env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| dirs::config_dir().unwrap().join("pyre"));
@@ -471,7 +607,10 @@ async fn test25_reattach_after_restart() -> bool {
     for i in 0..2u32 {
         let client = match connect(&sock).await {
             Ok(c) => c,
-            Err(e) => { println!("  FAIL: connect: {e}"); return false; }
+            Err(e) => {
+                println!("  FAIL: connect: {e}");
+                return false;
+            }
         };
         let mut req = spawn_default();
         req.name = Some(format!("reattach-{i}"));
@@ -480,8 +619,14 @@ async fn test25_reattach_after_restart() -> bool {
                 println!("  spawned session {}", r.session);
                 session_ids.push(r.session);
             }
-            Ok(Err(e)) => { println!("  FAIL: spawn: {e}"); return false; }
-            Err(e) => { println!("  FAIL: transport: {e}"); return false; }
+            Ok(Err(e)) => {
+                println!("  FAIL: spawn: {e}");
+                return false;
+            }
+            Err(e) => {
+                println!("  FAIL: transport: {e}");
+                return false;
+            }
         }
     }
     let expected = session_ids.len();
@@ -521,7 +666,9 @@ async fn test25_reattach_after_restart() -> bool {
     }
 
     // Remove stale socket if it lingers.
-    if sock.exists() { let _ = std::fs::remove_file(&sock); }
+    if sock.exists() {
+        let _ = std::fs::remove_file(&sock);
+    }
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // Restart pyred.
@@ -552,13 +699,22 @@ async fn test25_reattach_after_restart() -> bool {
 
     let client = match connect(&sock).await {
         Ok(c) => c,
-        Err(e) => { println!("  FAIL: connect after restart: {e}"); return false; }
+        Err(e) => {
+            println!("  FAIL: connect after restart: {e}");
+            return false;
+        }
     };
 
     let sessions = match client.list_sessions(tarpc::context::current()).await {
         Ok(Ok(ss)) => ss,
-        Ok(Err(e)) => { println!("  FAIL: list_sessions: {e}"); return false; }
-        Err(e) => { println!("  FAIL: transport: {e}"); return false; }
+        Ok(Err(e)) => {
+            println!("  FAIL: list_sessions: {e}");
+            return false;
+        }
+        Err(e) => {
+            println!("  FAIL: transport: {e}");
+            return false;
+        }
     };
 
     let got = sessions.len();
@@ -583,12 +739,21 @@ async fn test25_reattach_after_restart() -> bool {
 #[tokio::main]
 async fn main() -> Result<()> {
     println!("=== ADR-002 Hybrid Validation ===");
-    println!("XDG_RUNTIME_DIR = {}", std::env::var("XDG_RUNTIME_DIR").unwrap_or_default());
-    println!("PYRE_DATA_DIR   = {}", std::env::var("PYRE_DATA_DIR").unwrap_or_default());
+    println!(
+        "XDG_RUNTIME_DIR = {}",
+        std::env::var("XDG_RUNTIME_DIR").unwrap_or_default()
+    );
+    println!(
+        "PYRE_DATA_DIR   = {}",
+        std::env::var("PYRE_DATA_DIR").unwrap_or_default()
+    );
 
     let sock = sock_path();
     if !sock.exists() {
-        println!("FATAL: pyred socket not found at {} — start pyred first", sock.display());
+        println!(
+            "FATAL: pyred socket not found at {} — start pyred first",
+            sock.display()
+        );
         std::process::exit(1);
     }
 
@@ -623,7 +788,13 @@ async fn main() -> Result<()> {
 }
 
 fn println_results(r1: bool, r2: bool, r25: bool, r3: bool, r4: bool) {
-    fn label(b: bool) -> &'static str { if b { "PASS" } else { "FAIL" } }
+    fn label(b: bool) -> &'static str {
+        if b {
+            "PASS"
+        } else {
+            "FAIL"
+        }
+    }
     println!("\n=== RESULTS ===");
     println!("Test 1   (worker crash recovery):        {}", label(r1));
     println!("Test 2   (daemon restart persistence):   {}", label(r2));
