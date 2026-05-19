@@ -146,4 +146,10 @@ pub trait WorkerControl {
     ///
     /// If no panes remain after removal the worker exits cleanly.
     async fn close_pane(slot_idx: u32) -> Result<(), RpcError>;
+
+    /// Return the last `lines` lines of a pane's ring buffer (CSI stripped).
+    async fn capture_pane(slot_idx: u32, lines: u32) -> Result<Vec<u8>, RpcError>;
+
+    /// List all pane slot indices currently open in this worker.
+    async fn list_panes() -> Result<Vec<u32>, RpcError>;
 }

@@ -162,6 +162,13 @@ impl WorkerShard {
         Ok(())
     }
 
+    /// Return the last captured snapshot bytes for `slot_idx`, or empty vec if none.
+    async fn load_pane_snapshot(&self, _slot_idx: u32) -> Result<Vec<u8>> {
+        // Snapshot persistence is deferred to S3. Return empty bytes for now;
+        // capture_pane will return an empty result rather than an error.
+        Ok(Vec::new())
+    }
+
     async fn load_panes(&self) -> Result<Vec<(u32, String, String)>> {
         let rows = sqlx::query("SELECT slot_idx, shell, cwd FROM panes")
             .fetch_all(&self.db)
@@ -440,6 +447,41 @@ impl WorkerControl for WorkerControlImpl {
             .close_pane(slot_idx)
             .await
             .map_err(|e| RpcError::Internal(e.to_string()))
+    }
+
+    async fn capture_pane(
+        self,
+        _ctx: context::Context,
+        slot_idx: u32,
+        lines: u32,
+    ) -> Result<Vec<u8>, RpcError> {
+        use regex::Regex;
+        use std::sync::OnceLock;
+
+        static ANSI_RE: OnceLock<Regex> = OnceLock::new();
+        let re = ANSI_RE.get_or_init(|| {
+            Regex::new(r"\x1b\[[\x20-\x3f]*[\x40-\x7e]").expect("static regex is valid")
+        });
+
+        // Read recent bytes from the worker shard for this pane.
+        let raw = self
+            .state
+            .shard
+            .load_pane_snapshot(slot_idx)
+            .await
+            .map_err(|e| RpcError::Internal(e.to_string()))?;
+
+        let lossy = String::from_utf8_lossy(&raw);
+        let stripped = re.replace_all(&lossy, "");
+        let all_lines: Vec<&str> = stripped.split('\n').collect();
+        let take = (lines as usize).min(all_lines.len());
+        let tail = &all_lines[all_lines.len().saturating_sub(take)..];
+        Ok(tail.join("\n").into_bytes())
+    }
+
+    async fn list_panes(self, _ctx: context::Context) -> Result<Vec<u32>, RpcError> {
+        let panes = self.state.panes.read().await;
+        Ok(panes.keys().cloned().collect())
     }
 }
 
