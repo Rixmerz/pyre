@@ -2585,11 +2585,32 @@ fn initial_app_state(
     }
 }
 
+/// Describes how `run_tui` should acquire the initial session and pane.
+///
+/// Spawning the PTY must happen AFTER the terminal enters alternate-screen so
+/// that `terminal.size()` returns true dimensions.  Passing intent here
+/// (instead of pre-spawning in `main`) prevents the shell from starting at
+/// the 80×24 placeholder that `crossterm::terminal::size()` returns before
+/// alt-screen is entered.
+enum PaneInit {
+    /// Session and pane already exist (e.g. `pyre attach`).
+    Existing {
+        session: SessionId,
+        session_name: String,
+        pane: PaneId,
+    },
+    /// An existing session has no panes yet; open one at real terminal size.
+    OpenPane {
+        session: SessionId,
+        session_name: String,
+    },
+    /// No sessions exist; spawn a fresh session+pane at real terminal size.
+    Spawn,
+}
+
 async fn run_tui(
     socket: PathBuf,
-    session: SessionId,
-    session_name: String,
-    pane: PaneId,
+    init: PaneInit,
     control: PyreDaemonClient,
     shell: Option<String>,
 ) -> Result<()> {
@@ -2606,6 +2627,57 @@ async fn run_tui(
     // so the PTY is spawned at the right size from the very first frame.
     let term_rect = terminal.size()?;
     let (init_cols, init_rows) = compute_pane_inner_size(term_rect.width, term_rect.height);
+
+    // Resolve session/pane — spawning here (post-alt-screen) ensures the shell
+    // is started at real terminal dimensions, not an 80×24 placeholder.
+    let (session, session_name, pane) = match init {
+        PaneInit::Existing {
+            session,
+            session_name,
+            pane,
+        } => (session, session_name, pane),
+        PaneInit::OpenPane {
+            session,
+            session_name,
+        } => {
+            let req = OpenPaneReq {
+                session,
+                shell: shell.clone(),
+                cwd: std::env::current_dir()
+                    .ok()
+                    .or_else(|| std::env::var("HOME").ok().map(PathBuf::from)),
+                cols: init_cols,
+                rows: init_rows,
+                env: std::env::vars().collect(),
+            };
+            let pane = control
+                .open_pane(tarpc::context::current(), req)
+                .await
+                .context("rpc transport")?
+                .map_err(|e| anyhow!("daemon open_pane: {e}"))?;
+            (session, session_name, pane)
+        }
+        PaneInit::Spawn => {
+            let req = SpawnReq {
+                shell: shell.clone(),
+                cwd: std::env::current_dir().ok(),
+                cols: init_cols,
+                rows: init_rows,
+                env: std::env::vars().collect(),
+                name: None,
+            };
+            let SpawnResp {
+                session,
+                pane,
+            } = control
+                .spawn(tarpc::context::current(), req)
+                .await
+                .context("rpc transport")?
+                .map_err(|e| anyhow!("daemon spawn: {e}"))?;
+            let short8: String = session.0.to_string().chars().take(8).collect();
+            (session, format!("session-{short8}"), pane)
+        }
+    };
 
     let initial_slot = attach_pane(&socket, session, pane, init_cols, init_rows).await?;
 
@@ -3509,66 +3581,39 @@ async fn main() -> Result<()> {
     match cli.command {
         None => {
             let client = control_client(&socket).await?;
-            // Use a conservative placeholder for the daemon-side PTY creation.
-            // run_tui() enters alternate-screen before calling attach_pane, so
-            // it reads the true terminal size from ratatui and sends a resize RPC
-            // immediately on the first rendered frame.  These placeholder dims are
-            // never used for the vt100 parser — they only set the initial kernel
-            // PTY size, which is corrected within one frame.
-            let (cols, rows): (u16, u16) = (80, 24);
             // Check for existing sessions first; attach to first if present.
+            // All PTY spawning is deferred into run_tui() so that it happens
+            // after the terminal enters alternate-screen and terminal.size()
+            // returns true dimensions — not an 80×24 pre-alt-screen placeholder.
             let existing = client
                 .list_sessions(tarpc::context::current())
                 .await
                 .context("rpc transport")?
                 .map_err(|e| anyhow!("daemon list_sessions: {e}"))?;
 
-            let (session, session_name, pane) = if let Some(sess) = existing.into_iter().next() {
+            let init = if let Some(sess) = existing.into_iter().next() {
                 // Session exists — try to find an existing pane. If the session
                 // has zero panes (e.g. freshly booted daemon with a bare session
                 // container), open one automatically so the TUI always starts
                 // with an attachable pane.
-                let pane = match first_pane(&client, sess.id).await {
-                    Ok(p) => p,
-                    Err(_) => {
-                        let req = OpenPaneReq {
-                            session: sess.id,
-                            shell: shell.clone(),
-                            cwd: std::env::current_dir()
-                                .ok()
-                                .or_else(|| std::env::var("HOME").ok().map(PathBuf::from)),
-                            cols,
-                            rows,
-                            env: std::env::vars().collect(),
-                        };
-                        client
-                            .open_pane(tarpc::context::current(), req)
-                            .await
-                            .context("rpc transport")?
-                            .map_err(|e| anyhow!("daemon open_pane: {e}"))?
-                    }
-                };
-                (sess.id, sess.name, pane)
+                match first_pane(&client, sess.id).await {
+                    Ok(pane) => PaneInit::Existing {
+                        session: sess.id,
+                        session_name: sess.name,
+                        pane,
+                    },
+                    Err(_) => PaneInit::OpenPane {
+                        session: sess.id,
+                        session_name: sess.name,
+                    },
+                }
             } else {
-                // No sessions at all — spawn a fresh one (creates session + pane).
-                let req = SpawnReq {
-                    shell: shell.clone(),
-                    cwd: std::env::current_dir().ok(),
-                    cols,
-                    rows,
-                    env: std::env::vars().collect(),
-                    name: None,
-                };
-                let SpawnResp { session, pane } = client
-                    .spawn(tarpc::context::current(), req)
-                    .await
-                    .context("rpc transport")?
-                    .map_err(|e| anyhow!("daemon spawn: {e}"))?;
-                let short8: String = session.0.to_string().chars().take(8).collect();
-                (session, format!("session-{short8}"), pane)
+                // No sessions at all — spawn a fresh session+pane inside run_tui
+                // at real terminal dimensions.
+                PaneInit::Spawn
             };
 
-            run_tui(socket, session, session_name, pane, client, shell).await
+            run_tui(socket, init, client, shell).await
         }
         Some(Sub::Attach {
             session: session_prefix,
@@ -3595,7 +3640,17 @@ async fn main() -> Result<()> {
                 Some(ref prefix) => resolve_pane(&client, session_id, prefix).await?,
                 None => first_pane(&client, session_id).await?,
             };
-            run_tui(socket, session_id, session_name, pane, client, shell).await
+            run_tui(
+                socket,
+                PaneInit::Existing {
+                    session: session_id,
+                    session_name,
+                    pane,
+                },
+                client,
+                shell,
+            )
+            .await
         }
     }
 }
