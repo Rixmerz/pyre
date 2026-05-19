@@ -118,6 +118,26 @@ fn term_size() -> (u16, u16) {
     crossterm::terminal::size().unwrap_or((80, 24))
 }
 
+/// Compute the inner PTY content area for a single full-screen pane given
+/// the raw terminal dimensions.
+///
+/// The ratatui layout removes:
+///   - 1 row  sessions strip
+///   - 1 row  tabs strip
+///   - 1 row  status bar
+///   - 2 rows pane border (top + bottom)
+///   - 1 row  ribbon strip inside the pane
+///   - 2 cols pane border (left + right)
+///
+/// Total overhead: 6 rows, 2 cols. For splits the first-frame resize RPC
+/// corrects the exact size immediately; this gets the initial spawn close
+/// enough to avoid shell / fastfetch layout corruption on startup.
+fn compute_pane_inner_size(term_cols: u16, term_rows: u16) -> (u16, u16) {
+    let cols = term_cols.saturating_sub(2).max(1);
+    let rows = term_rows.saturating_sub(6).max(1);
+    (cols, rows)
+}
+
 fn resolve_shell(shell_arg: Option<String>) -> Option<String> {
     shell_arg
         .or_else(|| std::env::var("SHELL").ok())
@@ -777,8 +797,13 @@ fn rect_contains(rect: Rect, col: u16, row: u16) -> bool {
 // Stream connection + background tasks for one pane
 // ─────────────────────────────────────────────────────────────────────────────
 
-async fn attach_pane(socket: &Path, session: SessionId, pane_id: PaneId) -> Result<PaneSlot> {
-    let (cols, rows) = term_size();
+async fn attach_pane(
+    socket: &Path,
+    session: SessionId,
+    pane_id: PaneId,
+    cols: u16,
+    rows: u16,
+) -> Result<PaneSlot> {
 
     let mut stream_sock = UnixStream::connect(socket)
         .await
@@ -1808,7 +1833,8 @@ fn focus_next(tab: &mut Tab, slots: &[Option<PaneSlot>], forward: bool) {
 
 /// Split the active leaf. `horizontal` = true means HSplit (top/bottom).
 async fn split_active(state: &mut AppState, horizontal: bool) -> Result<()> {
-    let (cols, rows) = term_size();
+    let (term_cols, term_rows) = term_size();
+    let (cols, rows) = compute_pane_inner_size(term_cols, term_rows);
     let session_id = state.active_session_id();
     let req = OpenPaneReq {
         session: session_id,
@@ -1825,7 +1851,7 @@ async fn split_active(state: &mut AppState, horizontal: bool) -> Result<()> {
         .context("rpc transport")?
         .map_err(|e| anyhow!("daemon open_pane: {e}"))?;
 
-    let slot = attach_pane(&state.socket, session_id, new_pane_id).await?;
+    let slot = attach_pane(&state.socket, session_id, new_pane_id, cols, rows).await?;
     let new_slot_idx = state.slots.len();
     state.slots.push(Some(slot));
 
@@ -1867,7 +1893,8 @@ async fn split_active(state: &mut AppState, horizontal: bool) -> Result<()> {
 /// Open a new pane in a new tab within the active session.
 /// `label` is stored client-side only; pass `None` to auto-number.
 async fn open_new_tab(state: &mut AppState, label: Option<String>) -> Result<()> {
-    let (cols, rows) = term_size();
+    let (term_cols, term_rows) = term_size();
+    let (cols, rows) = compute_pane_inner_size(term_cols, term_rows);
     let session_id = state.active_session_id();
     let req = OpenPaneReq {
         session: session_id,
@@ -1884,7 +1911,7 @@ async fn open_new_tab(state: &mut AppState, label: Option<String>) -> Result<()>
         .context("rpc transport")?
         .map_err(|e| anyhow!("daemon open_pane: {e}"))?;
 
-    let slot = attach_pane(&state.socket, session_id, new_pane_id).await?;
+    let slot = attach_pane(&state.socket, session_id, new_pane_id, cols, rows).await?;
     let slot_idx = state.slots.len();
     state.slots.push(Some(slot));
 
@@ -1907,7 +1934,8 @@ async fn open_new_tab(state: &mut AppState, label: Option<String>) -> Result<()>
 
 /// Spawn a brand-new daemon session and push a SessionView.
 async fn open_new_session(state: &mut AppState, name: Option<String>) -> Result<()> {
-    let (cols, rows) = term_size();
+    let (term_cols, term_rows) = term_size();
+    let (cols, rows) = compute_pane_inner_size(term_cols, term_rows);
     let resolved_name = name.filter(|n| !n.is_empty());
     let req = SpawnReq {
         shell: state.shell.clone(),
@@ -1924,7 +1952,7 @@ async fn open_new_session(state: &mut AppState, name: Option<String>) -> Result<
         .context("rpc transport")?
         .map_err(|e| anyhow!("daemon spawn: {e}"))?;
 
-    let slot = attach_pane(&state.socket, session, pane).await?;
+    let slot = attach_pane(&state.socket, session, pane, cols, rows).await?;
     let slot_idx = state.slots.len();
     state.slots.push(Some(slot));
 
@@ -2507,7 +2535,16 @@ async fn run_tui(
     control: PyreDaemonClient,
     shell: Option<String>,
 ) -> Result<()> {
-    let initial_slot = attach_pane(&socket, session, pane).await?;
+    let (term_cols, term_rows) = term_size();
+    // Guard: if crossterm hasn't initialised the terminal yet, defer one tick.
+    let (init_cols, init_rows) = if term_cols == 0 || term_rows == 0 {
+        tokio::time::sleep(Duration::from_millis(16)).await;
+        let (c, r) = term_size();
+        compute_pane_inner_size(c, r)
+    } else {
+        compute_pane_inner_size(term_cols, term_rows)
+    };
+    let initial_slot = attach_pane(&socket, session, pane, init_cols, init_rows).await?;
     let mut state = initial_app_state(session, session_name, initial_slot, control, socket, shell);
 
     // Eagerly discover all other sessions the daemon already knows about so
@@ -2523,7 +2560,8 @@ async fn run_tui(
                 .await
             {
                 if let Some(p) = panes.into_iter().next() {
-                    if let Ok(slot) = attach_pane(&state.socket, info.id, p.id).await {
+                    let (ec, er) = compute_pane_inner_size(term_cols, term_rows);
+                    if let Ok(slot) = attach_pane(&state.socket, info.id, p.id, ec, er).await {
                         let slot_idx = state.slots.len();
                         state.slots.push(Some(slot));
                         state.sessions.push(SessionView {
@@ -2667,7 +2705,11 @@ async fn run_tui(
                         {
                             Ok(Ok(panes)) if !panes.is_empty() => {
                                 let pane_id = panes[0].id;
-                                match attach_pane(&state.socket, info.id, pane_id).await {
+                                let (sc, sr) = {
+                                    let (tc, tr) = term_size();
+                                    compute_pane_inner_size(tc, tr)
+                                };
+                                match attach_pane(&state.socket, info.id, pane_id, sc, sr).await {
                                     Ok(slot) => {
                                         let slot_idx = state.slots.len();
                                         state.slots.push(Some(slot));
@@ -2743,7 +2785,11 @@ async fn run_tui(
                         if local_pane_ids.contains(&pane_info.id) {
                             continue;
                         }
-                        match attach_pane(&state.socket, info.id, pane_info.id).await {
+                        let (pc, pr) = {
+                            let (tc, tr) = term_size();
+                            compute_pane_inner_size(tc, tr)
+                        };
+                        match attach_pane(&state.socket, info.id, pane_info.id, pc, pr).await {
                             Ok(slot) => {
                                 let slot_idx = state.slots.len();
                                 state.slots.push(Some(slot));
@@ -3303,7 +3349,16 @@ async fn main() -> Result<()> {
     match cli.command {
         None => {
             let client = control_client(&socket).await?;
-            let (cols, rows) = term_size();
+            // Read terminal size before alternate-screen is entered so crossterm
+            // can query the real dimensions. Guard against pre-init 0×0.
+            let raw_size = term_size();
+            let (raw_cols, raw_rows) = if raw_size.0 == 0 || raw_size.1 == 0 {
+                tokio::time::sleep(Duration::from_millis(16)).await;
+                term_size()
+            } else {
+                raw_size
+            };
+            let (cols, rows) = compute_pane_inner_size(raw_cols, raw_rows);
             // Check for existing sessions first; attach to first if present.
             let existing = client
                 .list_sessions(tarpc::context::current())
