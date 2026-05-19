@@ -56,13 +56,14 @@ mod clipboard;
 mod splash;
 mod theme;
 use std::process::Stdio;
+use std::collections::HashMap;
 use tarpc::client;
 use tarpc::tokio_serde::formats::Bincode;
 use theme::EMBER;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::process::Command as TokioCommand;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_serde::formats::SymmetricalBincode;
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 
@@ -379,8 +380,6 @@ struct PaneSlot {
     recent_blocks: Vec<Block>,
     /// `None` = live (rightmost highlighted); `Some(i)` = scrollback cursor.
     ribbon_cursor: Option<usize>,
-    /// Wall-clock instant of the last block-poll so we throttle to ~500 ms.
-    last_block_poll: std::time::Instant,
 
     /// Last PTY size successfully sent to the daemon, to avoid spamming per frame.
     last_sent_size: (u16, u16),
@@ -665,6 +664,9 @@ struct AppState {
     pending_resizes: Vec<(PaneId, pyre_proto::PaneSize)>,
     /// Last time the session list was refreshed from the daemon.
     session_list_last_poll: Instant,
+    /// Latest block snapshot delivered by the background poll task.
+    /// Key = PaneId, value = blocks for that pane (up to 20, newest last).
+    blocks_rx: watch::Receiver<HashMap<PaneId, Vec<Block>>>,
 }
 
 impl AppState {
@@ -866,9 +868,6 @@ async fn attach_pane(
         output_rx,
         recent_blocks: Vec::new(),
         ribbon_cursor: None,
-        last_block_poll: std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_secs(10))
-            .unwrap_or_else(std::time::Instant::now),
         last_sent_size: (cols, rows),
         scroll_offset: 0,
         scrollback_capacity: 0,
@@ -2487,6 +2486,7 @@ fn initial_app_state(
     control: PyreDaemonClient,
     socket: PathBuf,
     shell: Option<String>,
+    blocks_rx: watch::Receiver<HashMap<PaneId, Vec<Block>>>,
 ) -> AppState {
     AppState {
         sessions: vec![SessionView {
@@ -2524,6 +2524,7 @@ fn initial_app_state(
         pending_resizes: Vec::new(),
         // Force an immediate session-list sync on the first loop iteration.
         session_list_last_poll: Instant::now() - Duration::from_secs(10),
+        blocks_rx,
     }
 }
 
@@ -2545,7 +2546,46 @@ async fn run_tui(
         compute_pane_inner_size(term_cols, term_rows)
     };
     let initial_slot = attach_pane(&socket, session, pane, init_cols, init_rows).await?;
-    let mut state = initial_app_state(session, session_name, initial_slot, control, socket, shell);
+
+    // ── Background block-poll task (Bug 2 fix) ──────────────────────────────
+    // list_blocks is moved off the hot event loop into its own task. A
+    // watch channel carries the latest snapshot; the event loop does a
+    // non-blocking borrow_and_update read and never awaits the RPC directly.
+    let (blocks_tx, blocks_rx) = watch::channel(HashMap::<PaneId, Vec<Block>>::new());
+    {
+        let poll_client = control.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(500));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                let req = pyre_proto::blocks::ListBlocksReq {
+                    session: None,
+                    limit: 20,
+                };
+                // Apply a 2 s hard timeout so a stuck daemon cannot pin this task.
+                let result = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    poll_client.list_blocks(tarpc::context::current(), req),
+                )
+                .await;
+                if let Ok(Ok(Ok(blocks))) = result {
+                    // Group by pane_id so the event loop can index directly.
+                    let mut map: HashMap<PaneId, Vec<Block>> = HashMap::new();
+                    for b in blocks {
+                        map.entry(b.pane).or_default().push(b);
+                    }
+                    // send only fails when all receivers are dropped (TUI exited).
+                    if blocks_tx.send(map).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    let mut state =
+        initial_app_state(session, session_name, initial_slot, control, socket, shell, blocks_rx);
 
     // Eagerly discover all other sessions the daemon already knows about so
     // the top bar is populated before the first draw, not 1 s later.
@@ -2614,29 +2654,27 @@ async fn run_tui(
             close_pane_by_slot_idx(&mut state, slot_idx);
         }
 
-        // Poll block lists inline (~500 ms throttle per pane)
-        let poll_interval = std::time::Duration::from_millis(500);
-        for slot in state.slots.iter_mut().flatten() {
-            if slot.last_block_poll.elapsed() >= poll_interval {
-                slot.last_block_poll = std::time::Instant::now();
-                let req = pyre_proto::blocks::ListBlocksReq {
-                    session: None,
-                    limit: 20,
-                };
-                if let Ok(Ok(blocks)) = state
-                    .control
-                    .list_blocks(tarpc::context::current(), req)
-                    .await
-                {
-                    let pane_id = slot.pane_id;
-                    slot.recent_blocks = blocks.into_iter().filter(|b| b.pane == pane_id).collect();
+        // Drain latest block snapshot from the background poll task (non-blocking).
+        // borrow_and_update marks the value as seen; subsequent calls return
+        // Err(RecvError) until the background task publishes a new snapshot.
+        if state.blocks_rx.has_changed().unwrap_or(false) {
+            let map = state.blocks_rx.borrow_and_update().clone();
+            for slot in state.slots.iter_mut().flatten() {
+                let pane_id = slot.pane_id;
+                if let Some(blocks) = map.get(&pane_id) {
+                    slot.recent_blocks = blocks.clone();
                     if let Some(cursor) = slot.ribbon_cursor {
                         if !slot.recent_blocks.is_empty() {
-                            slot.ribbon_cursor = Some(cursor.min(slot.recent_blocks.len() - 1));
+                            slot.ribbon_cursor =
+                                Some(cursor.min(slot.recent_blocks.len() - 1));
                         } else {
                             slot.ribbon_cursor = None;
                         }
                     }
+                } else {
+                    // Pane not present in latest snapshot — clear stale data.
+                    slot.recent_blocks.clear();
+                    slot.ribbon_cursor = None;
                 }
             }
         }
