@@ -75,9 +75,12 @@ async fn run_blocks_test() -> anyhow::Result<()> {
     std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))?;
 
     // --- 2. Spawn pyred with both env vars set ---
+    // XDG_CONFIG_HOME is pointed at the temp dir so pyred uses default (single)
+    // process model regardless of the user's ~/.config/pyre/config.toml setting.
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_pyred"))
         .env("XDG_RUNTIME_DIR", xdg_dir.path())
         .env("PYRE_DATA_DIR", data_dir.path())
+        .env("XDG_CONFIG_HOME", xdg_dir.path())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()?;

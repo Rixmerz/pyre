@@ -18,24 +18,26 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use bytes::Bytes;
 use chrono::Utc;
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use pyre_proto::service::PyreDaemon as _;
 use pyre_proto::supervisor::{
     BlockEvent, RegisterAck, RpcError, SupervisorWorker, WorkerControlClient,
 };
 use pyre_proto::{
-    AttachAck, Block, BlockHit, BlockId, ListBlocksReq, OpenPaneReq, PaneId, PaneInfo,
-    PaneStateKind, PyreError, ReplayBlocks, ResizePaneReq, ResizePaneRes, SearchBlocksReq,
-    SessionId, SessionInfo, SpawnReq, SpawnResp,
+    AttachAck, Block, BlockHit, BlockId, InputFrame, ListBlocksReq, OpenPaneReq, OutputFrame,
+    PaneId, PaneInfo, PaneStateKind, PyreError, ReplayBlocks, ResizePaneReq, ResizePaneRes,
+    SearchBlocksReq, SessionId, SessionInfo, SpawnReq, SpawnResp,
 };
 use tarpc::server::{BaseChannel, Channel};
 use tarpc::tokio_serde::formats::Bincode;
 use tarpc::{client, context};
 use tokio::io::AsyncReadExt;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
-use tokio_util::codec::{Framed, LengthDelimitedCodec};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
+use tokio_serde::formats::SymmetricalBincode;
+use tokio_util::codec::{Framed, FramedRead, FramedWrite, LengthDelimitedCodec};
 
 use crate::index::BlockIndex;
 use crate::store::Store;
@@ -210,6 +212,53 @@ impl WorkerRegistry {
 }
 
 // ---------------------------------------------------------------------------
+// Per-pane mirror hub — multi-client output broadcast + serialised input
+// ---------------------------------------------------------------------------
+
+/// Shared state for all TUI clients attached to one pane.
+///
+/// A single connection is held open to the worker's stream UDS. Output bytes
+/// from the worker are broadcast to every subscribed TUI client. Input from
+/// any TUI client is sent to a shared `mpsc` channel whose single drainer
+/// forwards them to the worker in order, preventing interleaving.
+struct PaneMirrorHub {
+    /// Broadcast sender: worker → all TUI clients.
+    output_tx: broadcast::Sender<Bytes>,
+    /// Serialised input queue: any TUI client → single worker connection.
+    input_tx: mpsc::Sender<Bytes>,
+}
+
+/// Registry of live per-pane mirror hubs, keyed by pane UUID.
+///
+/// An entry is created on the first TUI client attach for a pane and removed
+/// when the worker-side connection closes (pane exited or worker respawned).
+#[derive(Default, Clone)]
+pub struct PaneMirrorRegistry {
+    hubs: Arc<RwLock<HashMap<uuid::Uuid, Arc<PaneMirrorHub>>>>,
+}
+
+impl PaneMirrorRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Return the existing hub for `pane_uuid`, or `None` if not yet created.
+    async fn get(&self, pane_uuid: uuid::Uuid) -> Option<Arc<PaneMirrorHub>> {
+        self.hubs.read().await.get(&pane_uuid).cloned()
+    }
+
+    /// Insert a new hub. Replaces any stale entry for the same pane.
+    async fn insert(&self, pane_uuid: uuid::Uuid, hub: Arc<PaneMirrorHub>) {
+        self.hubs.write().await.insert(pane_uuid, hub);
+    }
+
+    /// Remove the hub for `pane_uuid` (called when the worker side closes).
+    async fn remove(&self, pane_uuid: uuid::Uuid) {
+        self.hubs.write().await.remove(&pane_uuid);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Supervisor implementation of PyreDaemon
 // ---------------------------------------------------------------------------
 
@@ -232,6 +281,8 @@ pub struct SupervisorImpl {
     /// Per-session oneshot channels awaited by `spawn` until `register_worker` fires.
     /// Key: session_id string. Entry removed once fired or timed out.
     pub pending_registrations: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
+    /// Per-pane broadcast hubs: one worker connection shared by N TUI clients.
+    pub mirror_registry: PaneMirrorRegistry,
 }
 
 impl SupervisorImpl {
@@ -947,6 +998,7 @@ pub async fn run(
 
     let (event_tx, event_rx) = mpsc::channel::<BlockEvent>(4096);
     let registry = Arc::new(WorkerRegistry::new());
+    let mirror_registry = PaneMirrorRegistry::new();
 
     let pending_registrations: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>> =
         Arc::new(Mutex::new(HashMap::new()));
@@ -958,6 +1010,7 @@ pub async fn run(
         event_tx: event_tx.clone(),
         supervisor_sock: supervisor_sock.clone(),
         pending_registrations: pending_registrations.clone(),
+        mirror_registry: mirror_registry.clone(),
     };
 
     // Bind the supervisor callback socket (workers dial here to register).
@@ -1057,21 +1110,26 @@ pub async fn run(
     Ok(())
 }
 
-/// Proxy a MODE_STREAM connection from a client to the appropriate worker's
-/// stream UDS.
+/// Proxy a MODE_STREAM connection from a TUI client to the appropriate pane.
 ///
-/// Wire format after the MODE_STREAM tag byte (written by the caller before
-/// calling this function):
+/// Wire format after the MODE_STREAM tag byte:
 ///   16 bytes — SessionId (UUID bytes)
 ///   16 bytes — PaneId   (UUID bytes)
 ///
-/// The same 32 bytes are forwarded verbatim to the worker so it can identify
-/// which PTY to wire up.  After the handshake the supervisor runs a
-/// bidirectional copy loop until either side closes.
+/// Multi-client architecture:
+///   * A `PaneMirrorHub` is created (or reused) per pane, holding a single
+///     connection to the worker's stream UDS.
+///   * Output from the worker is broadcast to all subscribed TUI clients.
+///   * Input from each TUI client is forwarded to a shared `mpsc` channel
+///     whose single drainer writes to the worker in order, preventing
+///     keystroke interleaving across concurrent clients.
 async fn proxy_stream_to_worker(
     mut client_sock: UnixStream,
     registry: Arc<WorkerRegistry>,
+    mirror_registry: PaneMirrorRegistry,
 ) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+
     // Read session id (16 bytes) + pane id (16 bytes) from the client.
     let mut session_buf = [0u8; 16];
     client_sock
@@ -1085,6 +1143,17 @@ async fn proxy_stream_to_worker(
         .read_exact(&mut pane_buf)
         .await
         .context("read pane id")?;
+    let pane_uuid = uuid::Uuid::from_bytes(pane_buf);
+
+    // Resolve slot_idx before potentially creating the hub.
+    let slot_idx = match registry.lookup_pane(pane_uuid).await {
+        Some((_, s)) => s,
+        None => {
+            tracing::warn!(%pane_uuid, "MODE_STREAM: unknown pane uuid");
+            let _ = client_sock.shutdown().await;
+            return Ok(());
+        }
+    };
 
     // Look up the worker's stream socket path.
     let stream_sock_path = match registry.get_stream_sock(&session_id).await {
@@ -1096,34 +1165,153 @@ async fn proxy_stream_to_worker(
         }
     };
 
-    // Connect to worker stream UDS.
-    let mut worker_sock = UnixStream::connect(&stream_sock_path)
-        .await
-        .with_context(|| format!("connect worker stream sock {}", stream_sock_path.display()))?;
+    // Resolve or create the PaneMirrorHub for this pane.
+    let hub: Arc<PaneMirrorHub> = if let Some(existing) = mirror_registry.get(pane_uuid).await {
+        existing
+    } else {
+        // First client for this pane — open a single worker connection and start
+        // the background output-reader + input-drainer tasks.
+        let mut worker_sock = match UnixStream::connect(&stream_sock_path).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(%pane_uuid, "MODE_STREAM: connect worker stream sock: {e}");
+                let _ = client_sock.shutdown().await;
+                return Ok(());
+            }
+        };
+        worker_sock
+            .write_all(&slot_idx.to_le_bytes())
+            .await
+            .context("write slot_idx to worker")?;
 
-    // Resolve pane UUID → slot_idx using the PaneIndex, then forward just the
-    // 4-byte slot_idx (u32 LE) to the worker.  The worker does not keep a
-    // UUID→slot map, so we resolve here where the mapping is authoritative.
-    let pane_uuid = uuid::Uuid::from_bytes(pane_buf);
-    let slot_idx = match registry.lookup_pane(pane_uuid).await {
-        Some((_, s)) => s,
-        None => {
-            tracing::warn!(%pane_uuid, "MODE_STREAM: unknown pane uuid");
-            let _ = client_sock.shutdown().await;
+        // Output broadcast channel: capacity 256 (matches worker's broadcast cap).
+        let (out_tx, _) = broadcast::channel::<Bytes>(256);
+        // Input serialisation channel.
+        let (in_tx, mut in_rx) = mpsc::channel::<Bytes>(256);
+
+        let hub = Arc::new(PaneMirrorHub {
+            output_tx: out_tx.clone(),
+            input_tx: in_tx,
+        });
+        mirror_registry.insert(pane_uuid, hub.clone()).await;
+
+        let (worker_rd, worker_wr) = worker_sock.into_split();
+        let frame_read = FramedRead::new(worker_rd, LengthDelimitedCodec::new());
+        let frame_write = FramedWrite::new(worker_wr, LengthDelimitedCodec::new());
+        let mut worker_out: tokio_serde::SymmetricallyFramed<_, OutputFrame, _> =
+            tokio_serde::SymmetricallyFramed::new(frame_read, SymmetricalBincode::default());
+        let mut worker_in: tokio_serde::SymmetricallyFramed<_, InputFrame, _> =
+            tokio_serde::SymmetricallyFramed::new(frame_write, SymmetricalBincode::default());
+
+        // Worker → broadcast: read OutputFrames from worker, fan out raw bytes.
+        let mirror_reg_cleanup = mirror_registry.clone();
+        tokio::spawn(async move {
+            while let Some(frame) = worker_out.next().await {
+                match frame {
+                    Ok(f) => {
+                        // Ignore send errors — all subscribers may have disconnected
+                        // temporarily but the hub stays alive.
+                        let _ = out_tx.send(f.data);
+                    }
+                    Err(e) => {
+                        tracing::debug!(%pane_uuid, "worker output stream ended: {e}");
+                        break;
+                    }
+                }
+            }
+            // Worker closed — remove the hub so the next client gets a fresh one.
+            mirror_reg_cleanup.remove(pane_uuid).await;
+            tracing::debug!(%pane_uuid, "mirror hub removed (worker disconnected)");
+        });
+
+        // Input serialiser: drain the shared mpsc channel, write InputFrames to worker.
+        let session_uuid = match uuid::Uuid::parse_str(&session_id) {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::warn!("MODE_STREAM: invalid session uuid: {e}");
+                return Ok(());
+            }
+        };
+        let session = SessionId(session_uuid);
+        tokio::spawn(async move {
+            while let Some(data) = in_rx.recv().await {
+                if worker_in
+                    .send(InputFrame { session, data })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        hub
+    };
+
+    // Subscribe this TUI client to the pane's output broadcast.
+    let mut out_sub = hub.output_tx.subscribe();
+    let input_tx = hub.input_tx.clone();
+
+    // Split the client socket into framed halves.
+    let (client_rd, client_wr) = client_sock.into_split();
+    let frame_read = FramedRead::new(client_rd, LengthDelimitedCodec::new());
+    let frame_write = FramedWrite::new(client_wr, LengthDelimitedCodec::new());
+    let mut client_in: tokio_serde::SymmetricallyFramed<_, InputFrame, _> =
+        tokio_serde::SymmetricallyFramed::new(frame_read, SymmetricalBincode::default());
+    let mut client_out: tokio_serde::SymmetricallyFramed<_, OutputFrame, _> =
+        tokio_serde::SymmetricallyFramed::new(frame_write, SymmetricalBincode::default());
+
+    // Resolve a SessionId for wrapping OutputFrames sent to this client.
+    let session_uuid = match uuid::Uuid::parse_str(&session_id) {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::warn!("MODE_STREAM: invalid session uuid in client path: {e}");
             return Ok(());
         }
     };
-    use tokio::io::AsyncWriteExt;
-    worker_sock
-        .write_all(&slot_idx.to_le_bytes())
-        .await
-        .context("write slot_idx to worker")?;
+    let session = SessionId(session_uuid);
 
-    // Bidirectional proxy: client ↔ worker.
-    tokio::io::copy_bidirectional(&mut client_sock, &mut worker_sock)
-        .await
-        .context("bidirectional proxy")?;
+    // Client output task: broadcast → this client's socket.
+    let out_task = tokio::spawn(async move {
+        let mut seq: u64 = 0;
+        loop {
+            match out_sub.recv().await {
+                Ok(data) => {
+                    seq = seq.wrapping_add(1);
+                    if client_out
+                        .send(OutputFrame { session, seq, data })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(%pane_uuid, n, "client output broadcast lagged");
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
 
+    // Client input task: this client's socket → shared serialised mpsc channel.
+    let in_task = tokio::spawn(async move {
+        while let Some(frame) = client_in.next().await {
+            match frame {
+                Ok(f) => {
+                    if input_tx.send(f.data).await.is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(%pane_uuid, "client input frame error: {e}");
+                    break;
+                }
+            }
+        }
+    });
+
+    let _ = tokio::join!(out_task, in_task);
     Ok(())
 }
 
@@ -1153,7 +1341,10 @@ async fn handle_public_conn(
                 .await;
             Ok(())
         }
-        MODE_STREAM => proxy_stream_to_worker(sock, supervisor_impl.registry).await,
+        MODE_STREAM => {
+            proxy_stream_to_worker(sock, supervisor_impl.registry, supervisor_impl.mirror_registry)
+                .await
+        }
         other => anyhow::bail!("unknown mode tag {other:#04x}"),
     }
 }
