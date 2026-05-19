@@ -6,7 +6,8 @@
 //!
 //! Two-phase animation:
 //!   Phase A — Eruption (frames 0..PHASE_A_END): bottom seeded MAX_HEAT,
-//!             double propagation pass per frame so fire reaches full height fast.
+//!             adaptive propagation passes per frame so fire reaches full height
+//!             regardless of terminal size.
 //!   Phase B — Launch & consume (frames PHASE_A_END..FRAMES_TOTAL): seeding
 //!             stops; each frame translates the buffer upward by 1 row then
 //!             applies cooling propagation, making the bottom clear as the body
@@ -24,10 +25,12 @@ use std::time::Duration;
 
 // ─── Palette ──────────────────────────────────────────────────────────────────
 //
-// Literal DOOM fire palette, 37 entries (indices 0-36).
-// Index 0 = black (cold), index 36 = white-hot.
+// Extended DOOM fire palette: 49 entries (indices 0-48).
+// Index 0 = black (cold), index 48 = white-hot.
+// Entries 0-36 match the canonical DOOM palette; 37-48 extend into
+// orange-white for the higher MAX_HEAT headroom.
 
-const PALETTE: [(u8, u8, u8); 37] = [
+const PALETTE: [(u8, u8, u8); 49] = [
     (0, 0, 0),
     (7, 7, 7),
     (31, 7, 7),
@@ -65,17 +68,31 @@ const PALETTE: [(u8, u8, u8); 37] = [
     (207, 207, 111),
     (223, 223, 159),
     (239, 239, 199),
+    // Extended entries 37-48: orange-white headroom for MAX_HEAT=48
+    (239, 239, 215),
+    (239, 239, 223),
+    (239, 243, 227),
+    (243, 243, 231),
+    (243, 243, 235),
+    (245, 245, 237),
+    (247, 247, 239),
+    (249, 249, 241),
+    (251, 251, 245),
+    (253, 253, 249),
+    (255, 255, 253),
+    (255, 255, 255),
 ];
 
-const MAX_HEAT: u8 = 36;
+/// Maximum heat value. Extended to 48 so the flame retains a visible glow
+/// (dark red) even at the very top of a 60-row terminal during peak Phase A.
+const MAX_HEAT: u8 = 48;
 
 // ─── Timing & phase constants ─────────────────────────────────────────────────
 
-/// Frame interval in milliseconds (~100 fps).
+/// Frame interval (~111 fps).
 const FRAME_DELAY: Duration = Duration::from_millis(9);
 
-/// Last frame of Phase A (eruption). By this frame the flame should fill ~100%
-/// of screen height. Range [0, PHASE_A_END).
+/// Last frame of Phase A (eruption). Range [0, PHASE_A_END).
 const PHASE_A_END: usize = 14;
 
 /// Total frames in the animation. Phase B runs [PHASE_A_END, FRAMES_TOTAL).
@@ -113,6 +130,84 @@ impl Rng {
     }
 }
 
+// ─── Coherent wind field ──────────────────────────────────────────────────────
+
+/// Returns a horizontal wind offset for position (x, y) at the given frame.
+///
+/// Sums three sines with non-rational frequency ratios so the pattern never
+/// repeats and has no bilateral symmetry. Nearby cells receive similar values
+/// producing coherent swirls and asymmetric flame tongues.
+///
+/// Output range: approximately -5..+5 columns.
+#[inline]
+fn wind_at(x: usize, y: usize, frame: usize, cols: usize) -> i32 {
+    let xn = x as f32 / cols.max(1) as f32;
+    let yn = y as f32 / 80.0;
+    let t = frame as f32 / 22.0;
+    let w1 = (xn * 3.0 + t).sin();
+    let w2 = (xn * 7.3 + yn * 4.1 - t * 0.7).sin() * 0.7;
+    let w3 = (xn * 13.7 - yn * 2.7 + t * 1.3).sin() * 0.4;
+    ((w1 + w2 + w3) * 2.8).round() as i32
+}
+
+// ─── Per-column updraft field ─────────────────────────────────────────────────
+
+/// Precomputed per-column updraft bias (range -2..+2).
+///
+/// High-updraft columns cool less so heat climbs further there,
+/// producing vertical asymmetry: some columns tower above their neighbours.
+fn updraft_field(cols: usize) -> Vec<i32> {
+    (0..cols)
+        .map(|x| {
+            let xn = x as f32 / cols.max(1) as f32;
+            let u = (xn * 5.7).sin() * 1.5 + (xn * 11.3 + 1.7).sin() * 1.0;
+            u.round() as i32
+        })
+        .collect()
+}
+
+// ─── Propagation helper ───────────────────────────────────────────────────────
+
+/// One full upward-propagation pass over the heat buffer.
+///
+/// Uses a coherent 2D wind field (`wind_at`) instead of per-cell random jitter
+/// so nearby cells see similar horizontal offsets, producing visible swirls.
+/// `cooling_base` adds extra cooling on top of the per-cell random amount
+/// (used in Phase B to accelerate dissipation as the body rises).
+fn propagate(
+    heat: &mut [u8],
+    cols: usize,
+    heat_rows: usize,
+    rng: &mut Rng,
+    frame: usize,
+    cooling_base: u8,
+    updraft: &[i32],
+) {
+    for y in 0..heat_rows.saturating_sub(1) {
+        for x in 0..cols {
+            // Coherent horizontal offset from wind field.
+            let src_x = (x as i32 + wind_at(x, y, frame, cols))
+                .clamp(0, cols as i32 - 1) as usize;
+
+            // Vertical spike: ~12% chance to pull from y+2 instead of y+1.
+            let src_y = if y + 2 < heat_rows && rng.range(8) == 0 {
+                y + 2
+            } else {
+                y + 1
+            };
+
+            // Per-column updraft reduces effective cooling: high-updraft
+            // columns let heat climb further than their neighbours.
+            let cooling_adj = (cooling_base as i32 - updraft[x]).max(0) as u8;
+            let per_cell_cooling = rng.range(cooling_adj as u32 + 1) as u8;
+            let total_cooling = per_cell_cooling.saturating_add(cooling_base);
+
+            let src_heat = heat[src_y * cols + src_x];
+            heat[y * cols + x] = src_heat.saturating_sub(total_cooling);
+        }
+    }
+}
+
 // ─── Public entry point ───────────────────────────────────────────────────────
 
 /// Play the DOOM-fire splash animation.
@@ -132,44 +227,6 @@ pub fn play_splash(no_splash: bool) {
     let _ = run_fire();
 }
 
-// ─── Propagation helper ───────────────────────────────────────────────────────
-
-/// One full upward-propagation pass over the heat buffer.
-///
-/// Wind jitter is ±2 cols (wider than original ±1 for turbulence).
-/// Occasionally propagates from y+2 instead of y+1 for vertical spikes.
-/// `wind_bias` shifts the horizontal jitter left or right each call.
-/// `cooling_base` adds extra cooling on top of the per-cell random amount
-/// (used in Phase B to accelerate dissipation as the body rises).
-fn propagate(
-    heat: &mut [u8],
-    cols: usize,
-    heat_rows: usize,
-    rng: &mut Rng,
-    wind_bias: i32,
-    cooling_base: u8,
-) {
-    for y in 0..heat_rows.saturating_sub(1) {
-        for x in 0..cols {
-            // Horizontal jitter: ±2 + wind bias for extra turbulence.
-            let jitter = rng.range(5) as i32 - 2 + wind_bias;
-            let src_x = (x as i32 + jitter).clamp(0, cols as i32 - 1) as usize;
-
-            // Vertical spike: ~12% chance to pull from y+2 instead of y+1.
-            let src_y = if y + 2 < heat_rows && rng.range(8) == 0 {
-                y + 2
-            } else {
-                y + 1
-            };
-
-            let per_cell_cooling = rng.range(3) as u8; // 0-2
-            let total_cooling = per_cell_cooling.saturating_add(cooling_base);
-            let src_heat = heat[src_y * cols + src_x];
-            heat[y * cols + x] = src_heat.saturating_sub(total_cooling);
-        }
-    }
-}
-
 // ─── Core fire loop ───────────────────────────────────────────────────────────
 
 fn run_fire() -> io::Result<()> {
@@ -184,9 +241,20 @@ fn run_fire() -> io::Result<()> {
     // Each terminal row = 2 heat rows (half-block rendering doubles resolution).
     let heat_rows = term_rows as usize * 2;
 
+    // Adaptive passes per Phase A frame: must cover the full heat_rows height
+    // within PHASE_A_END frames. For 60-row terminal (120 heat_rows):
+    //   ceil(120 / 14) = 9 passes/frame × 14 frames = 126 steps → tops out.
+    // For 24-row terminal (48 heat_rows): 4 passes.
+    // For 120-row terminal (240 heat_rows): clamped at 16.
+    let passes_per_frame_a =
+        ((heat_rows as f32 / PHASE_A_END as f32).ceil() as usize).clamp(2, 16);
+
     // Heat buffer: row-major, index = y * cols + x.
     // y=0 is top (cold), y=heat_rows-1 is bottom (seed row).
     let mut heat = vec![0u8; cols * heat_rows];
+
+    // Precompute updraft field (static across all frames).
+    let updraft = updraft_field(cols);
 
     let mut rng = Rng::new();
 
@@ -195,28 +263,31 @@ fn run_fire() -> io::Result<()> {
     out.flush()?;
 
     for frame in 0..FRAMES_TOTAL {
-        // Wind direction flips every 8 frames (was 15) — more chaotic gusts.
-        let wind_bias: i32 = if (frame / 8) % 2 == 0 { 1 } else { -1 };
-
         if frame < PHASE_A_END {
             // ── Phase A: Eruption ───────────────────────────────────────────
-            // Seed the bottom 2 rows at MAX_HEAT with flicker.
-            let bottom1 = heat_rows - 1;
-            let bottom2 = heat_rows.saturating_sub(2);
+            // Asymmetric bottom seed: hot spots drift across the base over time
+            // so different parts of the flame are stronger at different moments.
+            let bottom = heat_rows - 1;
+            let t = frame as f32 / 18.0;
             for x in 0..cols {
-                let flicker = rng.range(3) as u8; // 0-2
-                let val = MAX_HEAT.saturating_sub(flicker.saturating_sub(1));
-                heat[bottom1 * cols + x] = val;
-                heat[bottom2 * cols + x] = val;
+                let xn = x as f32 / cols.max(1) as f32;
+                let bias = ((xn * 4.0 + t).sin() * 0.5 + 0.5) * 6.0; // 0..6
+                let v = MAX_HEAT.saturating_sub(rng.range(3) as u8 + bias as u8);
+                heat[bottom * cols + x] = v;
+                if bottom >= 1 {
+                    heat[(bottom - 1) * cols + x] =
+                        v.saturating_sub(rng.range(2) as u8);
+                }
             }
 
-            // Double propagation pass: heat reaches top in ~14 frames instead of ~30.
-            propagate(&mut heat, cols, heat_rows, &mut rng, wind_bias, 0);
-            propagate(&mut heat, cols, heat_rows, &mut rng, wind_bias, 0);
+            // Adaptive propagation passes: flame reaches top in PHASE_A_END frames
+            // regardless of terminal height.
+            for _ in 0..passes_per_frame_a {
+                propagate(&mut heat, cols, heat_rows, &mut rng, frame, 0, &updraft);
+            }
         } else {
             // ── Phase B: Launch & consume ───────────────────────────────────
             // 1. Translate buffer upward by 1 row.
-            //    heat[y] = heat[y+1] for y in 0..total_pixels-1; new bottom = 0.
             heat.copy_within(cols.., 0);
             // Zero the new bottom row (position heat_rows-1).
             let bottom_start = (heat_rows - 1) * cols;
@@ -229,7 +300,15 @@ fn run_fire() -> io::Result<()> {
             let phase_b_len = FRAMES_TOTAL - PHASE_A_END;
             let phase_b_frame = frame - PHASE_A_END;
             let cooling_base = (phase_b_frame * 3 / phase_b_len) as u8;
-            propagate(&mut heat, cols, heat_rows, &mut rng, wind_bias, cooling_base);
+            propagate(
+                &mut heat,
+                cols,
+                heat_rows,
+                &mut rng,
+                frame,
+                cooling_base,
+                &updraft,
+            );
         }
 
         // ── Render frame into a single output buffer ─────────────────────────
