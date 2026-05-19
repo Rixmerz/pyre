@@ -34,7 +34,7 @@ use tarpc::tokio_serde::formats::Bincode;
 use tarpc::{client, context};
 use tokio::io::AsyncReadExt;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 use crate::index::BlockIndex;
@@ -76,6 +76,14 @@ impl PaneIndex {
         self.pane_to_slot
             .get(&pane_id)
             .map(|(s, i)| (s.as_str(), *i))
+    }
+
+    /// Reverse lookup: given (session_id, slot_idx) return the stable PaneId.
+    fn pane_id_by_slot(&self, session_id: &str, slot_idx: u32) -> Option<uuid::Uuid> {
+        self.pane_to_slot
+            .iter()
+            .find(|(_, (sid, s))| sid.as_str() == session_id && *s == slot_idx)
+            .map(|(pane_id, _)| *pane_id)
     }
 
     fn next_slot(&mut self, session_id: &str) -> u32 {
@@ -127,6 +135,24 @@ impl WorkerRegistry {
         let pane_id = uuid::Uuid::new_v4();
         panes.register(pane_id, session_id.to_owned(), slot_idx);
         (pane_id, slot_idx)
+    }
+
+    /// Return the stable PaneId for (session_id, slot_idx), allocating a new one
+    /// if the slot was opened directly by the worker without going through the supervisor.
+    pub async fn get_or_alloc_pane_by_slot(&self, session_id: &str, slot_idx: u32) -> uuid::Uuid {
+        {
+            let panes = self.panes.read().await;
+            if let Some(pane_id) = panes.pane_id_by_slot(session_id, slot_idx) {
+                return pane_id;
+            }
+        }
+        // Slot not tracked yet — register a stable mapping now.
+        let pane_id = uuid::Uuid::new_v4();
+        self.panes
+            .write()
+            .await
+            .register(pane_id, session_id.to_owned(), slot_idx);
+        pane_id
     }
 
     /// Look up (session_id_str, slot_idx) for a PaneId.
@@ -192,6 +218,9 @@ pub struct SupervisorImpl {
     pub event_tx: mpsc::Sender<BlockEvent>,
     /// Path to the supervisor's callback socket, passed to spawned workers.
     pub supervisor_sock: PathBuf,
+    /// Per-session oneshot channels awaited by `spawn` until `register_worker` fires.
+    /// Key: session_id string. Entry removed once fired or timed out.
+    pub pending_registrations: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
 }
 
 impl SupervisorImpl {
@@ -236,13 +265,51 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
             tracing::warn!("upsert_session {session_id_str}: {e:#}");
         }
 
-        self.spawn_worker(&session_id_str)
-            .await
-            .map_err(|e| PyreError::SpawnFailed(e.to_string()))?;
-
-        // Register the initial pane in PaneIndex BEFORE returning the PaneId
-        // so that any follow-up RPC (e.g. close_pane) can resolve it immediately.
+        // Register the initial pane in PaneIndex BEFORE spawning so that any
+        // follow-up RPC (e.g. close_pane) can resolve the PaneId immediately.
         let (pane_uuid, _slot_idx) = self.registry.alloc_pane(&session_id_str).await;
+
+        // Insert a oneshot BEFORE spawning so register_worker can never race
+        // against us — it always finds the sender in the map.
+        let (reg_tx, reg_rx) = oneshot::channel::<()>();
+        self.pending_registrations
+            .lock()
+            .await
+            .insert(session_id_str.clone(), reg_tx);
+
+        self.spawn_worker(&session_id_str).await.map_err(|e| {
+            // Clean up the pending entry so it doesn't leak.
+            let pend = self.pending_registrations.clone();
+            let sid_str = session_id_str.clone();
+            tokio::spawn(async move {
+                pend.lock().await.remove(&sid_str);
+            });
+            PyreError::SpawnFailed(e.to_string())
+        })?;
+
+        // Await worker registration with a 5 s timeout.
+        match tokio::time::timeout(Duration::from_secs(5), reg_rx).await {
+            Ok(Ok(())) => {
+                tracing::debug!(session_id = session_id_str, "worker registration confirmed");
+            }
+            Ok(Err(_)) => {
+                // Sender was dropped — treat as failure.
+                return Err(PyreError::SpawnFailed(
+                    "worker registration channel closed".into(),
+                ));
+            }
+            Err(_) => {
+                // Timeout — clean up and return error.
+                self.pending_registrations
+                    .lock()
+                    .await
+                    .remove(&session_id_str);
+                return Err(PyreError::SpawnFailed(format!(
+                    "worker for session {session_id_str} did not register within 5 s"
+                )));
+            }
+        }
+
         let pane_id = PaneId(pane_uuid);
         Ok(SpawnResp {
             session: sid,
@@ -370,28 +437,24 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
             .map_err(|e| PyreError::Io(e.to_string()))?
             .map_err(|e| PyreError::Io(e.to_string()))?;
         let now = Utc::now();
-        let panes = slots
-            .into_iter()
-            .map(|slot_idx| {
-                // Look up the PaneId we assigned; fall back to a fresh UUID if
-                // the entry was somehow evicted.
-                let pane_id = PaneId(uuid::Uuid::new_v4());
-                PaneInfo {
-                    id: pane_id,
-                    session,
-                    cols: 80,
-                    rows: 24,
-                    shell: String::new(),
-                    created_at: now,
-                    closed_at: None,
-                    state: pyre_proto::PaneStateKind::Running,
-                    state_reason: format!("slot {slot_idx}"),
-                    last_activity: now,
-                    foreground_cmd: None,
-                    root_pid: 0,
-                }
-            })
-            .collect();
+        let mut panes = Vec::with_capacity(slots.len());
+        for slot_idx in slots {
+            let pane_uuid = self.registry.get_or_alloc_pane_by_slot(&id, slot_idx).await;
+            panes.push(PaneInfo {
+                id: PaneId(pane_uuid),
+                session,
+                cols: 80,
+                rows: 24,
+                shell: String::new(),
+                created_at: now,
+                closed_at: None,
+                state: pyre_proto::PaneStateKind::Running,
+                state_reason: format!("slot {slot_idx}"),
+                last_activity: now,
+                foreground_cmd: None,
+                root_pid: 0,
+            });
+        }
         Ok(panes)
     }
 
@@ -535,8 +598,12 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
                 _ => continue,
             };
             for slot_idx in slots {
+                let pane_uuid = self
+                    .registry
+                    .get_or_alloc_pane_by_slot(session_id_str, slot_idx)
+                    .await;
                 all.push(PaneInfo {
-                    id: PaneId(uuid::Uuid::new_v4()),
+                    id: PaneId(pane_uuid),
                     session: sid,
                     cols: 80,
                     rows: 24,
@@ -630,6 +697,7 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
 struct SupervisorWorkerImpl {
     registry: Arc<WorkerRegistry>,
     event_tx: mpsc::Sender<BlockEvent>,
+    pending_registrations: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
 }
 
 impl SupervisorWorker for SupervisorWorkerImpl {
@@ -655,6 +723,11 @@ impl SupervisorWorker for SupervisorWorkerImpl {
         };
         self.registry.insert(session_id.clone(), handle).await;
         tracing::info!(session_id, pid, "worker handle stored");
+
+        // Unblock any spawn() RPC that is waiting for this worker to register.
+        if let Some(tx) = self.pending_registrations.lock().await.remove(&session_id) {
+            let _ = tx.send(());
+        }
 
         Ok(RegisterAck {
             aggregated_index_ready: true,
@@ -828,12 +901,16 @@ pub async fn run(
     let (event_tx, event_rx) = mpsc::channel::<BlockEvent>(4096);
     let registry = Arc::new(WorkerRegistry::new());
 
+    let pending_registrations: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
     let supervisor_impl = SupervisorImpl {
         registry: registry.clone(),
         store: store.clone(),
         block_index: block_index.clone(),
         event_tx: event_tx.clone(),
         supervisor_sock: supervisor_sock.clone(),
+        pending_registrations: pending_registrations.clone(),
     };
 
     // Bind the supervisor callback socket (workers dial here to register).
@@ -853,6 +930,7 @@ pub async fn run(
     {
         let sw_registry = registry.clone();
         let sw_event_tx = event_tx.clone();
+        let sw_pending = pending_registrations.clone();
         tokio::spawn(async move {
             loop {
                 match sw_listener.accept().await {
@@ -860,6 +938,7 @@ pub async fn run(
                         let sw_impl = SupervisorWorkerImpl {
                             registry: sw_registry.clone(),
                             event_tx: sw_event_tx.clone(),
+                            pending_registrations: sw_pending.clone(),
                         };
                         let transport = tarpc::serde_transport::new(
                             Framed::new(sock, LengthDelimitedCodec::new()),
