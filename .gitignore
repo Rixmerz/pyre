@@ -8,3 +8,6 @@ target/
 .jig/
 .mcp-docs/
 .sca/
+
+# compiled test artifacts
+a.out
