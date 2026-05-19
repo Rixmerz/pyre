@@ -51,6 +51,8 @@ pub struct WorkerHandle {
     /// Path to the worker's `WorkerControl` UDS (used for reconnect in S2).
     #[allow(dead_code)]
     pub sock_path: PathBuf,
+    /// Path to the worker's raw-stream UDS for bidirectional PTY byte proxying.
+    pub stream_sock: PathBuf,
     /// tarpc client connected to the worker's `WorkerControl` UDS.
     pub ctrl_client: WorkerControlClient,
     /// Last time a heartbeat was received from this worker.
@@ -162,6 +164,15 @@ impl WorkerRegistry {
             .await
             .lookup(pane_id)
             .map(|(s, i)| (s.to_owned(), i))
+    }
+
+    /// Return the stream UDS path for a session.
+    pub async fn get_stream_sock(&self, session_id: &str) -> Option<PathBuf> {
+        self.inner
+            .read()
+            .await
+            .get(session_id)
+            .map(|h| h.stream_sock.clone())
     }
 
     /// Get the WorkerControlClient for a session (read-only borrow scope).
@@ -707,8 +718,15 @@ impl SupervisorWorker for SupervisorWorkerImpl {
         session_id: String,
         pid: u32,
         sock_path: String,
+        stream_sock_path: String,
     ) -> Result<RegisterAck, RpcError> {
-        tracing::info!(session_id, pid, sock_path, "worker registered");
+        tracing::info!(
+            session_id,
+            pid,
+            sock_path,
+            stream_sock_path,
+            "worker registered"
+        );
 
         let worker_sock = PathBuf::from(&sock_path);
         let ctrl_client = connect_worker_ctrl(&worker_sock)
@@ -718,6 +736,7 @@ impl SupervisorWorker for SupervisorWorkerImpl {
         let handle = WorkerHandle {
             pid,
             sock_path: worker_sock,
+            stream_sock: PathBuf::from(&stream_sock_path),
             ctrl_client,
             last_heartbeat: Instant::now(),
         };
@@ -1010,6 +1029,76 @@ pub async fn run(
     Ok(())
 }
 
+/// Proxy a MODE_STREAM connection from a client to the appropriate worker's
+/// stream UDS.
+///
+/// Wire format after the MODE_STREAM tag byte (written by the caller before
+/// calling this function):
+///   16 bytes — SessionId (UUID bytes)
+///   16 bytes — PaneId   (UUID bytes)
+///
+/// The same 32 bytes are forwarded verbatim to the worker so it can identify
+/// which PTY to wire up.  After the handshake the supervisor runs a
+/// bidirectional copy loop until either side closes.
+async fn proxy_stream_to_worker(
+    mut client_sock: UnixStream,
+    registry: Arc<WorkerRegistry>,
+) -> Result<()> {
+    // Read session id (16 bytes) + pane id (16 bytes) from the client.
+    let mut session_buf = [0u8; 16];
+    client_sock
+        .read_exact(&mut session_buf)
+        .await
+        .context("read session id")?;
+    let session_id = uuid::Uuid::from_bytes(session_buf).to_string();
+
+    let mut pane_buf = [0u8; 16];
+    client_sock
+        .read_exact(&mut pane_buf)
+        .await
+        .context("read pane id")?;
+
+    // Look up the worker's stream socket path.
+    let stream_sock_path = match registry.get_stream_sock(&session_id).await {
+        Some(p) => p,
+        None => {
+            tracing::warn!(session_id, "MODE_STREAM: no worker registered for session");
+            let _ = client_sock.shutdown().await;
+            return Ok(());
+        }
+    };
+
+    // Connect to worker stream UDS.
+    let mut worker_sock = UnixStream::connect(&stream_sock_path)
+        .await
+        .with_context(|| format!("connect worker stream sock {}", stream_sock_path.display()))?;
+
+    // Resolve pane UUID → slot_idx using the PaneIndex, then forward just the
+    // 4-byte slot_idx (u32 LE) to the worker.  The worker does not keep a
+    // UUID→slot map, so we resolve here where the mapping is authoritative.
+    let pane_uuid = uuid::Uuid::from_bytes(pane_buf);
+    let slot_idx = match registry.lookup_pane(pane_uuid).await {
+        Some((_, s)) => s,
+        None => {
+            tracing::warn!(%pane_uuid, "MODE_STREAM: unknown pane uuid");
+            let _ = client_sock.shutdown().await;
+            return Ok(());
+        }
+    };
+    use tokio::io::AsyncWriteExt;
+    worker_sock
+        .write_all(&slot_idx.to_le_bytes())
+        .await
+        .context("write slot_idx to worker")?;
+
+    // Bidirectional proxy: client ↔ worker.
+    tokio::io::copy_bidirectional(&mut client_sock, &mut worker_sock)
+        .await
+        .context("bidirectional proxy")?;
+
+    Ok(())
+}
+
 async fn handle_public_conn(
     sock: UnixStream,
     supervisor_impl: SupervisorImpl,
@@ -1036,11 +1125,7 @@ async fn handle_public_conn(
                 .await;
             Ok(())
         }
-        MODE_STREAM => {
-            // TODO(S2): proxy stream connections to the appropriate worker.
-            tracing::warn!("hybrid stream connections not yet implemented");
-            Ok(())
-        }
+        MODE_STREAM => proxy_stream_to_worker(sock, supervisor_impl.registry).await,
         other => anyhow::bail!("unknown mode tag {other:#04x}"),
     }
 }

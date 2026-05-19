@@ -82,13 +82,16 @@ pub enum RpcError {
 pub trait SupervisorWorker {
     /// Announce a new worker process to the supervisor.
     ///
-    /// `session_id` — UUID string of the session this worker owns.
-    /// `pid`        — OS PID of the worker process.
-    /// `sock_path`  — Absolute path to the worker's own `WorkerControl` UDS.
+    /// `session_id`       — UUID string of the session this worker owns.
+    /// `pid`              — OS PID of the worker process.
+    /// `sock_path`        — Absolute path to the worker's own `WorkerControl` UDS.
+    /// `stream_sock_path` — Absolute path to the worker's raw-stream UDS for
+    ///                      bidirectional PTY byte proxying.
     async fn register_worker(
         session_id: String,
         pid: u32,
         sock_path: String,
+        stream_sock_path: String,
     ) -> Result<RegisterAck, RpcError>;
 
     /// Deliver a single output event to the supervisor (fire-and-forget style).

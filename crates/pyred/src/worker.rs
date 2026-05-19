@@ -30,6 +30,7 @@ use pyre_proto::supervisor::{
 use tarpc::server::{BaseChannel, Channel};
 use tarpc::tokio_serde::formats::Bincode;
 use tarpc::{client, context};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
@@ -504,6 +505,100 @@ fn write_all_bytes(w: &mut dyn std::io::Write, buf: &[u8]) -> std::io::Result<()
 }
 
 // ---------------------------------------------------------------------------
+// Stream connection handler (raw PTY byte proxy)
+// ---------------------------------------------------------------------------
+
+/// Handle a single inbound stream connection on the worker's stream UDS.
+///
+/// Wire format (written by the supervisor proxy, matching single-mode):
+///   16 bytes — SessionId (UUID bytes, validated but not further used)
+///   16 bytes — PaneId   (UUID bytes)
+///
+/// After reading the header the connection becomes a raw bidirectional pipe
+/// between the client and the PTY master for the identified pane.
+async fn handle_stream_conn(mut sock: UnixStream, state: Arc<WorkerState>) {
+    // Read slot_idx (4 bytes, u32 LE) — resolved by supervisor before forwarding.
+    let mut slot_buf = [0u8; 4];
+    if sock.read_exact(&mut slot_buf).await.is_err() {
+        return;
+    }
+    let slot_idx = u32::from_le_bytes(slot_buf);
+
+    // Snapshot ring buffer and send as initial burst, then run bidi copy.
+    // We grab the input_tx and set up a dedicated reader via try_clone_reader.
+    let (input_tx, mut reader) = {
+        let panes = state.panes.read().await;
+        let handle = match panes.get(&slot_idx) {
+            Some(h) => h,
+            None => {
+                tracing::warn!(slot_idx, "stream conn: pane not found");
+                let _ = sock.shutdown().await;
+                return;
+            }
+        };
+
+        // Send ring buffer snapshot first.
+        let snap = handle.ring_buf.lock().await.snapshot().to_vec();
+
+        let reader = match handle.master.lock().await.try_clone_reader() {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(slot_idx, "stream conn: clone_reader failed: {e}");
+                let _ = sock.shutdown().await;
+                return;
+            }
+        };
+
+        // Write snapshot directly to socket before entering bidi loop.
+        if !snap.is_empty() && sock.write_all(&snap).await.is_err() {
+            return;
+        }
+
+        (handle.input_tx.clone(), reader)
+    };
+
+    // Split socket into read/write halves.
+    let (mut sock_rd, mut sock_wr) = sock.into_split();
+
+    // client → PTY: read from socket, send to input_tx.
+    let client_to_pty = tokio::spawn(async move {
+        let mut buf = vec![0u8; 4096];
+        loop {
+            match tokio::io::AsyncReadExt::read(&mut sock_rd, &mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if input_tx.send(buf[..n].to_vec()).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    // PTY → client: blocking read from PTY reader, write to socket.
+    let pty_to_client = tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Handle::current();
+        let mut buf = vec![0u8; 4096];
+        loop {
+            match std::io::Read::read(&mut reader, &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let chunk = buf[..n].to_vec();
+                    if rt
+                        .block_on(tokio::io::AsyncWriteExt::write_all(&mut sock_wr, &chunk))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let _ = tokio::join!(client_to_pty, pty_to_client);
+}
+
+// ---------------------------------------------------------------------------
 // Supervisor connection helper
 // ---------------------------------------------------------------------------
 
@@ -593,12 +688,49 @@ pub async fn run() -> Result<()> {
     std::fs::set_permissions(&env.worker_sock, std::fs::Permissions::from_mode(0o700))
         .context("set worker sock perms")?;
 
+    // Bind raw-stream UDS for bidirectional PTY proxying.
+    let stream_sock_path = {
+        let parent = env
+            .worker_sock
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("/tmp"));
+        parent.join(format!("session-{}-stream.sock", env.session_id))
+    };
+    if stream_sock_path.exists() {
+        let _ = std::fs::remove_file(&stream_sock_path);
+    }
+    let stream_listener = UnixListener::bind(&stream_sock_path)
+        .with_context(|| format!("bind stream sock {}", stream_sock_path.display()))?;
+    std::fs::set_permissions(&stream_sock_path, std::fs::Permissions::from_mode(0o700))
+        .context("set stream sock perms")?;
+    let stream_sock_str = stream_sock_path.to_string_lossy().to_string();
+
+    // Spawn stream accept loop.
+    {
+        let state_stream = state.clone();
+        tokio::spawn(async move {
+            loop {
+                match stream_listener.accept().await {
+                    Ok((sock, _)) => {
+                        let state2 = state_stream.clone();
+                        tokio::spawn(handle_stream_conn(sock, state2));
+                    }
+                    Err(e) => {
+                        tracing::error!("stream listener error: {e}");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
     match sv_client
         .register_worker(
             context::current(),
             env.session_id.clone(),
             pid,
             worker_sock_str,
+            stream_sock_str,
         )
         .await
     {
