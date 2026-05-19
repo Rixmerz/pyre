@@ -53,6 +53,7 @@ use ratatui::widgets::{
 };
 use ratatui::Terminal;
 mod clipboard;
+mod splash;
 mod theme;
 use tarpc::client;
 use tarpc::tokio_serde::formats::Bincode;
@@ -83,6 +84,10 @@ struct Cli {
     /// Shell to use when spawning (default: $SHELL)
     #[arg(long, global = true)]
     shell: Option<String>,
+
+    /// Skip the startup flame animation
+    #[arg(long, global = true)]
+    no_splash: bool,
 
     #[command(subcommand)]
     command: Option<Sub>,
@@ -3262,6 +3267,7 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    splash::play_splash(cli.no_splash);
     let socket = cli.socket.unwrap_or_else(default_socket);
     let shell = resolve_shell(cli.shell);
 
