@@ -14,8 +14,8 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use pyre_proto::{
-    ListBlocksReq, PaneStateKind, PyreDaemonClient, SearchBlocksReq, SessionId, SpawnReq,
-    MODE_CONTROL,
+    ListBlocksReq, OpenPaneReq, PaneStateKind, PyreDaemonClient, SearchBlocksReq, SessionId,
+    SpawnReq, MODE_CONTROL,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -532,6 +532,21 @@ impl Server {
                         },
                         "required": ["session"]
                     }
+                },
+                {
+                    "name": "pane_open",
+                    "description": "Open a new pane inside an existing session. Returns pane_id.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "session": { "type": "string", "description": "Session id or ≥8-char prefix" },
+                            "cols": { "type": "integer", "default": 80 },
+                            "rows": { "type": "integer", "default": 24 },
+                            "cwd": { "type": "string", "description": "Working directory (optional)" },
+                            "shell": { "type": "string", "description": "Shell binary (default: $SHELL)" }
+                        },
+                        "required": ["session"]
+                    }
                 }
             ]
         })
@@ -552,6 +567,7 @@ impl Server {
             "block_search" => self.tool_block_search(args).await?,
             "session_spawn" => self.tool_session_spawn(args).await?,
             "session_close" => self.tool_session_close(args).await?,
+            "pane_open" => self.tool_pane_open(args).await?,
             other => return Err(anyhow!("unknown tool: {other}")),
         };
 
@@ -760,6 +776,38 @@ impl Server {
             .map_err(|e| anyhow!("{e}"))?;
 
         Ok(format!("session {} closed", &session_id.0.to_string()[..8]))
+    }
+
+    async fn tool_pane_open(&self, args: &Value) -> Result<String> {
+        let session_prefix = args["session"]
+            .as_str()
+            .ok_or_else(|| anyhow!("missing session"))?;
+        let shell = args["shell"]
+            .as_str()
+            .map(str::to_owned)
+            .or_else(|| std::env::var("SHELL").ok());
+        let cwd = args["cwd"].as_str().map(PathBuf::from);
+        let cols = args["cols"].as_u64().unwrap_or(80) as u16;
+        let rows = args["rows"].as_u64().unwrap_or(24) as u16;
+
+        let client = self.client().await?;
+        let session_id = self.resolve_session_id(&client, session_prefix).await?;
+
+        let req = OpenPaneReq {
+            session: session_id,
+            shell,
+            cwd,
+            cols,
+            rows,
+            env: std::env::vars().collect(),
+        };
+        let pane_id = client
+            .open_pane(tarpc::context::current(), req)
+            .await
+            .context("rpc")?
+            .map_err(|e| anyhow!("{e}"))?;
+
+        Ok(format!("pane_id={}", pane_id.0))
     }
 }
 
