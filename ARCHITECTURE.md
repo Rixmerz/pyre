@@ -6,6 +6,8 @@
 |-------------|---------------------------------------------------|----------|
 | `pyre-proto`| Wire types, versioned IPC schema, codec helpers. Shared by daemon and clients. | `serde`, `tokio`, (`tonic` OR `tarpc` — ADR-001) |
 | `pyred`     | The daemon. Owns every PTY, runs the ANSI parser, emits Block events, persists state, serves IPC + MCP over UDS. | `portable-pty`, `tokio`, `alacritty_terminal`, `sqlx` (sqlite), `tantivy`, `mlua`, `toml`, `serde` |
+
+Process model: see [docs/adr/0002-daemon-process-architecture.md](docs/adr/0002-daemon-process-architecture.md).
 | `pyrec`     | Thin CLI client. `attach`, `detach`, `list`, `spawn`, `search`, `kill`. Stdio bridge to a pane. | `pyre-proto`, `tokio`, `clap`, `crossterm` (raw-mode passthrough) |
 | `pyre-tui`  | MVP renderer. ratatui-based multiplexed view: tabs = sessions, splits = panes, block ribbon at the bottom. The dogfood target for S4. | `pyre-proto`, `ratatui`, `crossterm`, `tokio` |
 | `pyre-gpu`  | S6 GPU renderer using `wgpu`. Drop-in replacement for `pyre-tui` as the user-facing front end. Same `pyre-proto` client. | `pyre-proto`, `wgpu`, `winit`, `tokio` |
