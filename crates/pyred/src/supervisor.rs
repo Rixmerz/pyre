@@ -222,11 +222,18 @@ impl WorkerRegistry {
 /// from the worker are broadcast to every subscribed TUI client. Input from
 /// any TUI client is sent to a shared `mpsc` channel whose single drainer
 /// forwards them to the worker in order, preventing interleaving.
+///
+/// The ring-buffer snapshot (seq=0 frame from the worker) is saved in
+/// `last_snapshot` so that late-arriving TUI clients receive it as a
+/// synthetic seq=0 frame before subscribing to live output.
 struct PaneMirrorHub {
     /// Broadcast sender: worker → all TUI clients.
     output_tx: broadcast::Sender<Bytes>,
     /// Serialised input queue: any TUI client → single worker connection.
     input_tx: mpsc::Sender<Bytes>,
+    /// Most recent ring-buffer snapshot received from the worker (seq=0 frame).
+    /// Replayed to each new TUI client so reattach shows prior terminal state.
+    last_snapshot: Arc<Mutex<Bytes>>,
 }
 
 /// Registry of live per-pane mirror hubs, keyed by pane UUID.
@@ -1441,9 +1448,12 @@ async fn proxy_stream_to_worker(
         // Input serialisation channel.
         let (in_tx, mut in_rx) = mpsc::channel::<Bytes>(256);
 
+        let last_snapshot: Arc<Mutex<Bytes>> = Arc::new(Mutex::new(Bytes::new()));
+
         let hub = Arc::new(PaneMirrorHub {
             output_tx: out_tx.clone(),
             input_tx: in_tx,
+            last_snapshot: last_snapshot.clone(),
         });
         mirror_registry.insert(pane_uuid, hub.clone()).await;
 
@@ -1456,11 +1466,32 @@ async fn proxy_stream_to_worker(
             tokio_serde::SymmetricallyFramed::new(frame_write, SymmetricalBincode::default());
 
         // Worker → broadcast: read OutputFrames from worker, fan out raw bytes.
+        // All output bytes are appended to last_snapshot (capped at 256 KiB) so
+        // that late-arriving TUI clients receive a synthetic seq=0 frame with the
+        // accumulated terminal state before subscribing to live output.
         let mirror_reg_cleanup = mirror_registry.clone();
+        const SNAPSHOT_CAP: usize = 256 * 1024;
         tokio::spawn(async move {
             while let Some(frame) = worker_out.next().await {
                 match frame {
                     Ok(f) => {
+                        // Append to accumulated snapshot, dropping the oldest bytes
+                        // when we exceed the cap to bound memory.
+                        {
+                            let mut snap = last_snapshot.lock().await;
+                            let new_len = snap.len() + f.data.len();
+                            if new_len <= SNAPSHOT_CAP {
+                                let mut v = snap.to_vec();
+                                v.extend_from_slice(&f.data);
+                                *snap = Bytes::from(v);
+                            } else {
+                                // Keep only the most recent SNAPSHOT_CAP bytes.
+                                let mut v = snap.to_vec();
+                                v.extend_from_slice(&f.data);
+                                let drop_n = v.len().saturating_sub(SNAPSHOT_CAP);
+                                *snap = Bytes::from(v[drop_n..].to_vec());
+                            }
+                        }
                         // Ignore send errors — all subscribers may have disconnected
                         // temporarily but the hub stays alive.
                         let _ = out_tx.send(f.data);
@@ -1500,18 +1531,12 @@ async fn proxy_stream_to_worker(
         hub
     };
 
-    // Subscribe this TUI client to the pane's output broadcast.
+    // Snapshot the current ring-buffer state and subscribe to live output
+    // atomically: subscribe first (so we don't miss bytes), then read snapshot.
+    // This mirrors the order used in worker.rs handle_stream_conn.
     let mut out_sub = hub.output_tx.subscribe();
+    let snap = hub.last_snapshot.lock().await.clone();
     let input_tx = hub.input_tx.clone();
-
-    // Split the client socket into framed halves.
-    let (client_rd, client_wr) = client_sock.into_split();
-    let frame_read = FramedRead::new(client_rd, LengthDelimitedCodec::new());
-    let frame_write = FramedWrite::new(client_wr, LengthDelimitedCodec::new());
-    let mut client_in: tokio_serde::SymmetricallyFramed<_, InputFrame, _> =
-        tokio_serde::SymmetricallyFramed::new(frame_read, SymmetricalBincode::default());
-    let mut client_out: tokio_serde::SymmetricallyFramed<_, OutputFrame, _> =
-        tokio_serde::SymmetricallyFramed::new(frame_write, SymmetricalBincode::default());
 
     // Resolve a SessionId for wrapping OutputFrames sent to this client.
     let session_uuid = match uuid::Uuid::parse_str(&session_id) {
@@ -1523,8 +1548,25 @@ async fn proxy_stream_to_worker(
     };
     let session = SessionId(session_uuid);
 
-    // Client output task: broadcast → this client's socket.
+    // Split the client socket into framed halves.
+    let (client_rd, client_wr) = client_sock.into_split();
+    let frame_read = FramedRead::new(client_rd, LengthDelimitedCodec::new());
+    let frame_write = FramedWrite::new(client_wr, LengthDelimitedCodec::new());
+    let mut client_in: tokio_serde::SymmetricallyFramed<_, InputFrame, _> =
+        tokio_serde::SymmetricallyFramed::new(frame_read, SymmetricalBincode::default());
+    let mut client_out: tokio_serde::SymmetricallyFramed<_, OutputFrame, _> =
+        tokio_serde::SymmetricallyFramed::new(frame_write, SymmetricalBincode::default());
+
+    // Client output task: replay snapshot as seq=0, then forward live broadcast frames.
     let out_task = tokio::spawn(async move {
+        // Always send the snapshot first (seq=0), even if empty — uniform client path.
+        if client_out
+            .send(OutputFrame { session, seq: 0, data: snap })
+            .await
+            .is_err()
+        {
+            return;
+        }
         let mut seq: u64 = 0;
         loop {
             match out_sub.recv().await {
