@@ -375,12 +375,26 @@ struct PaneSlot {
     last_screen_rect: Rect,
     /// Ribbon chip rects captured during last render: (block_idx, rect).
     ribbon_chip_rects: Vec<(usize, Rect)>,
+    /// Output bytes received before the first render (parser not yet sized to
+    /// the real pane area). Drained into the parser on the first render frame.
+    pending_output: Vec<u8>,
+    /// True once the parser has been sized to the actual pane area and
+    /// `pending_output` has been flushed. Set on the first `render_pane` call.
+    parser_sized: bool,
 }
 
 impl PaneSlot {
-    /// Feed raw bytes into the vt100 parser (scrollback is maintained natively).
+    /// Feed raw bytes into the vt100 parser.
+    /// If the parser has not yet been sized to the real pane area (before the
+    /// first render frame), bytes are buffered in `pending_output` instead of
+    /// being processed at the wrong terminal dimensions. `render_pane` drains
+    /// the buffer once it knows the correct area size.
     fn process_output(&mut self, data: &[u8]) {
-        self.parser.process(data);
+        if self.parser_sized {
+            self.parser.process(data);
+        } else {
+            self.pending_output.extend_from_slice(data);
+        }
     }
 }
 
@@ -835,6 +849,8 @@ async fn attach_pane(socket: &Path, session: SessionId, pane_id: PaneId) -> Resu
         scrollback_capacity: 0,
         last_screen_rect: Rect::default(),
         ribbon_chip_rects: Vec::new(),
+        pending_output: Vec::new(),
+        parser_sized: false,
     })
 }
 
@@ -918,6 +934,17 @@ fn render_pane(
         let (cur_rows, cur_cols) = slot.parser.screen().size();
         if cur_rows != target_rows || cur_cols != target_cols {
             slot.parser.set_size(target_rows, target_cols);
+        }
+        // On the first render we now know the real pane area. Drain any bytes
+        // that arrived before this frame (buffered in pending_output at wrong
+        // size) through the correctly-sized parser, then mark as sized so
+        // subsequent bytes go directly to the parser.
+        if !slot.parser_sized {
+            slot.parser_sized = true;
+            if !slot.pending_output.is_empty() {
+                let buffered = std::mem::take(&mut slot.pending_output);
+                slot.parser.process(&buffered);
+            }
         }
         // Fire resize RPC when dims changed AND differ from last sent — avoid
         // spamming the daemon every frame. Collected into pending_resizes and
@@ -3045,6 +3072,14 @@ async fn run_tui(
                             } else {
                                 state.sidebar_focused = false;
                             }
+                        }
+
+                        // New session (Ctrl-B S — uppercase to avoid collision with Ctrl-B s sidebar)
+                        KeyCode::Char('S') => {
+                            state.prompt = Some(NamePrompt {
+                                kind: PromptKind::NewSession,
+                                input: String::new(),
+                            });
                         }
 
                         // All other prefix keys consumed silently
