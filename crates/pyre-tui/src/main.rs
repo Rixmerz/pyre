@@ -3470,13 +3470,32 @@ async fn run_tui(
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    // Route tracing to a file so logs survive ratatui's alternate-screen mode.
+    // Fall back to stderr if the file cannot be opened.
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/pyre-tui.log");
+    match log_file {
+        Ok(f) => {
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+                )
+                .with_writer(std::sync::Mutex::new(f))
+                .init();
+        }
+        Err(_) => {
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+                )
+                .with_writer(std::io::stderr)
+                .init();
+        }
+    }
 
     let cli = Cli::parse();
     splash::play_splash(cli.no_splash);
