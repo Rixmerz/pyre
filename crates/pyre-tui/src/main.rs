@@ -2692,7 +2692,30 @@ async fn run_tui(
         }
     };
 
-    let initial_slot = attach_pane(&socket, session, pane, init_cols, init_rows).await?;
+    let mut initial_slot = attach_pane(&socket, session, pane, init_cols, init_rows).await?;
+
+    // Pre-populate the block ribbon for the initial pane so that Ctrl-B [
+    // shows previous command history immediately on reattach (S3).
+    match tokio::time::timeout(
+        Duration::from_secs(2),
+        control.replay(tarpc::context::current(), pane, 20),
+    )
+    .await
+    {
+        Ok(Ok(Ok(replay))) => {
+            if !replay.recent.is_empty() {
+                tracing::debug!(
+                    pane_id = %pane.0,
+                    blocks = replay.recent.len(),
+                    "reattach: pre-populated block ribbon"
+                );
+                initial_slot.recent_blocks = replay.recent;
+            }
+        }
+        Ok(Ok(Err(e))) => tracing::debug!(pane_id = %pane.0, "replay rpc error (non-fatal): {e}"),
+        Ok(Err(_)) => tracing::debug!(pane_id = %pane.0, "replay transport error (non-fatal)"),
+        Err(_) => tracing::debug!(pane_id = %pane.0, "replay rpc timeout (non-fatal)"),
+    }
 
     // ── Background block-poll task (Bug 2 fix) ──────────────────────────────
     // list_blocks is moved off the hot event loop into its own task. A
@@ -2750,7 +2773,18 @@ async fn run_tui(
                 .await
             {
                 if let Some(p) = panes.into_iter().next() {
-                    if let Ok(slot) = attach_pane(&state.socket, info.id, p.id, ec, er).await {
+                    if let Ok(mut slot) = attach_pane(&state.socket, info.id, p.id, ec, er).await {
+                        // Pre-populate block ribbon for eagerly-attached panes.
+                        if let Ok(Ok(Ok(replay))) = tokio::time::timeout(
+                            Duration::from_secs(2),
+                            state.control.replay(tarpc::context::current(), p.id, 20),
+                        )
+                        .await
+                        {
+                            if !replay.recent.is_empty() {
+                                slot.recent_blocks = replay.recent;
+                            }
+                        }
                         let slot_idx = state.slots.len();
                         state.slots.push(Some(slot));
                         state.sessions.push(SessionView {
