@@ -11,7 +11,7 @@
 //! * Listens for SIGCHLD; removes exited workers and respawns them.
 //! * Batches [`BlockEvent`]s from workers and writes to its Tantivy index.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -70,6 +70,11 @@ struct PaneIndex {
     pane_to_slot: HashMap<uuid::Uuid, (String, u32)>,
     /// Next slot index to assign per session.
     next_slot: HashMap<String, u32>,
+    /// Slots that have been explicitly closed via `pane_closed` RPC.
+    /// `get_or_alloc_pane_by_slot` refuses to re-register an entry here,
+    /// preventing late BlockEvents from a dying pane from resurrecting its
+    /// slot in the index and inflating the remaining-pane count.
+    dead_slots: HashSet<(String, u32)>,
 }
 
 impl PaneIndex {
@@ -84,11 +89,17 @@ impl PaneIndex {
     }
 
     /// Reverse lookup: given (session_id, slot_idx) return the stable PaneId.
+    /// Returns `None` if the slot is not tracked OR has been marked dead.
     fn pane_id_by_slot(&self, session_id: &str, slot_idx: u32) -> Option<uuid::Uuid> {
         self.pane_to_slot
             .iter()
             .find(|(_, (sid, s))| sid.as_str() == session_id && *s == slot_idx)
             .map(|(pane_id, _)| *pane_id)
+    }
+
+    /// Return true if this (session_id, slot_idx) has been explicitly closed.
+    fn is_dead(&self, session_id: &str, slot_idx: u32) -> bool {
+        self.dead_slots.contains(&(session_id.to_owned(), slot_idx))
     }
 
     fn next_slot(&mut self, session_id: &str) -> u32 {
@@ -102,6 +113,20 @@ impl PaneIndex {
         self.pane_to_slot
             .retain(|_, (sid, _)| sid.as_str() != session_id);
         self.next_slot.remove(session_id);
+        self.dead_slots.retain(|(sid, _)| sid.as_str() != session_id);
+    }
+
+    /// Remove one pane slot mapping, mark it dead, and return the number of
+    /// panes still registered for `session_id` after the removal.
+    fn remove_pane_slot(&mut self, session_id: &str, slot_idx: u32) -> usize {
+        self.pane_to_slot
+            .retain(|_, (sid, s)| !(sid.as_str() == session_id && *s == slot_idx));
+        self.dead_slots
+            .insert((session_id.to_owned(), slot_idx));
+        self.pane_to_slot
+            .values()
+            .filter(|(sid, _)| sid.as_str() == session_id)
+            .count()
     }
 }
 
@@ -144,11 +169,31 @@ impl WorkerRegistry {
 
     /// Return the stable PaneId for (session_id, slot_idx), allocating a new one
     /// if the slot was opened directly by the worker without going through the supervisor.
-    pub async fn get_or_alloc_pane_by_slot(&self, session_id: &str, slot_idx: u32) -> uuid::Uuid {
+    ///
+    /// Returns `None` if the slot has been explicitly closed via `pane_closed` RPC.
+    /// Callers that only need best-effort identity (list_all_panes, process_raw_event)
+    /// can safely ignore a `None` result.
+    pub async fn get_or_alloc_pane_by_slot(
+        &self,
+        session_id: &str,
+        slot_idx: u32,
+    ) -> Option<uuid::Uuid> {
         {
             let panes = self.panes.read().await;
+            // Return existing mapping if present.
             if let Some(pane_id) = panes.pane_id_by_slot(session_id, slot_idx) {
-                return pane_id;
+                return Some(pane_id);
+            }
+            // Refuse to resurrect a slot that was explicitly closed by pane_closed RPC.
+            // This prevents late BlockEvents from a dying pane re-inflating the PaneIndex
+            // and causing the remaining-count check in pane_closed to never reach zero.
+            if panes.is_dead(session_id, slot_idx) {
+                tracing::debug!(
+                    session_id,
+                    slot_idx,
+                    "get_or_alloc_pane_by_slot: slot is dead, skipping re-allocation"
+                );
+                return None;
             }
         }
         // Slot not tracked yet — register a stable mapping now.
@@ -157,7 +202,7 @@ impl WorkerRegistry {
             .write()
             .await
             .register(pane_id, session_id.to_owned(), slot_idx);
-        pane_id
+        Some(pane_id)
     }
 
     /// Look up (session_id_str, slot_idx) for a PaneId.
@@ -199,6 +244,35 @@ impl WorkerRegistry {
             .filter(|(_, h)| h.last_heartbeat.elapsed() > timeout)
             .map(|(id, _)| id.clone())
             .collect()
+    }
+
+    /// Remove a single pane-slot mapping for a session and return the number of
+    /// panes still registered for that session.  Used by `pane_closed` to decide
+    /// whether to evict the session immediately.
+    pub async fn remove_pane_slot(&self, session_id: &str, slot_idx: u32) -> usize {
+        let remaining = self
+            .panes
+            .write()
+            .await
+            .remove_pane_slot(session_id, slot_idx);
+        tracing::debug!(
+            session_id,
+            slot_idx,
+            remaining,
+            "remove_pane_slot: post-removal pane count"
+        );
+        remaining
+    }
+
+    /// Return the number of panes currently tracked for `session_id`.
+    pub async fn pane_count(&self, session_id: &str) -> usize {
+        self.panes
+            .read()
+            .await
+            .pane_to_slot
+            .values()
+            .filter(|(sid, _)| sid.as_str() == session_id)
+            .count()
     }
 
     /// Look up the session_id for a given worker PID; used by SIGCHLD handler.
@@ -535,7 +609,10 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
         let now = Utc::now();
         let mut panes = Vec::with_capacity(slots.len());
         for slot_idx in slots {
-            let pane_uuid = self.registry.get_or_alloc_pane_by_slot(&id, slot_idx).await;
+            let Some(pane_uuid) = self.registry.get_or_alloc_pane_by_slot(&id, slot_idx).await
+            else {
+                continue;
+            };
             panes.push(PaneInfo {
                 id: PaneId(pane_uuid),
                 session,
@@ -696,10 +773,13 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
                 _ => continue,
             };
             for slot_idx in slots {
-                let pane_uuid = self
+                let Some(pane_uuid) = self
                     .registry
                     .get_or_alloc_pane_by_slot(session_id_str, slot_idx)
-                    .await;
+                    .await
+                else {
+                    continue;
+                };
                 all.push(PaneInfo {
                     id: PaneId(pane_uuid),
                     session: sid,
@@ -854,7 +934,21 @@ impl SupervisorWorker for SupervisorWorkerImpl {
         slot_idx: u32,
     ) -> Result<(), RpcError> {
         tracing::info!(session_id, slot_idx, "worker reports pane closed");
-        // TODO(S2): evict pane entry from supervisor pane index.
+        // Remove this pane from the supervisor's index and check whether any
+        // panes remain for the session.  If none remain, evict the session from
+        // the registry *now* — before the worker process actually exits — so
+        // that the SIGCHLD handler finds no registry entry and does not respawn.
+        let remaining = self
+            .registry
+            .remove_pane_slot(&session_id, slot_idx)
+            .await;
+        if remaining == 0 {
+            tracing::info!(
+                session_id,
+                "all panes closed — evicting session from registry (no respawn)"
+            );
+            self.registry.remove(&session_id).await;
+        }
         Ok(())
     }
 
@@ -962,12 +1056,17 @@ async fn process_raw_event(
         .entry(key)
         .or_insert_with(|| PaneParserState::new(session_id));
 
-    // Resolve PaneId once per slot.
+    // Resolve PaneId once per slot.  If the slot has already been closed
+    // (marked dead in the PaneIndex), skip this event entirely — the pane
+    // is gone and indexing its output would produce orphaned blocks.
     if state.pane_id.is_none() {
-        let pane_uuid = registry
+        match registry
             .get_or_alloc_pane_by_slot(&raw.session_id, raw.slot_idx)
-            .await;
-        state.pane_id = Some(pyre_proto::PaneId(pane_uuid));
+            .await
+        {
+            Some(pane_uuid) => state.pane_id = Some(pyre_proto::PaneId(pane_uuid)),
+            None => return, // slot is dead — discard event
+        }
     }
     let pane_id = state.pane_id.expect("pane_id set above");
 
@@ -1138,10 +1237,22 @@ fn start_sigchld_handler(registry: Arc<WorkerRegistry>, supervisor_impl: Supervi
                 let pid = res as u32;
                 tracing::info!(pid, "worker exited (SIGCHLD)");
                 if let Some(session_id) = registry.session_for_pid(pid).await {
+                    // Check pane count before removing from registry.
+                    // If all panes have already been closed via pane_closed
+                    // RPC, the pane index will be empty — this was a voluntary
+                    // clean exit, not a crash. Do not respawn.
+                    let panes_remaining = registry.pane_count(&session_id).await;
                     registry.remove(&session_id).await;
-                    tracing::info!(session_id, "respawning worker after exit");
-                    if let Err(e) = supervisor_impl.spawn_worker(&session_id).await {
-                        tracing::error!(session_id, "respawn failed: {e:#}");
+                    if panes_remaining == 0 {
+                        tracing::info!(
+                            session_id,
+                            "worker exited cleanly (no panes left) — not respawning"
+                        );
+                    } else {
+                        tracing::info!(session_id, "respawning worker after exit");
+                        if let Err(e) = supervisor_impl.spawn_worker(&session_id).await {
+                            tracing::error!(session_id, "respawn failed: {e:#}");
+                        }
                     }
                 }
             }
