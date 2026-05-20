@@ -648,10 +648,11 @@ struct SessionView {
 }
 
 /// Which kind of name-prompt overlay is open.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum PromptKind {
     NewSession,
     NewTab,
+    RenameSession(SessionId),
 }
 
 /// Name-prompt overlay state.
@@ -1530,6 +1531,7 @@ fn render_name_prompt(frame: &mut ratatui::Frame, prompt: &NamePrompt) {
     let title = match prompt.kind {
         PromptKind::NewSession => " new session name ",
         PromptKind::NewTab => " new tab label ",
+        PromptKind::RenameSession(_) => " rename session ",
     };
 
     let outer = RatatuiBlock::default()
@@ -3226,6 +3228,40 @@ async fn run_tui(
                                             tracing::warn!("open_new_tab failed: {e}");
                                         }
                                     }
+                                    PromptKind::RenameSession(session_id) => {
+                                        if let Some(new_name) = input {
+                                            match state
+                                                .control
+                                                .rename_session(
+                                                    tarpc::context::current(),
+                                                    session_id,
+                                                    new_name.clone(),
+                                                )
+                                                .await
+                                            {
+                                                Ok(Ok(())) => {
+                                                    // Update local view immediately.
+                                                    if let Some(sv) = state
+                                                        .sessions
+                                                        .iter_mut()
+                                                        .find(|s| s.id == session_id)
+                                                    {
+                                                        sv.name = new_name;
+                                                    }
+                                                }
+                                                Ok(Err(e)) => {
+                                                    tracing::warn!("rename_session rpc error: {e}");
+                                                    state.status_msg =
+                                                        Some(format!("rename failed: {e}"));
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!("rename_session transport: {e}");
+                                                    state.status_msg =
+                                                        Some(format!("rename rpc: {e}"));
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -3406,6 +3442,17 @@ async fn run_tui(
                             state.prompt = Some(NamePrompt {
                                 kind: PromptKind::NewSession,
                                 input: String::new(),
+                            });
+                        }
+
+                        // Rename active session (Ctrl-B ,  — mirrors tmux rename-session)
+                        KeyCode::Char(',') => {
+                            let sv = &state.sessions[state.active_session];
+                            let current_name = sv.name.clone();
+                            let session_id = sv.id;
+                            state.prompt = Some(NamePrompt {
+                                kind: PromptKind::RenameSession(session_id),
+                                input: current_name,
                             });
                         }
 

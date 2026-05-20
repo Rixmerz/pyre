@@ -843,6 +843,21 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
         Ok(crate::inspect::inspect_pid(pid))
     }
 
+    async fn rename_session(
+        self,
+        _ctx: context::Context,
+        session: SessionId,
+        name: String,
+    ) -> Result<(), PyreError> {
+        // In hybrid mode the session name lives in the supervisor store.
+        // The worker registry keyed by UUID string does not carry a mutable
+        // name field, so we persist via the supervisor's store directly.
+        self.store
+            .upsert_session(session, &name)
+            .await
+            .map_err(|e| PyreError::Io(e.to_string()))
+    }
+
     async fn resize_pane(
         self,
         _ctx: context::Context,

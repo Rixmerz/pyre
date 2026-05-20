@@ -128,6 +128,8 @@ pub trait PyreDaemon {
     async fn send_keys(pane: PaneId, bytes: Vec<u8>) -> Result<(), PyreError>;
     /// Resize the PTY of a pane to the given dimensions.
     async fn resize_pane(req: crate::ResizePaneReq) -> Result<crate::ResizePaneRes, PyreError>;
+    /// Rename an existing session. Persists to SQLite immediately.
+    async fn rename_session(session: SessionId, name: String) -> Result<(), PyreError>;
 }
 
 /// Process metadata returned by `inspect_pid`.

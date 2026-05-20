@@ -313,6 +313,18 @@ impl pyre_proto::service::PyreDaemon for DaemonImpl {
         Ok(crate::inspect::inspect_pid(pid))
     }
 
+    async fn rename_session(
+        self,
+        _ctx: context::Context,
+        session: SessionId,
+        name: String,
+    ) -> Result<(), PyreError> {
+        self.registry
+            .rename_session(session, name, &self.store)
+            .await
+            .map_err(|_| PyreError::NoSuchSession(session))
+    }
+
     async fn resize_pane(
         self,
         _ctx: context::Context,

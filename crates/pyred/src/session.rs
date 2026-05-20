@@ -347,6 +347,25 @@ impl SessionRegistry {
         }
     }
 
+    /// Rename a session in-memory and persist to SQLite.
+    pub async fn rename_session(
+        &self,
+        session_id: SessionId,
+        name: String,
+        store: &Store,
+    ) -> anyhow::Result<()> {
+        let session = self
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("no such session {session_id}"))?;
+        *session.name.write().await = name.clone();
+        store.upsert_session(session_id, &name).await?;
+        Ok(())
+    }
+
     /// Used by shutdown path in main.rs.
     pub async fn all_sessions(&self) -> Vec<Arc<SessionState>> {
         self.sessions.lock().await.values().cloned().collect()
