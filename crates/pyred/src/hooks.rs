@@ -102,7 +102,10 @@ impl HooksConfig {
             });
         }
 
-        // notify-send when entering WaitingInput.
+        // notify-send when entering WaitingInput — Linux desktop only.
+        // On macOS and other non-Linux platforms this is a no-op; users can
+        // set notify_send = false in hooks.toml (already the default).
+        #[cfg(target_os = "linux")]
         if self.on_state_change.notify_send && state == PaneStateKind::WaitingInput {
             let pane_short = pane_short.to_string();
             tokio::task::spawn_blocking(move || {

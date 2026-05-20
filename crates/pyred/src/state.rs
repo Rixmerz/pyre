@@ -207,11 +207,22 @@ impl PaneStateTracker {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// /proc helpers
+// Process helpers — Linux impl uses /proc; non-Linux degrades gracefully.
+// State engine falls back to OSC 133 + timeout heuristics on macOS.
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[cfg(target_os = "linux")]
 fn pid_alive(pid: u32) -> bool {
     std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// On non-Linux systems, signal 0 to the process checks existence without
+/// actually delivering a signal. errno ESRCH means the process is dead.
+#[cfg(not(target_os = "linux"))]
+fn pid_alive(pid: u32) -> bool {
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+    kill(Pid::from_raw(pid as i32), None).is_ok()
 }
 
 fn is_shell(name: &str) -> bool {
@@ -220,11 +231,20 @@ fn is_shell(name: &str) -> bool {
 
 /// Walk /proc/{pid}/task/{pid}/children recursively to find the deepest leaf PID,
 /// then return its comm. Falls back to root_pid's own comm.
+/// On non-Linux the process tree cannot be walked; returns root comm directly.
 pub fn foreground_of(root_pid: u32) -> Option<String> {
-    let deepest = deepest_child(root_pid);
-    read_comm(deepest)
+    #[cfg(target_os = "linux")]
+    {
+        let deepest = deepest_child(root_pid);
+        read_comm(deepest)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        read_comm(root_pid)
+    }
 }
 
+#[cfg(target_os = "linux")]
 fn deepest_child(pid: u32) -> u32 {
     let children_path = format!("/proc/{pid}/task/{pid}/children");
     if let Ok(content) = std::fs::read_to_string(&children_path) {
@@ -239,10 +259,18 @@ fn deepest_child(pid: u32) -> u32 {
     pid
 }
 
+#[cfg(target_os = "linux")]
 fn read_comm(pid: u32) -> Option<String> {
     std::fs::read_to_string(format!("/proc/{pid}/comm"))
         .ok()
         .map(|s| s.trim().to_string())
+}
+
+/// On non-Linux, /proc/comm is unavailable. Return None so callers fall
+/// back to heuristics that don't depend on process name.
+#[cfg(not(target_os = "linux"))]
+fn read_comm(_pid: u32) -> Option<String> {
+    None
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
