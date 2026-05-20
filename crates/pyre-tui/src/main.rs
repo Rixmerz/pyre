@@ -3814,7 +3814,11 @@ async fn run_tui(
             }
 
             Event::Paste(s) => {
-                let bytes = bytes::Bytes::from(s.into_bytes());
+                let mut buf = Vec::with_capacity(s.len() + 12);
+                buf.extend_from_slice(b"\x1b[200~");
+                buf.extend_from_slice(s.as_bytes());
+                buf.extend_from_slice(b"\x1b[201~");
+                let bytes = bytes::Bytes::from(buf);
                 let sv = &state.sessions[state.active_session];
                 let tab = &sv.tabs[sv.active_tab];
                 if let Some(slot_idx) = slot_at(&tab.root, &tab.focus_path) {
