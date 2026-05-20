@@ -42,7 +42,7 @@ dirs = "5"
 regex = "1"
 async-trait = "0.1"
 ratatui = "0.30"
-crossterm = "0.29"
+crossterm = { version = "0.29", features = ["bracketed-paste"] }
 tantivy = "0.26"
 toml = "0.8"
 clap = { version = "4", features = ["derive"] }

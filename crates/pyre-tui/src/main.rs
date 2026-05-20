@@ -32,8 +32,8 @@ use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use clap::Parser;
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseButton,
-    MouseEventKind,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    KeyCode, KeyModifiers, MouseButton, MouseEventKind,
 };
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use futures::SinkExt;
@@ -303,14 +303,24 @@ struct TermGuard;
 impl TermGuard {
     fn enter() -> Result<Self> {
         crossterm::terminal::enable_raw_mode()?;
-        crossterm::execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+        crossterm::execute!(
+            stdout(),
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste
+        )?;
         Ok(Self)
     }
 }
 
 impl Drop for TermGuard {
     fn drop(&mut self) {
-        let _ = crossterm::execute!(stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        let _ = crossterm::execute!(
+            stdout(),
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
         let _ = crossterm::terminal::disable_raw_mode();
     }
 }
@@ -3589,6 +3599,24 @@ async fn run_tui(
                                 "send_keys: input_tx.send (inline await)"
                             );
                         }
+                    }
+                }
+            }
+
+            Event::Paste(s) => {
+                let bytes = bytes::Bytes::from(s.into_bytes());
+                let sv = &state.sessions[state.active_session];
+                let tab = &sv.tabs[sv.active_tab];
+                if let Some(slot_idx) = slot_at(&tab.root, &tab.focus_path) {
+                    if let Some(slot) = state.slots[slot_idx].as_mut() {
+                        slot.scroll_offset = 0;
+                        let send_result = slot.input_tx.send(bytes.clone()).await;
+                        tracing::debug!(
+                            slot_idx,
+                            paste_bytes = bytes.len(),
+                            send_ok = send_result.is_ok(),
+                            "send_keys: bracketed paste input_tx.send"
+                        );
                     }
                 }
             }
