@@ -26,6 +26,7 @@
 
 use std::io::stdout;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -66,6 +67,37 @@ use tokio::process::Command as TokioCommand;
 use tokio::sync::{mpsc, watch};
 use tokio_serde::formats::SymmetricalBincode;
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
+
+use alacritty_terminal::event::{Event as TermEvent, EventListener};
+use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::{Column as TermColumn, Line as TermLine, Point as TermPoint};
+use alacritty_terminal::term::{cell::Flags as CellFlags, Config as TermConfig};
+use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Processor as AnsiProcessor};
+use alacritty_terminal::Term;
+
+/// Minimal Dimensions impl for creating/resizing an alacritty Term.
+struct TermSize {
+    cols: usize,
+    rows: usize,
+}
+
+impl TermSize {
+    fn new(cols: usize, rows: usize) -> Self {
+        Self { cols, rows }
+    }
+}
+
+impl Dimensions for TermSize {
+    fn total_lines(&self) -> usize {
+        self.rows
+    }
+    fn screen_lines(&self) -> usize {
+        self.rows
+    }
+    fn columns(&self) -> usize {
+        self.cols
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI
@@ -360,11 +392,83 @@ fn key_to_bytes(code: KeyCode, modifiers: KeyModifiers) -> Option<Bytes> {
 // Color helper
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn vt100_color(color: vt100::Color) -> Option<Color> {
+/// Convert an alacritty/vte AnsiColor to a ratatui Color.
+/// Returns None for "default" colors so ratatui uses its own defaults.
+fn ansi_color(color: AnsiColor) -> Option<Color> {
     match color {
-        vt100::Color::Default => None,
-        vt100::Color::Idx(i) => Some(Color::Indexed(i)),
-        vt100::Color::Rgb(r, g, b) => Some(Color::Rgb(r, g, b)),
+        AnsiColor::Named(nc) => match nc {
+            NamedColor::Black => Some(Color::Black),
+            NamedColor::Red => Some(Color::Red),
+            NamedColor::Green => Some(Color::Green),
+            NamedColor::Yellow => Some(Color::Yellow),
+            NamedColor::Blue => Some(Color::Blue),
+            NamedColor::Magenta => Some(Color::Magenta),
+            NamedColor::Cyan => Some(Color::Cyan),
+            NamedColor::White => Some(Color::Gray),
+            NamedColor::BrightBlack => Some(Color::DarkGray),
+            NamedColor::BrightRed => Some(Color::LightRed),
+            NamedColor::BrightGreen => Some(Color::LightGreen),
+            NamedColor::BrightYellow => Some(Color::LightYellow),
+            NamedColor::BrightBlue => Some(Color::LightBlue),
+            NamedColor::BrightMagenta => Some(Color::LightMagenta),
+            NamedColor::BrightCyan => Some(Color::LightCyan),
+            NamedColor::BrightWhite => Some(Color::White),
+            // Foreground/Background are "default" — let ratatui use terminal defaults.
+            NamedColor::Foreground | NamedColor::Background => None,
+            // Dim variants: map to corresponding base color.
+            NamedColor::DimBlack => Some(Color::Black),
+            NamedColor::DimRed => Some(Color::Red),
+            NamedColor::DimGreen => Some(Color::Green),
+            NamedColor::DimYellow => Some(Color::Yellow),
+            NamedColor::DimBlue => Some(Color::Blue),
+            NamedColor::DimMagenta => Some(Color::Magenta),
+            NamedColor::DimCyan => Some(Color::Cyan),
+            NamedColor::DimWhite => Some(Color::Gray),
+            // Cursor/DimForeground/etc — treat as default.
+            _ => None,
+        },
+        AnsiColor::Spec(rgb) => Some(Color::Rgb(rgb.r, rgb.g, rgb.b)),
+        AnsiColor::Indexed(i) => Some(Color::Indexed(i)),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// EventProxy — forwards PtyWrite responses from Term back to the PTY input.
+// This is critical for DSR/CPR (cursor position reports) so TUIs that issue
+// ?6n or ?1000h don't hang waiting for a reply.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+struct EventProxy {
+    /// Queued PtyWrite responses; drained by PaneSlot::drain_pty_responses.
+    queue: Arc<Mutex<Vec<String>>>,
+}
+
+impl EventProxy {
+    fn new() -> Self {
+        Self {
+            queue: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Drain any accumulated response bytes into `dest`. Call this after
+    /// `process_output` and send the collected bytes back to the daemon input
+    /// channel so child programs receive their CPR / DSR replies.
+    fn drain(&self) -> Vec<u8> {
+        let mut q = self.queue.lock().expect("event proxy lock");
+        let mut out: Vec<u8> = Vec::new();
+        for s in q.drain(..) {
+            out.extend_from_slice(s.as_bytes());
+        }
+        out
+    }
+}
+
+impl EventListener for EventProxy {
+    fn send_event(&self, event: TermEvent) {
+        if let TermEvent::PtyWrite(s) = event {
+            self.queue.lock().expect("event proxy lock").push(s);
+        }
     }
 }
 
@@ -388,7 +492,13 @@ enum PaneEvent {
 /// One attached PTY pane with its I/O channels and VT parser.
 struct PaneSlot {
     pane_id: PaneId,
-    parser: vt100::Parser,
+    /// alacritty_terminal state machine — handles alt-screen, DSR/CPR, mouse.
+    term: Term<EventProxy>,
+    /// VTE ANSI byte-stream processor that feeds bytes into `term`.
+    processor: AnsiProcessor,
+    /// Event proxy shared with `term`; drained after each process_output call
+    /// to forward CPR/DSR replies back to the child PTY.
+    event_proxy: EventProxy,
     /// Bytes to send to this pane (written by the key handler).
     input_tx: mpsc::Sender<Bytes>,
     /// Events from daemon for this pane (drained each UI tick).
@@ -427,8 +537,8 @@ struct PaneSlot {
 }
 
 impl PaneSlot {
-    /// Feed raw bytes into the vt100 parser.
-    /// If the parser has not yet been sized to the real pane area (before the
+    /// Feed raw bytes into the alacritty Term processor.
+    /// If the terminal has not yet been sized to the real pane area (before the
     /// first render frame), bytes are buffered in `pending_output` instead of
     /// being processed at the wrong terminal dimensions. `render_pane` drains
     /// the buffer once it knows the correct area size.
@@ -450,10 +560,16 @@ impl PaneSlot {
         }
 
         if self.parser_sized {
-            self.parser.process(data);
+            self.processor.advance(&mut self.term, data);
         } else {
             self.pending_output.extend_from_slice(data);
         }
+    }
+
+    /// Drain any PtyWrite responses generated by the Term (CPR/DSR replies)
+    /// and return them as raw bytes to be forwarded back to the child PTY.
+    fn drain_pty_responses(&self) -> Vec<u8> {
+        self.event_proxy.drain()
     }
 }
 
@@ -931,10 +1047,20 @@ async fn attach_pane(
         }
     });
 
-    tracing::debug!(rows, cols, pane_id = %pane_id.0, "attach_pane: creating vt100::Parser");
+    tracing::debug!(rows, cols, pane_id = %pane_id.0, "attach_pane: creating alacritty Term");
+    let event_proxy = EventProxy::new();
+    let term_config = TermConfig::default();
+    // (cols, rows) implements Dimensions via the tuple impl in alacritty_terminal.
+    let term = Term::new(
+        term_config,
+        &TermSize::new(cols as usize, rows as usize),
+        event_proxy.clone(),
+    );
     Ok(PaneSlot {
         pane_id,
-        parser: vt100::Parser::new(rows, cols, 10_000),
+        term,
+        processor: AnsiProcessor::new(),
+        event_proxy,
         input_tx,
         output_rx,
         recent_blocks: Vec::new(),
@@ -1001,14 +1127,19 @@ fn render_pane(
     // Store the content rect for mouse hit-test (used by scroll wheel handler).
     slot.last_screen_rect = content_area;
 
-    // ── Unified render: set_scrollback shifts the vt100 view; 0 = live ──
-    // Peek the total scrollback capacity: vt100 clamps set_scrollback to the actual
-    // buffer length, so setting MAX then reading back the offset gives us the true max.
-    slot.parser.set_scrollback(usize::MAX);
-    slot.scrollback_capacity = slot.parser.screen().scrollback();
+    // ── Unified render: scroll_display shifts the alacritty view; 0 = live ──
+    // Peek total scrollback capacity by temporarily jumping to Top, reading
+    // history_size(), then restoring to our desired offset.
+    slot.scrollback_capacity = slot.term.grid().history_size();
     // Clamp current offset in case old lines aged out of the ring buffer.
     slot.scroll_offset = slot.scroll_offset.min(slot.scrollback_capacity);
-    slot.parser.set_scrollback(slot.scroll_offset);
+    // Set display_offset to our desired scrollback position.
+    slot.term.grid_mut().scroll_display(Scroll::Bottom);
+    if slot.scroll_offset > 0 {
+        slot.term
+            .grid_mut()
+            .scroll_display(Scroll::Delta(slot.scroll_offset as i32));
+    }
 
     // When scrolled back, reserve 1 column on the right for a scrollbar.
     let (sb_area, text_area) = if slot.scroll_offset > 0 && content_area.width > 1 {
@@ -1021,24 +1152,24 @@ fn render_pane(
         (None, content_area)
     };
 
-    // Bug A fix: sync parser dimensions to the actual visible area each frame.
-    // If the parser was never resized (e.g. after a split), it still thinks it
+    // Bug A fix: sync terminal dimensions to the actual visible area each frame.
+    // If the terminal was never resized (e.g. after a split), it still thinks it
     // is the original full-terminal size and positions output beyond the pane
     // bounds, producing invisible or overlapping lines.
     {
-        let target_rows = text_area.height;
-        let target_cols = text_area.width;
-        let (cur_rows, cur_cols) = slot.parser.screen().size();
+        let target_rows = text_area.height as usize;
+        let target_cols = text_area.width as usize;
+        let cur_rows = slot.term.grid().screen_lines();
+        let cur_cols = slot.term.grid().columns();
 
         // Log on first call only (before parser_sized is set).
         if !slot.parser_sized {
-            let (p_rows, p_cols) = (cur_rows, cur_cols);
             tracing::debug!(
                 slot_idx,
                 text_area.width,
                 text_area.height,
-                parser_rows = p_rows,
-                parser_cols = p_cols,
+                parser_rows = cur_rows,
+                parser_cols = cur_cols,
                 "render_pane: first call"
             );
         }
@@ -1050,65 +1181,88 @@ fn render_pane(
                 old_cols = cur_cols,
                 new_rows = target_rows,
                 new_cols = target_cols,
-                "render_pane: parser resize"
+                "render_pane: terminal resize"
             );
-            slot.parser.set_size(target_rows, target_cols);
+            slot.term.resize(TermSize::new(target_cols, target_rows));
         }
         // On the first render we now know the real pane area. Drain any bytes
         // that arrived before this frame (buffered in pending_output at wrong
-        // size) through the correctly-sized parser, then mark as sized so
-        // subsequent bytes go directly to the parser.
+        // size) through the correctly-sized terminal, then mark as sized so
+        // subsequent bytes go directly to the terminal.
         if !slot.parser_sized {
             slot.parser_sized = true;
             if !slot.pending_output.is_empty() {
                 let buffered = std::mem::take(&mut slot.pending_output);
-                slot.parser.process(&buffered);
+                slot.processor.advance(&mut slot.term, &buffered);
             }
         }
         // Fire resize RPC when dims changed AND differ from last sent — avoid
         // spamming the daemon every frame. Collected into pending_resizes and
         // drained after draw() returns (async context).
         let (last_cols, last_rows) = slot.last_sent_size;
-        if target_cols != last_cols || target_rows != last_rows {
-            slot.last_sent_size = (target_cols, target_rows);
+        let target_cols_u16 = target_cols as u16;
+        let target_rows_u16 = target_rows as u16;
+        if target_cols_u16 != last_cols || target_rows_u16 != last_rows {
+            slot.last_sent_size = (target_cols_u16, target_rows_u16);
             pending_resizes.push((
                 slot.pane_id,
                 pyre_proto::PaneSize {
-                    cols: target_cols,
-                    rows: target_rows,
+                    cols: target_cols_u16,
+                    rows: target_rows_u16,
                 },
             ));
         }
     }
 
     {
-        let screen = slot.parser.screen();
+        let grid = slot.term.grid();
+        let num_rows = grid.screen_lines();
+        let num_cols = grid.columns();
         let mut lines: Vec<Line> = Vec::with_capacity(text_area.height as usize);
 
-        for row in 0..text_area.height {
+        for row in 0..text_area.height as usize {
             let mut spans: Vec<Span> = Vec::new();
             let mut current_text = String::new();
             let mut current_style = Style::default();
 
-            for col in 0..text_area.width {
-                let cell = screen.cell(row, col);
-                let (ch, fg, bg) = match cell {
-                    Some(c) => {
-                        let ch = if c.contents().is_empty() {
-                            ' '
-                        } else {
-                            c.contents().chars().next().unwrap_or(' ')
-                        };
-                        let fg = vt100_color(c.fgcolor());
-                        let bg = vt100_color(c.bgcolor());
-                        (ch, fg, bg)
-                    }
-                    None => (' ', None, None),
+            // The viewport top line when scrolled: display_offset lines above Line(0).
+            // display_iter visits rows from top of viewport downward; we index directly.
+            let display_line = TermLine(row as i32 - grid.display_offset() as i32);
+
+            for col in 0..text_area.width as usize {
+                let (ch, fg, bg, flags) = if row < num_rows && col < num_cols {
+                    let cell = &grid[TermPoint::new(display_line, TermColumn(col))];
+                    let ch = if cell.c == '\0' { ' ' } else { cell.c };
+                    (ch, ansi_color(cell.fg), ansi_color(cell.bg), cell.flags)
+                } else {
+                    (' ', None, None, CellFlags::empty())
                 };
 
-                let style = Style::default()
+                let mut style = Style::default()
                     .fg(fg.unwrap_or(Color::Reset))
                     .bg(bg.unwrap_or(Color::Reset));
+
+                if flags.contains(CellFlags::BOLD) {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                if flags.contains(CellFlags::DIM) {
+                    style = style.add_modifier(Modifier::DIM);
+                }
+                if flags.contains(CellFlags::ITALIC) {
+                    style = style.add_modifier(Modifier::ITALIC);
+                }
+                if flags.intersects(CellFlags::ALL_UNDERLINES) {
+                    style = style.add_modifier(Modifier::UNDERLINED);
+                }
+                if flags.contains(CellFlags::INVERSE) {
+                    style = style.add_modifier(Modifier::REVERSED);
+                }
+                if flags.contains(CellFlags::HIDDEN) {
+                    style = style.add_modifier(Modifier::HIDDEN);
+                }
+                if flags.contains(CellFlags::STRIKEOUT) {
+                    style = style.add_modifier(Modifier::CROSSED_OUT);
+                }
 
                 if style == current_style {
                     current_text.push(ch);
@@ -1868,7 +2022,9 @@ fn draw_frame(
                 if let Some(slot) = state.slots[slot_idx].as_ref() {
                     if slot.scroll_offset == 0 {
                         let vt_area = slot.last_screen_rect;
-                        let (vt_row, vt_col) = slot.parser.screen().cursor_position();
+                        let cursor_pt = slot.term.grid().cursor.point;
+                        let vt_row = cursor_pt.line.0.max(0) as u16;
+                        let vt_col = cursor_pt.column.0 as u16;
                         let cursor_x = vt_area
                             .x
                             .saturating_add(vt_col)
@@ -2277,27 +2433,26 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
             if let Some(ref mut sel) = state.selection {
                 if sel.dragging {
                     sel.dragging = false;
-                    // Extract selected text from the vt100 parser via per-cell iteration.
+                    // Extract selected text from the alacritty grid via per-cell iteration.
                     let pane_idx = sel.pane_idx;
                     let ((r0, c0), (r1, c1)) = sel.normalized();
                     if let Some(slot) = state.slots[pane_idx].as_ref() {
-                        let screen = slot.parser.screen();
+                        let grid = slot.term.grid();
+                        let num_cols = grid.columns();
                         let mut text = String::new();
                         for row in r0..=r1 {
                             if row > r0 {
                                 text.push('\n');
                             }
-                            let col_start = if row == r0 { c0 } else { 0 };
-                            let col_end = if row == r1 { c1 } else { screen.size().1 };
+                            let col_start = if row == r0 { c0 as usize } else { 0usize };
+                            let col_end = if row == r1 { c1 as usize } else { num_cols };
                             for col in col_start..=col_end {
-                                let contents = screen
-                                    .cell(row, col)
-                                    .map(|c| c.contents().to_owned())
-                                    .unwrap_or_default();
-                                if contents.is_empty() {
+                                let pt = TermPoint::new(TermLine(row as i32), TermColumn(col));
+                                let ch = grid[pt].c;
+                                if ch == '\0' {
                                     text.push(' ');
                                 } else {
-                                    text.push_str(&contents);
+                                    text.push(ch);
                                 }
                             }
                         }
@@ -2857,6 +3012,14 @@ async fn run_tui(
                             slot.frames_received += 1;
                             loop_bytes_processed += data.len() as u64;
                             slot.process_output(&data);
+                            // Forward any CPR/DSR responses generated by the
+                            // terminal emulator (e.g. ?1000h, cursor position
+                            // reports) back to the child PTY so nested TUIs
+                            // don't hang waiting for a reply.
+                            let responses = slot.drain_pty_responses();
+                            if !responses.is_empty() {
+                                let _ = slot.input_tx.try_send(Bytes::from(responses));
+                            }
                         }
                         PaneEvent::Closed { frames_received } => {
                             closed_slots.push((slot_idx, frames_received));
