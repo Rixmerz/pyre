@@ -2793,12 +2793,7 @@ enum PaneInit {
         session_name: String,
         pane: PaneId,
     },
-    /// An existing session has no panes yet; open one at real terminal size.
-    OpenPane {
-        session: SessionId,
-        session_name: String,
-    },
-    /// No sessions exist; spawn a fresh session+pane at real terminal size.
+    /// No sessions exist (or all existing sessions are stale); spawn a fresh session+pane at real terminal size.
     Spawn,
 }
 
@@ -2830,27 +2825,6 @@ async fn run_tui(
             session_name,
             pane,
         } => (session, session_name, pane),
-        PaneInit::OpenPane {
-            session,
-            session_name,
-        } => {
-            let req = OpenPaneReq {
-                session,
-                shell: shell.clone(),
-                cwd: std::env::current_dir()
-                    .ok()
-                    .or_else(|| std::env::var("HOME").ok().map(PathBuf::from)),
-                cols: init_cols,
-                rows: init_rows,
-                env: std::env::vars().collect(),
-            };
-            let pane = control
-                .open_pane(tarpc::context::current(), req)
-                .await
-                .context("rpc transport")?
-                .map_err(|e| anyhow!("daemon open_pane: {e}"))?;
-            (session, session_name, pane)
-        }
         PaneInit::Spawn => {
             let req = SpawnReq {
                 shell: shell.clone(),
@@ -3900,27 +3874,26 @@ async fn main() -> Result<()> {
                 .context("rpc transport")?
                 .map_err(|e| anyhow!("daemon list_sessions: {e}"))?;
 
-            let init = if let Some(sess) = existing.into_iter().next() {
-                // Session exists — try to find an existing pane. If the session
-                // has zero panes (e.g. freshly booted daemon with a bare session
-                // container), open one automatically so the TUI always starts
-                // with an attachable pane.
+            // Iterate sessions and pick the first one that has a live pane.
+            // Stale sessions (worker evicted, zero panes) will fail first_pane;
+            // skip them rather than trying to open a pane on a dead worker.
+            let mut init = PaneInit::Spawn;
+            for sess in existing {
                 match first_pane(&client, sess.id).await {
-                    Ok(pane) => PaneInit::Existing {
-                        session: sess.id,
-                        session_name: sess.name,
-                        pane,
-                    },
-                    Err(_) => PaneInit::OpenPane {
-                        session: sess.id,
-                        session_name: sess.name,
-                    },
+                    Ok(pane) => {
+                        init = PaneInit::Existing {
+                            session: sess.id,
+                            session_name: sess.name,
+                            pane,
+                        };
+                        break;
+                    }
+                    Err(_) => {
+                        // Session has no live pane — skip it.
+                        continue;
+                    }
                 }
-            } else {
-                // No sessions at all — spawn a fresh session+pane inside run_tui
-                // at real terminal dimensions.
-                PaneInit::Spawn
-            };
+            }
 
             run_tui(socket, init, client, shell).await
         }
