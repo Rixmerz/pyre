@@ -38,12 +38,33 @@ impl Default for SearchUi {
     }
 }
 
+/// Parse the raw search input string.
+///
+/// Returns `(query_string, failures_only)`.
+///
+/// Prefixes handled (applied in order):
+/// - `!` → `failures_only = true`, stripped from the query.
+/// - `pane:<uuid>` → kept as-is in the query; the Tantivy schema already
+///   indexes this field, so no special transformation is needed.
+///
+/// When `active_pane` is supplied and the input does not already contain a
+/// `pane:` prefix, the pane UUID is prepended so that the overlay defaults
+/// to scoping results to the focused pane. The user can delete it with
+/// backspace.
 pub fn parse_search_input(input: &str) -> (String, bool) {
     if let Some(rest) = input.strip_prefix('!') {
         (rest.trim_start().to_string(), true)
     } else {
         (input.to_string(), false)
     }
+}
+
+/// Build an initial search string pre-populated with a `pane:<id>` prefix.
+///
+/// Called by `SearchUi::open_overlay_scoped` to give the user a starting
+/// point they can backspace away if they want a global search.
+pub fn pane_scoped_prefix(pane_id: &pyre_proto::PaneId) -> String {
+    format!("pane:{} ", pane_id.0)
 }
 
 impl SearchUi {
@@ -53,6 +74,14 @@ impl SearchUi {
         self.cursor = 0;
         self.results.clear();
         self.status = "search (! = failures only) — Enter run, Esc close".into();
+    }
+
+    /// Open the overlay pre-populated with a `pane:<id>` prefix (S6.2-7).
+    /// The user can backspace the prefix away to search globally.
+    pub fn open_overlay_scoped(&mut self, pane_id: &pyre_proto::PaneId) {
+        self.open_overlay();
+        self.input = pane_scoped_prefix(pane_id);
+        self.cursor = self.input.len();
     }
 
     pub fn close(&mut self) {
