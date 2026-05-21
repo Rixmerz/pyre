@@ -201,8 +201,12 @@ impl SearchUi {
         let fg = [0xe8, 0xe8, 0xe8];
         let dim = [0x88, 0x88, 0x99];
 
-        fill_rect(atlas, buffer, buf_w, buf_h, panel_x0, panel_y0, panel_x1, panel_y1, bg);
-        draw_hline(atlas, buffer, buf_w, buf_h, panel_x0, panel_y0, panel_x1, border);
+        fill_rect(
+            atlas, buffer, buf_w, buf_h, panel_x0, panel_y0, panel_x1, panel_y1, bg,
+        );
+        draw_hline(
+            atlas, buffer, buf_w, buf_h, panel_x0, panel_y0, panel_x1, border,
+        );
         draw_hline(
             atlas,
             buffer,
@@ -228,17 +232,22 @@ impl SearchUi {
             bg,
         );
         row += 1;
-        draw_line(atlas, buffer, buf_w, buf_h, col, row, &format!("> {}", self.input), fg, bg);
+        draw_line(
+            atlas,
+            buffer,
+            buf_w,
+            buf_h,
+            col,
+            row,
+            &format!("> {}", self.input),
+            fg,
+            bg,
+        );
         row += 1;
         draw_line(atlas, buffer, buf_w, buf_h, col, row, &self.status, dim, bg);
         row += 1;
 
-        for (i, hit) in self
-            .results
-            .iter()
-            .take(MAX_VISIBLE_RESULTS)
-            .enumerate()
-        {
+        for (i, hit) in self.results.iter().take(MAX_VISIBLE_RESULTS).enumerate() {
             let sel = i == self.cursor;
             let line_bg = if sel { [0x2a, 0x22, 0x18] } else { bg };
             let cmd: String = hit.block.command.chars().take(32).collect();
@@ -273,7 +282,17 @@ fn fill_rect(
     let row0 = y0 / crate::atlas::CELL_H;
     for r in 0..rows {
         for c in 0..cols {
-            atlas.paint_cell(buffer, buf_w, buf_h, col0 + c, row0 + r, ' ', [0, 0, 0], bg, false);
+            atlas.paint_cell(
+                buffer,
+                buf_w,
+                buf_h,
+                col0 + c,
+                row0 + r,
+                ' ',
+                [0, 0, 0],
+                bg,
+                false,
+            );
         }
     }
 }
@@ -293,7 +312,17 @@ fn draw_hline(
     let col0 = x0 / crate::atlas::CELL_W;
     let cols = (x1 - x0) / crate::atlas::CELL_W;
     for c in 0..cols {
-        atlas.paint_cell(buffer, buf_w, buf_h, col0 + c, row, '─', color, color, false);
+        atlas.paint_cell(
+            buffer,
+            buf_w,
+            buf_h,
+            col0 + c,
+            row,
+            '─',
+            color,
+            color,
+            false,
+        );
     }
 }
 

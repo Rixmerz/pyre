@@ -519,7 +519,10 @@ impl WorkerState {
         let h = panes
             .get(&slot_idx)
             .ok_or_else(|| anyhow::anyhow!("unknown slot {slot_idx}"))?;
-        h.state_tracker.lock().expect("tracker poisoned").mark_seen();
+        h.state_tracker
+            .lock()
+            .expect("tracker poisoned")
+            .mark_seen();
         Ok(())
     }
 }
@@ -716,11 +719,7 @@ impl WorkerControl for WorkerControlImpl {
             .map_err(|e| RpcError::Internal(e.to_string()))
     }
 
-    async fn mark_pane_seen(
-        self,
-        _ctx: context::Context,
-        slot_idx: u32,
-    ) -> Result<(), RpcError> {
+    async fn mark_pane_seen(self, _ctx: context::Context, slot_idx: u32) -> Result<(), RpcError> {
         self.state
             .mark_pane_seen(slot_idx)
             .await

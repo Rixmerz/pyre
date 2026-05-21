@@ -15,9 +15,7 @@ pub fn classify_foreground(comm: &str) -> AgentKind {
         "cursor" | "cursor-agent" | "cursor-agent-cli" => AgentKind::CursorAgent,
         "droid" | "factory" => AgentKind::Droid,
         "amp" => AgentKind::Amp,
-        "bash" | "zsh" | "fish" | "sh" | "dash" | "ksh" | "tcsh" | "csh" | "nu" => {
-            AgentKind::Shell
-        }
+        "bash" | "zsh" | "fish" | "sh" | "dash" | "ksh" | "tcsh" | "csh" | "nu" => AgentKind::Shell,
         _ if base.contains("claude") => AgentKind::ClaudeCode,
         _ if base.contains("codex") => AgentKind::Codex,
         _ => AgentKind::Unknown,

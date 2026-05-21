@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use pyre_proto::{
-    ListBlocksReq, OpenPaneReq, PaneStateKind, PyreDaemonClient, SearchBlocksReq, SessionId,
-    SpawnReq, write_control_client,
+    write_control_client, ListBlocksReq, OpenPaneReq, PaneStateKind, PyreDaemonClient,
+    SearchBlocksReq, SessionId, SpawnReq,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -738,7 +738,10 @@ impl Server {
             .map_err(|e| anyhow!("{e}"))?;
 
         if reached {
-            Ok(format!("pane {} reached {state_str}", &pane_id.0.to_string()[..8]))
+            Ok(format!(
+                "pane {} reached {state_str}",
+                &pane_id.0.to_string()[..8]
+            ))
         } else {
             Err(anyhow!("timeout after {timeout_secs}s"))
         }

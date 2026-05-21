@@ -20,9 +20,9 @@ use bytes::Bytes;
 use futures::SinkExt;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
-use pyre_proto::{write_control_client, 
-    InputFrame, OpenPaneReq, OutputFrame, PyreDaemonClient, SpawnReq, SpawnResp,
-    MODE_STREAM,
+use pyre_proto::{
+    write_control_client, InputFrame, OpenPaneReq, OutputFrame, PyreDaemonClient, SpawnReq,
+    SpawnResp, MODE_STREAM,
 };
 use tarpc::client;
 use tarpc::tokio_serde::formats::Bincode;

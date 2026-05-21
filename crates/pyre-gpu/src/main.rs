@@ -13,11 +13,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
+use atlas::grid_dims_for_window;
 use bytes::Bytes;
 use clap::Parser;
 use futures::{SinkExt, StreamExt};
 use paint::Painter;
-use atlas::grid_dims_for_window;
 use pyre_proto::{
     write_control_client, InputFrame, OutputFrame, PaneId, PyreDaemonClient, SessionId, SpawnReq,
     SpawnResp, MODE_STREAM,
@@ -35,8 +35,8 @@ use tracing_subscriber::EnvFilter;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
-use winit::keyboard::ModifiersState;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::keyboard::ModifiersState;
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
@@ -159,11 +159,7 @@ impl ApplicationHandler for App {
         let attrs = WindowAttributes::default()
             .with_title(title)
             .with_inner_size(PhysicalSize::new(1200u32, 800u32));
-        let window = Arc::new(
-            event_loop
-                .create_window(attrs)
-                .expect("create window"),
-        );
+        let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         let ctx = SbContext::new(window.clone()).expect("softbuffer context");
         let surface = Surface::new(&ctx, window.clone()).expect("softbuffer surface");
         self.window = Some(window);
@@ -171,12 +167,7 @@ impl ApplicationHandler for App {
         self.needs_redraw = true;
     }
 
-    fn window_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        _id: WindowId,
-        event: WindowEvent,
-    ) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::ModifiersChanged(m) => {
@@ -376,7 +367,9 @@ fn key_to_bytes(event: &KeyEvent) -> Option<Vec<u8>> {
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+        )
         .init();
 
     let cli = Cli::parse();
@@ -409,10 +402,7 @@ async fn main() -> Result<()> {
     };
 
     let pane_ids = list_session_panes(&client, session).await?;
-    let pane_index = pane_ids
-        .iter()
-        .position(|p| *p == pane)
-        .unwrap_or(0);
+    let pane_index = pane_ids.iter().position(|p| *p == pane).unwrap_or(0);
 
     let (output_tx, output_rx) = mpsc::unbounded_channel();
     let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Bytes>();
@@ -497,10 +487,7 @@ async fn spawn_default(
     Ok((session, pane))
 }
 
-async fn list_session_panes(
-    client: &PyreDaemonClient,
-    session: SessionId,
-) -> Result<Vec<PaneId>> {
+async fn list_session_panes(client: &PyreDaemonClient, session: SessionId) -> Result<Vec<PaneId>> {
     let panes = client
         .list_panes(tarpc::context::current(), session)
         .await

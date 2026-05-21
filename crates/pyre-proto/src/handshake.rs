@@ -25,9 +25,7 @@ pub async fn read_control_version_after_tag<R: AsyncRead + Unpin>(r: &mut R) -> 
     if client_ver != PROTO_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "proto version mismatch: client={client_ver}, server={PROTO_VERSION}"
-            ),
+            format!("proto version mismatch: client={client_ver}, server={PROTO_VERSION}"),
         ));
     }
     Ok(())
@@ -40,7 +38,10 @@ pub async fn read_control_server<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<
     if tag[0] != MODE_CONTROL {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("expected control mode tag {MODE_CONTROL:#04x}, got {:#04x}", tag[0]),
+            format!(
+                "expected control mode tag {MODE_CONTROL:#04x}, got {:#04x}",
+                tag[0]
+            ),
         ));
     }
     read_control_version_after_tag(r).await

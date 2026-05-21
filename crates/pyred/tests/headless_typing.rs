@@ -16,7 +16,9 @@ use std::time::Duration;
 use futures::StreamExt;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
-use pyre_proto::{OutputFrame, PyreDaemonClient, SpawnReq, SpawnResp, write_control_client, MODE_STREAM};
+use pyre_proto::{
+    write_control_client, OutputFrame, PyreDaemonClient, SpawnReq, SpawnResp, MODE_STREAM,
+};
 use tarpc::client;
 use tarpc::tokio_serde::formats::Bincode;
 use tokio::io::AsyncWriteExt;

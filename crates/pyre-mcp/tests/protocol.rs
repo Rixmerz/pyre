@@ -186,7 +186,10 @@ fn test_live_session_spawn() {
 
     let mut daemon = Command::new(&pyred_bin)
         .env_clear()
-        .env("HOME", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
+        .env(
+            "HOME",
+            std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()),
+        )
         .env("XDG_RUNTIME_DIR", rt_dir.path())
         .env("PYRE_DATA_DIR", &data_dir)
         .stderr(Stdio::null())

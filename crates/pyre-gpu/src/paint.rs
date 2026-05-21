@@ -21,15 +21,7 @@ impl Painter {
             let col = idx % cols;
             let row = idx / cols;
             self.atlas.paint_cell(
-                buffer,
-                width,
-                height,
-                col,
-                row,
-                cell.ch,
-                cell.fg,
-                cell.bg,
-                cell.bold,
+                buffer, width, height, col, row, cell.ch, cell.fg, cell.bg, cell.bold,
             );
         }
     }

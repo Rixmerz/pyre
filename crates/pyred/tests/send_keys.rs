@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
-use pyre_proto::{PyreDaemonClient, SpawnReq, SpawnResp, write_control_client};
+use pyre_proto::{write_control_client, PyreDaemonClient, SpawnReq, SpawnResp};
 use tarpc::client;
 use tarpc::tokio_serde::formats::Bincode;
 use tokio::net::UnixStream;

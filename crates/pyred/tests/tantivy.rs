@@ -11,9 +11,9 @@ use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
-use pyre_proto::{write_control_client, 
-    InputFrame, ListBlocksReq, OutputFrame, PyreDaemonClient, SearchBlocksReq, SpawnReq, SpawnResp,
-    MODE_STREAM,
+use pyre_proto::{
+    write_control_client, InputFrame, ListBlocksReq, OutputFrame, PyreDaemonClient,
+    SearchBlocksReq, SpawnReq, SpawnResp, MODE_STREAM,
 };
 use std::sync::{Arc, Mutex};
 use tarpc::client;

@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
-use pyre_proto::{PyreDaemonClient, SpawnReq, SpawnResp, write_control_client};
+use pyre_proto::{write_control_client, PyreDaemonClient, SpawnReq, SpawnResp};
 use tarpc::client;
 use tarpc::tokio_serde::formats::Bincode;
 use tokio::net::UnixStream;
@@ -587,7 +587,10 @@ async fn run_hybrid_wait_pane() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("tarpc wait_pane_state: {e}"))?
         .map_err(|e| anyhow::anyhow!("wait_pane_state: {e:?}"))?;
 
-    assert!(reached, "wait_pane_state should return true when state is already set");
+    assert!(
+        reached,
+        "wait_pane_state should return true when state is already set"
+    );
 
     drop(rpc);
     let pid = Pid::from_raw(child.id() as i32);
