@@ -97,6 +97,16 @@ Mutating tools require `[mcp].allow_mutations = true` in config.
 3. **Hybrid workers** — crash isolation per agent session.
 4. **Reattach + replay** — grid snapshot and last N blocks after disconnect.
 
+## Renderer choice
+
+Launch `pyre` (TUI) for full multi-pane tiling. Launch `pyre-gpu` for
+a windowed view with GPU-accelerated cell rasterization.
+
+`pyre-gpu` is a single-pane-window today. Ctrl+Tab swaps the attached
+pane via stream reconnect — it does not tile. Use `pyre` if you need
+multiple agent panes visible at once. See [ADR-003](adr/0003-render-backend.md)
+for the gap and timeline (S6.2).
+
 ## Hooks
 
 Optional `hooks.toml` runs local scripts on `on_block_end` and

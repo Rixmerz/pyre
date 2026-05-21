@@ -22,6 +22,17 @@ Ctrl+Tab / Ctrl+Shift+Tab cycles panes in the active session (stream reconnect);
 Ctrl+/ opens Tantivy `search_blocks` overlay (`!query` = failures only).
 Full layout parity with `pyre` TUI and optional `wgpu` remain future work.
 
+### Phase 1 — single-pane-window constraint
+
+`pyre-gpu` is a **single-pane-window** viewer. Ctrl+Tab in `pyre-gpu`
+performs a stream reconnect — it detaches from the current pane and
+reattaches to the next one in the session. It does **not** tile or
+split the window; only one pane is visible at a time.
+
+`pyre` (the TUI) tiles multiple panes simultaneously using ratatui
+layout. Users expecting split-pane display should use `pyre` until
+real tiling lands in `pyre-gpu` (planned for S6.2).
+
 ## Rationale
 
 - **Binary swap, not rewrite:** `OutputFrame` / `InputFrame` framing stays stable;
