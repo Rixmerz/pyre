@@ -6,9 +6,15 @@
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use pyre_proto::{BlockEvent, OpenPaneReq, PaneId, PaneInfo, SessionId, SessionInfo, SpawnReq};
+use pyre_proto::{
+    AgentKind, BlockEvent, OpenPaneReq, PaneEvent, PaneEventKind, PaneId, PaneInfo, PaneStateKind,
+    SessionId, SessionInfo, SpawnReq,
+};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex as StdMutex,
+};
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
@@ -130,15 +136,89 @@ pub struct SessionState {
     pub panes: Mutex<HashMap<PaneId, Arc<PaneState>>>,
 }
 
-#[derive(Default)]
+/// Ring buffer capacity for pane events.  Large enough that a briefly
+/// disconnected client can always catch up; small enough to be free memory.
+const EVENT_RING_CAP: usize = 256;
+
 pub struct SessionRegistry {
     sessions: Mutex<HashMap<SessionId, Arc<SessionState>>>,
+    /// Broadcast channel: all pane lifecycle events.  Capacity = EVENT_RING_CAP.
+    pub event_tx: broadcast::Sender<PaneEvent>,
+    /// Ring buffer of the last EVENT_RING_CAP events; new subscribers can
+    /// drain history before subscribing to live events.
+    pub event_ring: StdMutex<std::collections::VecDeque<PaneEvent>>,
+    /// Monotonically increasing sequence counter.  Zero is reserved as the
+    /// "no events yet" sentinel for clients, so real events start at 1.
+    seq: AtomicU64,
+}
+
+impl Default for SessionRegistry {
+    fn default() -> Self {
+        let (event_tx, _) = broadcast::channel(EVENT_RING_CAP);
+        Self {
+            sessions: Mutex::new(HashMap::new()),
+            event_tx,
+            event_ring: StdMutex::new(std::collections::VecDeque::with_capacity(EVENT_RING_CAP)),
+            seq: AtomicU64::new(0),
+        }
+    }
 }
 
 impl SessionRegistry {
     pub fn new() -> Self {
         Self::default()
     }
+
+    // ── Event broadcaster ────────────────────────────────────────────────────
+
+    /// Assign the next sequence number, build a `PaneEvent`, push it into the
+    /// ring buffer, and broadcast to all current subscribers.
+    pub fn emit_event(
+        &self,
+        pane_id: PaneId,
+        kind: PaneEventKind,
+        state: Option<PaneStateKind>,
+        agent: Option<AgentKind>,
+    ) {
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let ev = PaneEvent {
+            seq,
+            pane_id: pane_id.0.to_string(),
+            kind,
+            state,
+            agent,
+        };
+        {
+            let mut ring = self.event_ring.lock().expect("event_ring poisoned");
+            if ring.len() >= EVENT_RING_CAP {
+                ring.pop_front();
+            }
+            ring.push_back(ev.clone());
+        }
+        // Ignore lagged-receiver errors — they just mean a slow subscriber
+        // missed some events and will get them from the ring on reconnect.
+        let _ = self.event_tx.send(ev);
+    }
+
+    /// Return all events from the ring with seq > `after_seq`, then subscribe
+    /// to the live broadcast.  Callers use this to avoid the TOCTOU gap
+    /// between draining history and subscribing.
+    pub fn events_after(&self, after_seq: u64) -> (Vec<PaneEvent>, broadcast::Receiver<PaneEvent>) {
+        // Subscribe first so no live events can be missed between ring drain
+        // and subscribing.
+        let rx = self.event_tx.subscribe();
+        let history: Vec<PaneEvent> = self
+            .event_ring
+            .lock()
+            .expect("event_ring poisoned")
+            .iter()
+            .filter(|e| e.seq > after_seq)
+            .cloned()
+            .collect();
+        (history, rx)
+    }
+
+    // ── Session/pane management ──────────────────────────────────────────────
 
     pub async fn new_session(&self, store: Arc<Store>, name: Option<String>) -> Arc<SessionState> {
         let id = SessionId::new();
@@ -196,6 +276,20 @@ impl SessionRegistry {
         session.panes.lock().await.insert(pane.id, pane.clone());
         *session.last_active_at.lock().await = Utc::now();
 
+        // Emit Spawned event *after* the pane is registered so any
+        // subscriber that immediately calls list_all_panes will see it.
+        let agent = pane
+            .state_tracker
+            .lock()
+            .map(|t| t.agent)
+            .unwrap_or(AgentKind::Unknown);
+        self.emit_event(
+            pane.id,
+            PaneEventKind::Spawned,
+            Some(PaneStateKind::Running),
+            Some(agent),
+        );
+
         Ok(pane)
     }
 
@@ -225,6 +319,7 @@ impl SessionRegistry {
         *pane.closed_at.lock().await = Some(Utc::now());
         session.panes.lock().await.remove(&pane_id);
         self.evict_session_if_empty(session.id).await;
+        self.emit_event(pane_id, PaneEventKind::Closed, None, None);
         Ok(())
     }
 
@@ -322,6 +417,7 @@ impl SessionRegistry {
             if let Err(e) = p.kill() {
                 tracing::warn!("kill pane {}: {e:#}", p.id);
             }
+            self.emit_event(p.id, PaneEventKind::Closed, None, None);
         }
         Ok(())
     }
@@ -345,6 +441,10 @@ impl SessionRegistry {
             sessions.remove(&sid);
             tracing::info!("session {sid} removed (last pane exited)");
         }
+        // Release sessions lock before emitting to avoid holding it across
+        // the broadcast send.
+        drop(sessions);
+        self.emit_event(pane_id, PaneEventKind::Closed, None, None);
     }
 
     /// Rename a session in-memory and persist to SQLite.

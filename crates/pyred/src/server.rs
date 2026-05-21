@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use pyre_proto::{
-    AttachAck, Block, BlockHit, BlockId, ListBlocksReq, OpenPaneReq, PaneId, PaneInfo,
+    AttachAck, Block, BlockHit, BlockId, ListBlocksReq, OpenPaneReq, PaneEvent, PaneId, PaneInfo,
     PaneStateKind, PyreError, ReplayBlocks, ResizePaneReq, ResizePaneRes, SearchBlocksReq,
     SessionId, SessionInfo, SpawnReq, SpawnResp,
 };
@@ -448,5 +448,64 @@ impl pyre_proto::service::PyreDaemon for DaemonImpl {
             .lock()
             .map_err(|_| PyreError::Io("focus_queue lock poisoned".into()))?
             .pop_front())
+    }
+
+    async fn next_pane_event(
+        self,
+        _ctx: context::Context,
+        after_seq: u64,
+        timeout_ms: u32,
+    ) -> Result<Vec<PaneEvent>, PyreError> {
+        // Drain any already-buffered events with seq > after_seq and subscribe
+        // to the live broadcast in one atomic step so no event can slip through.
+        let (history, mut rx) = self.registry.events_after(after_seq);
+        if !history.is_empty() {
+            return Ok(history);
+        }
+
+        let deadline = tokio::time::Duration::from_millis(timeout_ms.max(1) as u64);
+        let mut collected: Vec<PaneEvent> = Vec::new();
+
+        // Collect the first event that arrives, then drain any additional
+        // events that land within a short coalescing window (1 ms) so callers
+        // receive a small batch rather than one event per RPC round-trip.
+        let got_first = tokio::time::timeout(deadline, async {
+            loop {
+                match rx.recv().await {
+                    Ok(ev) if ev.seq > after_seq => {
+                        collected.push(ev);
+                        break;
+                    }
+                    Ok(_) => continue, // stale event from before our cursor
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Receiver fell behind; drain ring for missed events.
+                        let (missed, new_rx) = self.registry.events_after(after_seq);
+                        rx = new_rx;
+                        if !missed.is_empty() {
+                            collected.extend(missed);
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        })
+        .await;
+
+        if got_first.is_err() {
+            // Timeout — normal; return empty vec.
+            return Ok(vec![]);
+        }
+
+        // Coalesce: drain any additional events that arrive within 1 ms.
+        let coalesce = tokio::time::Duration::from_millis(1);
+        loop {
+            match tokio::time::timeout(coalesce, rx.recv()).await {
+                Ok(Ok(ev)) if ev.seq > after_seq => collected.push(ev),
+                _ => break,
+            }
+        }
+
+        Ok(collected)
     }
 }

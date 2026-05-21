@@ -322,6 +322,12 @@ pub fn spawn_state_engine(
                     hooks
                         .fire_state_change(session_id, pane_id, new_state, &reason)
                         .await;
+                    registry.emit_event(
+                        pane_id,
+                        pyre_proto::PaneEventKind::StateChanged,
+                        Some(new_state),
+                        None,
+                    );
                 }
             }
         }

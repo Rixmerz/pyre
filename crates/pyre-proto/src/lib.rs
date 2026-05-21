@@ -12,8 +12,8 @@ pub use handshake::{
 };
 pub use paths::runtime_pyre_dir;
 pub use service::{
-    AttachAck, InputFrame, OutputFrame, PidInspect, PyreDaemon, PyreDaemonClient, PyreError,
-    SpawnReq, MODE_CONTROL, MODE_STREAM,
+    AttachAck, InputFrame, OutputFrame, PaneEvent, PaneEventKind, PidInspect, PyreDaemon,
+    PyreDaemonClient, PyreError, SpawnReq, MODE_CONTROL, MODE_STREAM,
 };
 pub use sessions::{
     AgentKind, OpenPaneReq, PaneInfo, PaneStateKind, ReplayBlocks, ResizePaneReq, ResizePaneRes,

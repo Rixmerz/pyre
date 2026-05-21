@@ -400,37 +400,52 @@ impl Server {
         let uri_clone = uri.clone();
 
         let handle = tokio::spawn(async move {
-            let mut last_snapshot: Option<String> = None;
+            // Long-poll `next_pane_event` instead of 1 s polling on list_all_panes.
+            // seq=0 means "give me everything from the beginning"; each iteration
+            // advances seq to the last event seen so reconnects don't re-notify.
+            let mut seq: u64 = 0;
+            let mut backoff = std::time::Duration::from_millis(100);
 
             loop {
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-
-                let Ok(client) = control_client(&socket).await else {
-                    continue;
-                };
-                let Ok(Ok(panes)) = client.list_all_panes(tarpc::context::current()).await else {
-                    continue;
-                };
-
-                let Ok(snapshot) = serde_json::to_string(&panes) else {
-                    continue;
+                let client = match control_client(&socket).await {
+                    Ok(c) => c,
+                    Err(_) => {
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(std::time::Duration::from_secs(5));
+                        continue;
+                    }
                 };
 
-                let changed = last_snapshot
-                    .as_ref()
-                    .map(|prev| prev != &snapshot)
-                    .unwrap_or(true);
-
-                if changed {
-                    last_snapshot = Some(snapshot);
-                    let notif = Response::notification(
-                        "notifications/resources/updated",
-                        json!({ "uri": uri_clone }),
-                    );
-                    if let Ok(line) = serde_json::to_string(&notif) {
-                        if tx.send(line).await.is_err() {
-                            break;
+                match client
+                    .next_pane_event(tarpc::context::current(), seq, 30_000)
+                    .await
+                {
+                    Ok(Ok(events)) if !events.is_empty() => {
+                        // Advance cursor to the highest seq we received.
+                        if let Some(last) = events.last() {
+                            seq = last.seq;
                         }
+                        backoff = std::time::Duration::from_millis(100);
+                        // Any lifecycle event on a pane resource triggers an update
+                        // notification so the MCP client re-reads the resource.
+                        let notif = Response::notification(
+                            "notifications/resources/updated",
+                            json!({ "uri": uri_clone }),
+                        );
+                        if let Ok(line) = serde_json::to_string(&notif) {
+                            if tx.send(line).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(Ok(_)) => {
+                        // Empty response = normal long-poll timeout; loop immediately.
+                        backoff = std::time::Duration::from_millis(100);
+                    }
+                    _ => {
+                        // RPC error or transport failure — back off and reconnect.
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(std::time::Duration::from_secs(5));
                     }
                 }
             }

@@ -25,6 +25,40 @@ use thiserror::Error;
 
 use crate::{PaneId, SessionId};
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Pane event types for the broadcast long-poll RPC
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Discriminator for what triggered a `PaneEvent`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PaneEventKind {
+    /// A new pane was spawned (PTY open).
+    Spawned,
+    /// The pane's `PaneStateKind` changed.
+    StateChanged,
+    /// The pane was closed (shell exited or explicit close_pane call).
+    Closed,
+}
+
+/// One entry in the daemon-side broadcast ring buffer.
+///
+/// `seq` is a monotonically increasing counter across all events for a daemon
+/// instance; clients checkpoint their position via `after_seq` so they can
+/// resume after a transient disconnect without missing events.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaneEvent {
+    /// Monotonically increasing sequence number (starts at 1).
+    pub seq: u64,
+    /// String representation of the `PaneId` UUID.
+    pub pane_id: String,
+    /// What happened.
+    pub kind: PaneEventKind,
+    /// Current state, if known (absent for `Closed`).
+    pub state: Option<crate::PaneStateKind>,
+    /// Detected agent kind, if known.
+    pub agent: Option<crate::AgentKind>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpawnReq {
     pub shell: Option<String>,
@@ -144,6 +178,16 @@ pub trait PyreDaemon {
     async fn request_focus(pane_id: String) -> Result<bool, PyreError>;
     /// Dequeue the oldest pending focus request, if any (polled by the TUI each tick).
     async fn take_focus_request() -> Result<Option<String>, PyreError>;
+    /// Long-poll for pane lifecycle events.
+    ///
+    /// Returns all events whose `seq` is strictly greater than `after_seq`,
+    /// waiting up to `timeout_ms` milliseconds for at least one event to
+    /// arrive. Returns an empty `Vec` on timeout — that is a normal, non-error
+    /// result; the client should loop and pass the last `seq` it saw.
+    ///
+    /// The daemon keeps a ring buffer of the last 256 events so a client that
+    /// was briefly disconnected can still catch up without missing events.
+    async fn next_pane_event(after_seq: u64, timeout_ms: u32) -> Result<Vec<PaneEvent>, PyreError>;
 }
 
 /// Process metadata returned by `inspect_pid`.
