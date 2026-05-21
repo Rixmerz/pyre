@@ -1,0 +1,13 @@
+[package]
+name = "pyre-themes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+ratatui = { workspace = true }
+toml = { workspace = true }
+dirs = { workspace = true }
+anyhow = { workspace = true }

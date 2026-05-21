@@ -3175,6 +3175,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pyre-themes"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "ratatui",
+ "serde",
+ "toml",
+]
+
+[[package]]
 name = "pyre-tui"
 version = "0.1.0"
 dependencies = [
@@ -3186,6 +3197,7 @@ dependencies = [
  "futures",
  "libc",
  "pyre-proto",
+ "pyre-themes",
  "ratatui",
  "regex",
  "serde_json",
@@ -3193,6 +3205,7 @@ dependencies = [
  "tokio",
  "tokio-serde 0.9.0",
  "tokio-util",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "uuid",

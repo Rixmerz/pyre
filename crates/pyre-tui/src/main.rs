@@ -44,6 +44,7 @@ use pyre_proto::{
     write_control_client, Block, InputFrame, OpenPaneReq, OutputFrame, PaneId, PidInspect,
     PyreDaemonClient, SessionId, SpawnReq, SpawnResp, MODE_STREAM,
 };
+use pyre_themes::{Registry, Theme};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -709,6 +710,14 @@ impl Default for SearchState {
     }
 }
 
+/// State for the theme picker overlay (Ctrl-B T).
+struct ThemePickerState {
+    /// Index of the currently highlighted theme in the registry list.
+    cursor: usize,
+    /// Snapshot of theme names from the registry, in display order.
+    names: Vec<&'static str>,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Drag-selection types
 // ─────────────────────────────────────────────────────────────────────────────
@@ -888,6 +897,10 @@ struct AppState {
     anim: AnimClock,
     /// Block stdout modal pager (Some = open, None = closed).
     pager: Option<PagerState>,
+    /// Active theme (loaded from config on startup, switchable at runtime).
+    theme: Theme,
+    /// Theme picker overlay (Some = open, None = closed).
+    theme_picker: Option<ThemePickerState>,
 }
 
 impl AppState {
@@ -1162,19 +1175,20 @@ fn render_pane(
     pending_resizes: &mut Vec<(PaneId, pyre_proto::PaneSize)>,
     anim_frame: u64,
     attention: bool,
+    theme: &theme::LegacyTheme,
 ) {
     let short8: String = slot.pane_id.0.to_string().chars().take(8).collect();
     let seed = slot.pane_id.0.as_u128() as u32;
     let border_block = if focused {
         let border_style = if attention {
-            fire_motion::ember_border_style(anim_frame, seed, EMBER.border_focus, EMBER.spark)
+            fire_motion::ember_border_style(anim_frame, seed, theme.border_focus, theme.spark)
         } else {
-            EMBER.border_focus()
+            theme.border_focus()
         };
         let title_style = if attention {
-            fire_motion::ember_title_style(anim_frame, seed, EMBER.primary, EMBER.spark)
+            fire_motion::ember_title_style(anim_frame, seed, theme.primary, theme.spark)
         } else {
-            EMBER.title(EMBER.primary)
+            theme.title(theme.primary)
         };
         RatatuiBlock::default()
             .borders(Borders::ALL)
@@ -1188,21 +1202,21 @@ fn render_pane(
             .border_style(fire_motion::ember_border_style(
                 anim_frame,
                 seed,
-                EMBER.border,
-                EMBER.primary,
+                theme.border,
+                theme.primary,
             ))
             .title(Span::styled(
                 format!(" pane {short8} "),
-                fire_motion::ember_title_style(anim_frame, seed, EMBER.text_dim, EMBER.secondary),
+                fire_motion::ember_title_style(anim_frame, seed, theme.text_dim, theme.secondary),
             ))
     } else {
         RatatuiBlock::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(EMBER.border())
+            .border_style(theme.border())
             .title(Span::styled(
                 format!(" pane {short8} "),
-                EMBER.title(EMBER.text_dim),
+                theme.title(theme.text_dim),
             ))
     };
 
@@ -1416,8 +1430,8 @@ fn render_pane(
         let mut sb_state = ScrollbarState::new(virtual_total).position(position);
         frame.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                .style(EMBER.border())
-                .thumb_style(Style::default().fg(EMBER.primary))
+                .style(theme.border())
+                .thumb_style(Style::default().fg(theme.primary))
                 .track_symbol(Some("│"))
                 .thumb_symbol("█"),
             sb_rect,
@@ -1426,18 +1440,23 @@ fn render_pane(
     }
 
     // ── ribbon render ──
-    render_ribbon(frame, ribbon_area, slot);
+    render_ribbon(frame, ribbon_area, slot, theme);
 }
 
 /// Render the one-line block ribbon inside `area`.
 /// Captures chip rects into `slot.ribbon_chip_rects` for mouse hit-test.
-fn render_ribbon(frame: &mut ratatui::Frame, area: Rect, slot: &mut PaneSlot) {
+fn render_ribbon(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    slot: &mut PaneSlot,
+    theme: &theme::LegacyTheme,
+) {
     // Clear chip rects from the previous frame.
     slot.ribbon_chip_rects.clear();
 
     if slot.recent_blocks.is_empty() {
         let p =
-            Paragraph::new(" (no blocks)").style(Style::default().fg(EMBER.text_dim).bg(EMBER.bg));
+            Paragraph::new(" (no blocks)").style(Style::default().fg(theme.text_dim).bg(theme.bg));
         frame.render_widget(p, area);
         return;
     }
@@ -1456,9 +1475,9 @@ fn render_ribbon(frame: &mut ratatui::Frame, area: Rect, slot: &mut PaneSlot) {
 
         // Exit code badge colour and prefix.
         let (badge_fg, live_prefix) = match b.exit_code {
-            Some(0) => (EMBER.ok, ""),
-            Some(_) => (EMBER.err, ""),
-            None => (EMBER.spark, "●"),
+            Some(0) => (theme.ok, ""),
+            Some(_) => (theme.err, ""),
+            None => (theme.spark, "●"),
         };
 
         let sep = if i > 0 { "│" } else { "" };
@@ -1481,24 +1500,24 @@ fn render_ribbon(frame: &mut ratatui::Frame, area: Rect, slot: &mut PaneSlot) {
         x_offset += sep_len + chip_len;
 
         let chip_style = if i == highlight_idx && !is_live {
-            EMBER.selection()
+            theme.selection()
         } else if i == latest_idx && is_live {
             Style::default()
-                .fg(EMBER.bg)
-                .bg(EMBER.primary)
+                .fg(theme.bg)
+                .bg(theme.primary)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(badge_fg).bg(EMBER.muted_bg)
+            Style::default().fg(badge_fg).bg(theme.muted_bg)
         };
 
         if i > 0 {
-            spans.push(Span::styled("│", Style::default().fg(EMBER.text_dim)));
+            spans.push(Span::styled("│", Style::default().fg(theme.text_dim)));
         }
         spans.push(Span::styled(chip_text, chip_style));
     }
 
     frame.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(EMBER.bg)),
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.bg)),
         area,
     );
 }
@@ -1516,6 +1535,7 @@ fn render_layout(
     pending_resizes: &mut Vec<(PaneId, pyre_proto::PaneSize)>,
     anim_frame: u64,
     panes_meta: &[pyre_proto::PaneInfo],
+    theme: &theme::LegacyTheme,
 ) {
     match node {
         LayoutNode::Leaf(slot_idx) => {
@@ -1532,6 +1552,7 @@ fn render_layout(
                     pending_resizes,
                     anim_frame,
                     attention,
+                    theme,
                 );
             }
         }
@@ -1569,6 +1590,7 @@ fn render_layout(
                     pending_resizes,
                     anim_frame,
                     panes_meta,
+                    theme,
                 );
                 current_path.pop();
             }
@@ -1607,6 +1629,7 @@ fn render_layout(
                     pending_resizes,
                     anim_frame,
                     panes_meta,
+                    theme,
                 );
                 current_path.pop();
             }
@@ -1615,7 +1638,7 @@ fn render_layout(
 }
 
 /// Render the search overlay centered on the terminal.
-fn render_search_overlay(frame: &mut ratatui::Frame, app: &AppState) {
+fn render_search_overlay(frame: &mut ratatui::Frame, app: &AppState, t: &theme::LegacyTheme) {
     let area = frame.area();
 
     // Centered rect: ~70% width, ~60% height.
@@ -1631,12 +1654,9 @@ fn render_search_overlay(frame: &mut ratatui::Frame, app: &AppState) {
     let outer = RatatuiBlock::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Double)
-        .border_style(EMBER.border_focus())
-        .title(Span::styled(
-            " search (! = failures) ",
-            EMBER.title(EMBER.primary),
-        ))
-        .style(EMBER.overlay());
+        .border_style(t.border_focus())
+        .title(Span::styled(" search (! = failures) ", t.title(t.primary)))
+        .style(t.overlay());
     let inner = outer.inner(overlay_rect);
     frame.render_widget(outer, overlay_rect);
 
@@ -1652,21 +1672,21 @@ fn render_search_overlay(frame: &mut ratatui::Frame, app: &AppState) {
     // Input box — prompt prefix `> ` in primary, query in text, cursor █ in spark.
     let cursor_f = app.anim.frame();
     let input_spans = vec![
-        Span::styled("> ", Style::default().fg(EMBER.primary)),
-        Span::styled(app.search.input.as_str(), Style::default().fg(EMBER.text)),
+        Span::styled("> ", Style::default().fg(t.primary)),
+        Span::styled(app.search.input.as_str(), Style::default().fg(t.text)),
         Span::styled(
             "█",
-            fire_motion::ember_fg_style(cursor_f, 0x_a11ce, EMBER.spark, EMBER.secondary, 0.9),
+            fire_motion::ember_fg_style(cursor_f, 0x_a11ce, t.spark, t.secondary, 0.9),
         ),
     ];
     let input_block = RatatuiBlock::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(EMBER.border())
-        .style(EMBER.overlay());
+        .border_style(t.border())
+        .style(t.overlay());
     let input_para = Paragraph::new(Line::from(input_spans))
         .block(input_block)
-        .style(EMBER.bg_style());
+        .style(t.bg_style());
     frame.render_widget(input_para, input_area);
 
     // Set host cursor at end of input text: inner input area x + 2 (prompt) + query len.
@@ -1693,7 +1713,7 @@ fn render_search_overlay(frame: &mut ratatui::Frame, app: &AppState) {
                 hit.snippet.chars().take(80).collect()
             };
             ListItem::new(format!("[{pane_short}] {ts_short} {snippet}"))
-                .style(Style::default().fg(EMBER.text))
+                .style(Style::default().fg(t.text))
         })
         .collect();
 
@@ -1702,14 +1722,14 @@ fn render_search_overlay(frame: &mut ratatui::Frame, app: &AppState) {
             RatatuiBlock::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(EMBER.border())
+                .border_style(t.border())
                 .title(Span::styled(
                     format!(" {} results ", app.search.results.len()),
-                    Style::default().fg(EMBER.text_dim),
+                    Style::default().fg(t.text_dim),
                 ))
-                .style(EMBER.overlay()),
+                .style(t.overlay()),
         )
-        .highlight_style(EMBER.selection());
+        .highlight_style(t.selection());
 
     // Use a stateful list so we can highlight the cursor item.
     let mut list_state = ratatui::widgets::ListState::default();
@@ -1725,7 +1745,7 @@ fn render_search_overlay(frame: &mut ratatui::Frame, app: &AppState) {
 ///   - Title bar  (1 row): block id + exit code
 ///   - Body       (fill):  scrollable stdout lines
 ///   - Footer     (1 row): scroll hints + keybinding hint
-fn render_pager(frame: &mut ratatui::Frame, pager: &PagerState) {
+fn render_pager(frame: &mut ratatui::Frame, pager: &PagerState, t: &theme::LegacyTheme) {
     let area = frame.area();
 
     // Dim the background to indicate a blocking overlay.
@@ -1734,8 +1754,8 @@ fn render_pager(frame: &mut ratatui::Frame, pager: &PagerState) {
     let outer = RatatuiBlock::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Double)
-        .border_style(EMBER.border_focus())
-        .style(EMBER.overlay());
+        .border_style(t.border_focus())
+        .style(t.overlay());
 
     // Build a title that includes the block id and exit code.
     let exit_label = match pager.exit_code {
@@ -1745,7 +1765,7 @@ fn render_pager(frame: &mut ratatui::Frame, pager: &PagerState) {
     };
     let title_str = format!(" {} |{exit_label}", &pager.block_id);
 
-    let outer_with_title = outer.title(Span::styled(title_str, EMBER.title(EMBER.primary)));
+    let outer_with_title = outer.title(Span::styled(title_str, t.title(t.primary)));
     let inner = outer_with_title.inner(area);
     frame.render_widget(outer_with_title, area);
 
@@ -1765,11 +1785,11 @@ fn render_pager(frame: &mut ratatui::Frame, pager: &PagerState) {
         .iter()
         .skip(pager.scroll)
         .take(visible_rows)
-        .map(|l| Line::from(Span::styled(l.as_str(), Style::default().fg(EMBER.text))))
+        .map(|l| Line::from(Span::styled(l.as_str(), Style::default().fg(t.text))))
         .collect();
 
     let body = Paragraph::new(visible)
-        .style(EMBER.bg_style())
+        .style(t.bg_style())
         .wrap(ratatui::widgets::Wrap { trim: false });
     frame.render_widget(body, body_area);
 
@@ -1787,14 +1807,14 @@ fn render_pager(frame: &mut ratatui::Frame, pager: &PagerState) {
 
     // Footer: hint line.
     let hint = Paragraph::new(Line::from(vec![
-        Span::styled(" ↑/↓ ", Style::default().fg(EMBER.primary)),
-        Span::styled("scroll  ", Style::default().fg(EMBER.text_dim)),
-        Span::styled("PgUp/PgDn ", Style::default().fg(EMBER.primary)),
-        Span::styled("page  ", Style::default().fg(EMBER.text_dim)),
-        Span::styled("q/Esc ", Style::default().fg(EMBER.primary)),
-        Span::styled("close", Style::default().fg(EMBER.text_dim)),
+        Span::styled(" ↑/↓ ", Style::default().fg(t.primary)),
+        Span::styled("scroll  ", Style::default().fg(t.text_dim)),
+        Span::styled("PgUp/PgDn ", Style::default().fg(t.primary)),
+        Span::styled("page  ", Style::default().fg(t.text_dim)),
+        Span::styled("q/Esc ", Style::default().fg(t.primary)),
+        Span::styled("close", Style::default().fg(t.text_dim)),
     ]))
-    .style(EMBER.bg_style());
+    .style(t.bg_style());
     frame.render_widget(hint, footer_area);
 }
 
@@ -1810,14 +1830,14 @@ fn state_dot_char(state: pyre_proto::PaneStateKind) -> char {
     }
 }
 
-fn state_dot_color(state: pyre_proto::PaneStateKind) -> Color {
+fn state_dot_color(state: pyre_proto::PaneStateKind, t: &theme::LegacyTheme) -> Color {
     use pyre_proto::PaneStateKind::*;
     match state {
-        Running => EMBER.ok,
-        WaitingInput => EMBER.spark,
-        Idle | Done => EMBER.text_dim,
-        Interactive => EMBER.info,
-        Crashed => EMBER.err,
+        Running => t.ok,
+        WaitingInput => t.spark,
+        Idle | Done => t.text_dim,
+        Interactive => t.info,
+        Crashed => t.err,
     }
 }
 
@@ -1869,12 +1889,17 @@ fn session_name_for(state: &AppState, session_id: pyre_proto::SessionId) -> Stri
         })
 }
 
-fn render_sidebar(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
+fn render_sidebar(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    state: &AppState,
+    t: &theme::LegacyTheme,
+) {
     let block = RatatuiBlock::default()
         .borders(Borders::RIGHT)
         .border_type(BorderType::Rounded)
-        .style(EMBER.bg_style())
-        .title(Span::styled(" agents ", EMBER.title(EMBER.primary)));
+        .style(t.bg_style())
+        .title(Span::styled(" agents ", t.title(t.primary)));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1891,12 +1916,12 @@ fn render_sidebar(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
             let dot_color = if info.state == pyre_proto::PaneStateKind::WaitingInput && !info.seen {
                 let p = fire_motion::pulse_phase(anim_f, seed, 9.0);
                 fire_motion::lerp_rgb(
-                    fire_motion::rgb_tuple(state_dot_color(info.state)),
-                    fire_motion::rgb_tuple(EMBER.secondary),
+                    fire_motion::rgb_tuple(state_dot_color(info.state, t)),
+                    fire_motion::rgb_tuple(t.secondary),
                     p * 0.55,
                 )
             } else {
-                state_dot_color(info.state)
+                state_dot_color(info.state, t)
             };
             let label = agent_ui_label(info.state, info.seen);
             let agent = info.agent.label();
@@ -1904,15 +1929,15 @@ fn render_sidebar(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
             let pane_short = &id_str[..8.min(id_str.len())];
             let row_style = if i == state.sidebar_cursor && state.sidebar_focused {
                 Style::default()
-                    .fg(EMBER.bg)
-                    .bg(EMBER.primary)
+                    .fg(t.bg)
+                    .bg(t.primary)
                     .add_modifier(Modifier::BOLD)
             } else if i == state.sidebar_cursor {
                 Style::default().add_modifier(Modifier::REVERSED)
             } else if info.state == pyre_proto::PaneStateKind::WaitingInput && !info.seen {
-                fire_motion::ember_fg_style(anim_f, seed, EMBER.spark, EMBER.text, 0.45)
+                fire_motion::ember_fg_style(anim_f, seed, t.spark, t.text, 0.45)
             } else {
-                Style::default().fg(EMBER.text)
+                Style::default().fg(t.text)
             };
             ListItem::new(Line::from(vec![
                 Span::styled("  ", row_style),
@@ -1922,12 +1947,17 @@ fn render_sidebar(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
         })
         .collect();
 
-    let list = List::new(items).style(EMBER.bg_style());
+    let list = List::new(items).style(t.bg_style());
     frame.render_widget(list, inner);
 }
 
 /// Render the name-prompt overlay and position the host cursor.
-fn render_name_prompt(frame: &mut ratatui::Frame, prompt: &NamePrompt, anim_frame: u64) {
+fn render_name_prompt(
+    frame: &mut ratatui::Frame,
+    prompt: &NamePrompt,
+    anim_frame: u64,
+    t: &theme::LegacyTheme,
+) {
     let area = frame.area();
     let w = (area.width as f32 * 0.60) as u16;
     let h: u16 = 5;
@@ -1946,9 +1976,9 @@ fn render_name_prompt(frame: &mut ratatui::Frame, prompt: &NamePrompt, anim_fram
     let outer = RatatuiBlock::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Double)
-        .border_style(EMBER.border_focus())
-        .title(Span::styled(title, EMBER.title(EMBER.primary)))
-        .style(EMBER.overlay());
+        .border_style(t.border_focus())
+        .title(Span::styled(title, t.title(t.primary)))
+        .style(t.overlay());
     let inner = outer.inner(overlay_rect);
     frame.render_widget(outer, overlay_rect);
 
@@ -1966,22 +1996,111 @@ fn render_name_prompt(frame: &mut ratatui::Frame, prompt: &NamePrompt, anim_fram
     let hint_area = split[1];
 
     let input_spans = vec![
-        Span::styled("> ", Style::default().fg(EMBER.primary)),
-        Span::styled(prompt.input.as_str(), Style::default().fg(EMBER.text)),
+        Span::styled("> ", Style::default().fg(t.primary)),
+        Span::styled(prompt.input.as_str(), Style::default().fg(t.text)),
         Span::styled(
             "█",
-            fire_motion::ember_fg_style(anim_frame, 0xc0ffee, EMBER.spark, EMBER.secondary, 0.9),
+            fire_motion::ember_fg_style(anim_frame, 0xc0ffee, t.spark, t.secondary, 0.9),
         ),
     ];
     frame.render_widget(Paragraph::new(Line::from(input_spans)), input_area);
 
-    let hint = Paragraph::new(" Enter = create  |  Esc = cancel")
-        .style(Style::default().fg(EMBER.text_dim));
+    let hint =
+        Paragraph::new(" Enter = create  |  Esc = cancel").style(Style::default().fg(t.text_dim));
     frame.render_widget(hint, hint_area);
 
     // Host cursor at end of input.
     let cursor_col = (2u16 + prompt.input.len() as u16).min(input_area.width.saturating_sub(1));
     frame.set_cursor_position((input_area.x + cursor_col, input_area.y));
+}
+
+/// Render the theme picker overlay (Ctrl-B T).
+///
+/// Layout: centered modal ~60% wide × ~70% tall.
+/// Each row shows: `[kind] display_name  ░ bg ░ fg ░ accent ░ border_focus ░ cursor ░ ok ░ warn ░ error`
+fn render_theme_picker(frame: &mut ratatui::Frame, state: &AppState) {
+    let picker = match state.theme_picker.as_ref() {
+        Some(p) => p,
+        None => return,
+    };
+
+    let reg = Registry::builtin();
+    let themes = reg.list();
+
+    let area = frame.area();
+    let w = (area.width as f32 * 0.60) as u16;
+    let h = (area.height as f32 * 0.70) as u16;
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let overlay_rect = Rect::new(x, y, w.max(40), h.max(8));
+
+    frame.render_widget(Clear, overlay_rect);
+
+    let outer = RatatuiBlock::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(EMBER.border_focus())
+        .title(Span::styled(
+            " theme picker  ↑/↓ select  Enter apply  Esc cancel ",
+            EMBER.title(EMBER.primary),
+        ))
+        .style(EMBER.overlay());
+    let inner = outer.inner(overlay_rect);
+    frame.render_widget(outer, overlay_rect);
+
+    let visible_rows = inner.height as usize;
+
+    // Scroll window: keep cursor visible.
+    let scroll_top = if picker.cursor >= visible_rows {
+        picker.cursor - visible_rows + 1
+    } else {
+        0
+    };
+
+    for (row_idx, theme_idx) in (scroll_top..).take(visible_rows).enumerate() {
+        let Some(theme) = themes.get(theme_idx) else {
+            break;
+        };
+
+        let y_pos = inner.y + row_idx as u16;
+        let is_selected = theme_idx == picker.cursor;
+
+        let kind_badge = match theme.kind {
+            pyre_themes::ThemeKind::Dark => "dark ",
+            pyre_themes::ThemeKind::Light => "lite ",
+        };
+
+        // Build the row with 8 swatch cells.
+        let swatch_roles: [ratatui::style::Color; 8] = [
+            theme.palette.bg.to_ratatui(),
+            theme.palette.fg.to_ratatui(),
+            theme.palette.accent.to_ratatui(),
+            theme.palette.border_focus.to_ratatui(),
+            theme.palette.cursor.to_ratatui(),
+            theme.palette.ok.to_ratatui(),
+            theme.palette.warn.to_ratatui(),
+            theme.palette.error.to_ratatui(),
+        ];
+
+        let row_bg = if is_selected { EMBER.primary } else { EMBER.bg };
+        let row_fg = if is_selected { EMBER.bg } else { EMBER.text };
+
+        let label = format!("{kind_badge}{}", theme.display_name);
+        let mut spans: Vec<Span> = vec![Span::styled(
+            format!(" {label:<28} "),
+            Style::default().fg(row_fg).bg(row_bg),
+        )];
+
+        for swatch in &swatch_roles {
+            spans.push(Span::styled("░", Style::default().fg(*swatch).bg(row_bg)));
+        }
+        spans.push(Span::styled(" ", Style::default().bg(row_bg)));
+
+        frame.render_widget(
+            ratatui::widgets::Paragraph::new(Line::from(spans)),
+            Rect::new(inner.x, y_pos, inner.width, 1),
+        );
+    }
 }
 
 fn draw_frame(
@@ -1991,6 +2110,7 @@ fn draw_frame(
 ) -> Result<()> {
     terminal.draw(|frame| {
         let area = frame.area();
+        let t = theme::LegacyTheme::from_palette(&state.theme.palette);
 
         // Four rows: sessions strip (1) + tabs strip (1) + body (min 0) + status bar (1)
         let outer = Layout::default()
@@ -2139,7 +2259,7 @@ fn draw_frame(
         };
 
         if let Some(sbar_area) = sidebar_area_opt {
-            render_sidebar(frame, sbar_area, state);
+            render_sidebar(frame, sbar_area, state, &t);
         }
 
         // Render active tab's layout in the remaining area.
@@ -2176,6 +2296,7 @@ fn draw_frame(
                         &mut state.pending_resizes,
                         anim_frame,
                         attention,
+                        &t,
                     );
                 }
             }
@@ -2193,6 +2314,7 @@ fn draw_frame(
                 &mut state.pending_resizes,
                 anim_frame,
                 panes_meta,
+                &t,
             );
         }
         state.sessions[state.active_session].tabs[active_tab_idx].boundaries = new_boundaries;
@@ -2288,12 +2410,14 @@ fn draw_frame(
         // Overlays or scrollback suppress it.
         if let Some(ref pager) = state.pager {
             // Block pager — full-screen, draws over everything, no cursor.
-            render_pager(frame, pager);
+            render_pager(frame, pager, &t);
+        } else if state.theme_picker.is_some() {
+            render_theme_picker(frame, state);
         } else if let Some(ref prompt) = state.prompt {
-            render_name_prompt(frame, prompt, state.anim.frame());
+            render_name_prompt(frame, prompt, state.anim.frame(), &t);
         } else if state.search.open {
             // Search overlay — drawn on top of everything else and owns cursor.
-            render_search_overlay(frame, state);
+            render_search_overlay(frame, state, &t);
         } else if state.pid_inspect.is_none() {
             // No blocking overlay: propagate vt100 cursor from focused pane.
             let sv = &state.sessions[state.active_session];
@@ -3046,6 +3170,7 @@ fn close_focused_pane(state: &mut AppState) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Build an `AppState` from one already-attached initial session/pane.
+#[allow(clippy::too_many_arguments)]
 fn initial_app_state(
     session: SessionId,
     session_name: String,
@@ -3054,6 +3179,7 @@ fn initial_app_state(
     socket: PathBuf,
     shell: Option<String>,
     blocks_rx: watch::Receiver<HashMap<PaneId, Vec<Block>>>,
+    theme: Theme,
 ) -> AppState {
     AppState {
         sessions: vec![SessionView {
@@ -3094,6 +3220,8 @@ fn initial_app_state(
         blocks_rx,
         anim: AnimClock::new(),
         pager: None,
+        theme,
+        theme_picker: None,
     }
 }
 
@@ -3224,6 +3352,18 @@ async fn run_tui(
         });
     }
 
+    // Load theme from config (non-fatal — fall back to default on any error).
+    let theme = {
+        let reg = Registry::builtin();
+        let name = pyre_themes::config::load_theme_name()
+            .unwrap_or(None)
+            .unwrap_or_else(|| Registry::default_theme().to_owned());
+        reg.get(&name)
+            .or_else(|| reg.get(Registry::default_theme()))
+            .expect("ember always present")
+            .clone()
+    };
+
     let mut state = initial_app_state(
         session,
         session_name,
@@ -3232,6 +3372,7 @@ async fn run_tui(
         socket,
         shell,
         blocks_rx,
+        theme,
     );
 
     // Eagerly discover all other sessions the daemon already knows about so
@@ -3744,6 +3885,44 @@ async fn run_tui(
                     continue;
                 }
 
+                // Theme picker key handling — intercepts all keys while open.
+                if state.theme_picker.is_some() {
+                    match code {
+                        KeyCode::Esc | KeyCode::Char('q') => {
+                            state.theme_picker = None;
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            if let Some(ref mut p) = state.theme_picker {
+                                p.cursor = p.cursor.saturating_sub(1);
+                            }
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            if let Some(ref mut p) = state.theme_picker {
+                                let max = p.names.len().saturating_sub(1);
+                                p.cursor = (p.cursor + 1).min(max);
+                            }
+                        }
+                        KeyCode::Enter => {
+                            if let Some(p) = state.theme_picker.take() {
+                                let name = p.names[p.cursor];
+                                let reg = Registry::builtin();
+                                if let Some(t) = reg.get(name) {
+                                    state.theme = t.clone();
+                                    if let Err(e) = pyre_themes::config::save_theme_name(name) {
+                                        tracing::warn!("save theme failed: {e}");
+                                        state.status_msg = Some(format!("theme saved (warn: {e})"));
+                                    } else {
+                                        state.status_msg =
+                                            Some(format!("theme: {}", t.display_name));
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 // Block stdout pager key handling — intercepts all keys while open.
                 if state.pager.is_some() {
                     let visible_rows = body_area.height.saturating_sub(2) as usize; // inner - footer
@@ -3946,6 +4125,19 @@ async fn run_tui(
                                 kind: PromptKind::NewSession,
                                 input: String::new(),
                             });
+                        }
+
+                        // Theme picker (Ctrl-B T — uppercase to avoid collision with lower-t)
+                        KeyCode::Char('T') => {
+                            let reg = Registry::builtin();
+                            let names: Vec<&'static str> =
+                                reg.list().iter().map(|t| t.name).collect();
+                            // Pre-select the currently active theme.
+                            let cursor = names
+                                .iter()
+                                .position(|&n| n == state.theme.name)
+                                .unwrap_or(0);
+                            state.theme_picker = Some(ThemePickerState { cursor, names });
                         }
 
                         // Rename active session (Ctrl-B ,  — mirrors tmux rename-session)
