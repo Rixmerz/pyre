@@ -283,17 +283,7 @@ fn read_comm(pid: u32) -> Option<String> {
 
 #[cfg(target_os = "macos")]
 fn read_comm(pid: u32) -> Option<String> {
-    use std::process::Command;
-    let out = Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "comm="])
-        .output()
-        .ok()?;
-    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if name.is_empty() {
-        None
-    } else {
-        Some(name)
-    }
+    libproc::proc_pid::name(pid as i32).ok()
 }
 
 /// Non-Linux, non-macOS: no portable comm reader.
