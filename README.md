@@ -111,6 +111,24 @@ Prefix: `Ctrl-B`
 | Mouse click | Focus pane under cursor |
 | Mouse wheel | Scroll output |
 
+## Quickstart smoke test (10 min)
+
+Exercises daemon, TUI, `pyrec`, and search end-to-end on a single machine.
+Assumes binaries are built and `pyred` is not already running.
+
+1. `pyred &` — start the daemon in single-process mode (default). Use `pyred --config <path>` with `process_model = "hybrid"` for the supervisor model.
+2. `pyre` — launch the TUI; a fresh session opens automatically (the daemon spawns a default pane).
+3. `Ctrl-B "` — horizontal split; a second pane appears below the first.
+4. Type `echo hello && sleep 1 && echo done` in the lower pane and press Enter; wait for the block to finish (exit badge `b<id>` appears in the ribbon).
+5. `Ctrl-B [` — enter block ribbon mode on the focused pane; `←`/`→` (or `h`/`l`) move the cursor between recent blocks.
+6. Press `Enter` on a block — the modal pager opens showing the full stdout. `↑`/`↓` or `PgUp`/`PgDn` scroll; `q` or `Esc` closes.
+7. In a second terminal: `pyrec search "hello"` — confirm the block is indexed (output includes a snippet line).
+8. Back in the TUI: `Ctrl-B /` — open the search overlay; type `hello`; `↑`/`↓` navigate hits; `Enter` jumps focus to the source pane and highlights the block in the ribbon.
+9. `Ctrl-B y` — copy the last block's stdout to the clipboard (requires `wl-copy` on Wayland or `xclip` on X11).
+10. `pyrec kill-session <session-id>` (UUID prefix accepted) — close the session cleanly; `pyrec sessions` should return an empty list.
+
+Note: `pyrec wait-pane --pane <pane-id> --state waiting` can be used in step 5 instead of watching the TUI — it returns as soon as the pane transitions to `WaitingInput` (or the shell prompt reappears with OSC 133 integration installed).
+
 ## pyrec basics
 
 ```sh

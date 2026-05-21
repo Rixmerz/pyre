@@ -639,6 +639,52 @@ struct SearchState {
     rx: Option<mpsc::Receiver<Vec<BlockHit>>>,
 }
 
+/// State for the block stdout modal pager (Enter in ribbon mode).
+struct PagerState {
+    /// Block identifier shown in the title bar.
+    block_id: String,
+    /// Exit code shown in the title bar (`None` = still running).
+    exit_code: Option<i32>,
+    /// Output lines (raw bytes decoded as lossy UTF-8, split on `\n`).
+    lines: Vec<String>,
+    /// First visible line index (scrolled position).
+    scroll: usize,
+}
+
+impl PagerState {
+    fn new(block_id: String, exit_code: Option<i32>, raw: &[u8]) -> Self {
+        let text = String::from_utf8_lossy(raw);
+        let lines: Vec<String> = text.split('\n').map(|l| l.to_owned()).collect();
+        Self {
+            block_id,
+            exit_code,
+            lines,
+            scroll: 0,
+        }
+    }
+
+    /// Number of lines in the body.
+    fn len(&self) -> usize {
+        self.lines.len()
+    }
+
+    /// Scroll up (towards top). Returns true if position changed.
+    fn scroll_up(&mut self, n: usize) -> bool {
+        let prev = self.scroll;
+        self.scroll = self.scroll.saturating_sub(n);
+        self.scroll != prev
+    }
+
+    /// Scroll down (towards bottom). `visible_rows` is the number of rows
+    /// the pager body can display. Returns true if position changed.
+    fn scroll_down(&mut self, n: usize, visible_rows: usize) -> bool {
+        let prev = self.scroll;
+        let max_scroll = self.len().saturating_sub(visible_rows);
+        self.scroll = (self.scroll + n).min(max_scroll);
+        self.scroll != prev
+    }
+}
+
 /// Split `!query` failures filter from the tantivy query string.
 fn parse_search_input(input: &str) -> (String, bool) {
     if let Some(rest) = input.strip_prefix('!') {
@@ -840,6 +886,8 @@ struct AppState {
     blocks_rx: watch::Receiver<HashMap<PaneId, Vec<Block>>>,
     /// In-TUI ember motion (shared curves with startup splash).
     anim: AnimClock,
+    /// Block stdout modal pager (Some = open, None = closed).
+    pager: Option<PagerState>,
 }
 
 impl AppState {
@@ -1671,6 +1719,85 @@ fn render_search_overlay(frame: &mut ratatui::Frame, app: &AppState) {
     frame.render_stateful_widget(list, results_area, &mut list_state);
 }
 
+/// Render the full-screen block stdout pager overlay.
+///
+/// Layout (top-to-bottom):
+///   - Title bar  (1 row): block id + exit code
+///   - Body       (fill):  scrollable stdout lines
+///   - Footer     (1 row): scroll hints + keybinding hint
+fn render_pager(frame: &mut ratatui::Frame, pager: &PagerState) {
+    let area = frame.area();
+
+    // Dim the background to indicate a blocking overlay.
+    frame.render_widget(Clear, area);
+
+    let outer = RatatuiBlock::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(EMBER.border_focus())
+        .style(EMBER.overlay());
+
+    // Build a title that includes the block id and exit code.
+    let exit_label = match pager.exit_code {
+        None => " running ".to_owned(),
+        Some(0) => " exit 0 ".to_owned(),
+        Some(n) => format!(" exit {n} "),
+    };
+    let title_str = format!(" {} |{exit_label}", &pager.block_id);
+
+    let outer_with_title = outer.title(Span::styled(title_str, EMBER.title(EMBER.primary)));
+    let inner = outer_with_title.inner(area);
+    frame.render_widget(outer_with_title, area);
+
+    // Split inner into body + footer.
+    let splits = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    let body_area = splits[0];
+    let footer_area = splits[1];
+
+    let visible_rows = body_area.height as usize;
+
+    // Collect visible lines.
+    let visible: Vec<Line> = pager
+        .lines
+        .iter()
+        .skip(pager.scroll)
+        .take(visible_rows)
+        .map(|l| Line::from(Span::styled(l.as_str(), Style::default().fg(EMBER.text))))
+        .collect();
+
+    let body = Paragraph::new(visible)
+        .style(EMBER.bg_style())
+        .wrap(ratatui::widgets::Wrap { trim: false });
+    frame.render_widget(body, body_area);
+
+    // Scrollbar on the right edge of body_area.
+    let total_lines = pager.len();
+    if total_lines > visible_rows {
+        let mut sb_state =
+            ScrollbarState::new(total_lines.saturating_sub(visible_rows)).position(pager.scroll);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            body_area,
+            &mut sb_state,
+        );
+    }
+
+    // Footer: hint line.
+    let hint = Paragraph::new(Line::from(vec![
+        Span::styled(" ↑/↓ ", Style::default().fg(EMBER.primary)),
+        Span::styled("scroll  ", Style::default().fg(EMBER.text_dim)),
+        Span::styled("PgUp/PgDn ", Style::default().fg(EMBER.primary)),
+        Span::styled("page  ", Style::default().fg(EMBER.text_dim)),
+        Span::styled("q/Esc ", Style::default().fg(EMBER.primary)),
+        Span::styled("close", Style::default().fg(EMBER.text_dim)),
+    ]))
+    .style(EMBER.bg_style());
+    frame.render_widget(hint, footer_area);
+}
+
 fn state_dot_char(state: pyre_proto::PaneStateKind) -> char {
     use pyre_proto::PaneStateKind::*;
     match state {
@@ -2159,7 +2286,10 @@ fn draw_frame(
         // Host-terminal cursor positioning.
         // Only one pane (the focused one, live view) owns the cursor.
         // Overlays or scrollback suppress it.
-        if let Some(ref prompt) = state.prompt {
+        if let Some(ref pager) = state.pager {
+            // Block pager — full-screen, draws over everything, no cursor.
+            render_pager(frame, pager);
+        } else if let Some(ref prompt) = state.prompt {
             render_name_prompt(frame, prompt, state.anim.frame());
         } else if state.search.open {
             // Search overlay — drawn on top of everything else and owns cursor.
@@ -2963,6 +3093,7 @@ fn initial_app_state(
         session_list_last_poll: Instant::now() - Duration::from_secs(10),
         blocks_rx,
         anim: AnimClock::new(),
+        pager: None,
     }
 }
 
@@ -3613,6 +3744,40 @@ async fn run_tui(
                     continue;
                 }
 
+                // Block stdout pager key handling — intercepts all keys while open.
+                if state.pager.is_some() {
+                    let visible_rows = body_area.height.saturating_sub(2) as usize; // inner - footer
+                    match code {
+                        KeyCode::Char('q') | KeyCode::Esc => {
+                            state.pager = None;
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            if let Some(ref mut p) = state.pager {
+                                p.scroll_up(1);
+                            }
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            if let Some(ref mut p) = state.pager {
+                                p.scroll_down(1, visible_rows);
+                            }
+                        }
+                        KeyCode::PageUp => {
+                            let n = visible_rows.max(1);
+                            if let Some(ref mut p) = state.pager {
+                                p.scroll_up(n);
+                            }
+                        }
+                        KeyCode::PageDown => {
+                            let n = visible_rows.max(1);
+                            if let Some(ref mut p) = state.pager {
+                                p.scroll_down(n, visible_rows);
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 // Detect Ctrl-B prefix
                 if !prefix_active
                     && mods.contains(KeyModifiers::CONTROL)
@@ -3811,25 +3976,48 @@ async fn run_tui(
                             if !state.search.results.is_empty() {
                                 let hit = &state.search.results[state.search.cursor];
                                 let target_pane = hit.block.pane;
-                                let sv = &mut state.sessions[state.active_session];
-                                let tab = &mut sv.tabs[sv.active_tab];
-                                let mut all_paths: Vec<Vec<usize>> = Vec::new();
-                                let mut tmp: Vec<usize> = Vec::new();
-                                leaves_in_order(&tab.root, &mut tmp, &mut all_paths);
-                                let found_path = all_paths.iter().find(|p| {
-                                    slot_at(&tab.root, p)
-                                        .and_then(|idx| state.slots[idx].as_ref())
-                                        .map(|s| s.pane_id == target_pane)
-                                        .unwrap_or(false)
-                                });
-                                if let Some(path) = found_path {
-                                    let path = path.clone();
-                                    let slot_idx = slot_at(&tab.root, &path).expect("just found");
-                                    tab.focus_path = path;
-                                    let block_id = hit.block.id;
+                                let target_block = hit.block.id;
+
+                                // Search all sessions + tabs for a loaded pane matching
+                                // target_pane. Prefer the current session; fall back to others.
+                                // Returns (session_idx, tab_idx, focus_path, slot_idx).
+                                type JumpTarget = (usize, usize, Vec<usize>, usize);
+                                let mut jump: Option<JumpTarget> = None;
+                                'outer: for (si, sv) in state.sessions.iter().enumerate() {
+                                    for (ti, tab) in sv.tabs.iter().enumerate() {
+                                        let mut paths: Vec<Vec<usize>> = Vec::new();
+                                        let mut tmp: Vec<usize> = Vec::new();
+                                        leaves_in_order(&tab.root, &mut tmp, &mut paths);
+                                        for p in &paths {
+                                            if let Some(idx) = slot_at(&tab.root, p) {
+                                                if state.slots[idx]
+                                                    .as_ref()
+                                                    .map(|s| s.pane_id == target_pane)
+                                                    .unwrap_or(false)
+                                                {
+                                                    jump = Some((si, ti, p.clone(), idx));
+                                                    // If this is already the current session,
+                                                    // stop searching — no better match exists.
+                                                    if si == state.active_session {
+                                                        break 'outer;
+                                                    }
+                                                    // Keep scanning in case the current session
+                                                    // also has this pane (unlikely but safe).
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if let Some((si, ti, path, slot_idx)) = jump {
+                                    state.active_session = si;
+                                    state.sessions[si].active_tab = ti;
+                                    state.sessions[si].tabs[ti].focus_path = path;
                                     let maybe_cursor =
                                         state.slots[slot_idx].as_ref().and_then(|s| {
-                                            s.recent_blocks.iter().position(|b| b.id == block_id)
+                                            s.recent_blocks
+                                                .iter()
+                                                .position(|b| b.id == target_block)
                                         });
                                     if let Some(c) = maybe_cursor {
                                         if let Some(slot) = state.slots[slot_idx].as_mut() {
@@ -3919,22 +4107,60 @@ async fn run_tui(
                     let sv = &state.sessions[state.active_session];
                     let tab = &sv.tabs[sv.active_tab];
                     if let Some(slot_idx) = slot_at(&tab.root, &tab.focus_path) {
-                        if let Some(slot) = state.slots[slot_idx].as_mut() {
+                        if let Some(slot) = state.slots[slot_idx].as_ref() {
                             if slot.ribbon_cursor.is_some() {
                                 match code {
                                     KeyCode::Left | KeyCode::Char('h') => {
-                                        slot.ribbon_cursor =
-                                            slot.ribbon_cursor.map(|c| c.saturating_sub(1));
+                                        let s = state.slots[slot_idx].as_mut().expect("checked");
+                                        s.ribbon_cursor =
+                                            s.ribbon_cursor.map(|c| c.saturating_sub(1));
                                         continue;
                                     }
                                     KeyCode::Right | KeyCode::Char('l') => {
-                                        let max = slot.recent_blocks.len().saturating_sub(1);
-                                        slot.ribbon_cursor =
-                                            slot.ribbon_cursor.map(|c| (c + 1).min(max));
+                                        let s = state.slots[slot_idx].as_mut().expect("checked");
+                                        let max = s.recent_blocks.len().saturating_sub(1);
+                                        s.ribbon_cursor = s.ribbon_cursor.map(|c| (c + 1).min(max));
                                         continue;
                                     }
-                                    KeyCode::Enter | KeyCode::Esc => {
-                                        slot.ribbon_cursor = None;
+                                    KeyCode::Esc => {
+                                        let s = state.slots[slot_idx].as_mut().expect("checked");
+                                        s.ribbon_cursor = None;
+                                        continue;
+                                    }
+                                    KeyCode::Enter => {
+                                        // Open modal pager for the focused block's stdout.
+                                        if let Some(cursor) = slot.ribbon_cursor {
+                                            if let Some(block) = slot.recent_blocks.get(cursor) {
+                                                let block_id_str = block.id.0.to_string();
+                                                let exit_code = block.exit_code;
+                                                let block_id = block.id;
+                                                match state
+                                                    .control
+                                                    .get_block_stdout(
+                                                        tarpc::context::current(),
+                                                        block_id,
+                                                    )
+                                                    .await
+                                                {
+                                                    Ok(Ok(bytes)) => {
+                                                        state.pager = Some(PagerState::new(
+                                                            block_id_str,
+                                                            exit_code,
+                                                            &bytes,
+                                                        ));
+                                                    }
+                                                    Ok(Err(e)) => {
+                                                        state.status_msg =
+                                                            Some(format!("pager: rpc error: {e}"));
+                                                    }
+                                                    Err(e) => {
+                                                        state.status_msg = Some(format!(
+                                                            "pager: transport error: {e}"
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                        }
                                         continue;
                                     }
                                     _ => {

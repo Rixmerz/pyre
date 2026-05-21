@@ -4,6 +4,24 @@ pyre is a standalone terminal product: persistent sessions, block-level
 command history, full-text search, and MCP orchestration. Use this guide
 when running multiple coding agents in parallel.
 
+## Quickstart smoke test (10 min)
+
+Exercises daemon, TUI, `pyrec`, and search end-to-end. Run this after a
+fresh build to confirm the stack is wired correctly.
+
+1. `pyred &` — start daemon in single-process mode. For hybrid: set `process_model = "hybrid"` in config and restart.
+2. `pyre` — launch TUI; a fresh session opens automatically.
+3. `Ctrl-B "` — horizontal split; lower pane gets a new shell.
+4. Type `echo hello && sleep 1 && echo done` in the lower pane; wait for the block to finish (exit badge appears in the block ribbon below the pane).
+5. In a second terminal: `pyrec wait-pane --pane <pane-id> --state waiting` — confirms the pane returned to the prompt (with OSC 133 integration).
+6. `pyrec search "hello"` — confirms the block is indexed; output shows a snippet.
+7. Back in TUI: `Ctrl-B /` — open search overlay; type `hello`; `Enter` jumps focus to the source pane and sets the ribbon cursor on the matching block.
+8. `Ctrl-B [` — enter block ribbon mode; `←`/`→` navigate blocks; `Enter` opens the modal pager (full stdout, scrollable with `↑`/`↓`/`PgUp`/`PgDn`; `q` closes).
+9. `Ctrl-B y` — copy the last block's stdout to the clipboard.
+10. `pyrec kill-session <session-id>` — clean up; `pyrec sessions` should return empty.
+
+Pane and session IDs are UUIDs. Eight-character prefixes are accepted by all `pyrec` subcommands that take `--pane` or `--session`.
+
 ## Recommended layout (hybrid mode)
 
 Enable the hybrid supervisor so each agent session runs in an isolated
