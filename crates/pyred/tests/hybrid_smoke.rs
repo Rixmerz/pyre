@@ -1,13 +1,11 @@
 //! Hybrid-mode smoke tests (ADR-002 Option C).
 //!
-//! Tests 1-3 require the built `pyred` binary (same as `prod_smoke.rs`) because
-//! the supervisor spawns real worker processes via `std::process::Command`.
-//! They are marked `#[ignore]` and run with:
-//!   cargo test --test hybrid_smoke -- --ignored --nocapture
+//! Tests 1-5 require the built `pyred` binary because the supervisor spawns
+//! real worker processes via `std::process::Command`. They run by default in
+//! `cargo test` (no `--ignored` flag needed) as long as the binary is built
+//! first, which `cargo test -p pyred --tests` ensures via `CARGO_BIN_EXE_pyred`.
 //!
-//! Tests 4–5 (hybrid wait_pane_state, replay RPC) require the built binary (`--ignored`).
-//! Test 6 (`migration_idempotency`) is fully in-process and runs without
-//! `--ignored`.
+//! Test 6 (`migration_idempotency`) is fully in-process.
 
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -78,14 +76,8 @@ where
 // ---------------------------------------------------------------------------
 // Test 1: cross-session block search aggregates results from both sessions
 // ---------------------------------------------------------------------------
-//
-// Why #[ignore]:
-//   `supervisor::run` forks real `pyred --mode worker` child processes via
-//   `std::process::Command`. There is no in-process path to inject workers
-//   without calling the binary. This test requires the built binary.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires built pyred binary in hybrid mode; run with --ignored"]
 async fn cross_session_block_search_aggregates() {
     let result = tokio::time::timeout(Duration::from_secs(30), run_cross_session_search()).await;
     match result {
@@ -215,14 +207,8 @@ async fn run_cross_session_search() -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 // Test 2: worker_respawn_on_crash
 // ---------------------------------------------------------------------------
-//
-// Why #[ignore]:
-//   Requires the pyred binary AND requires the supervisor's SIGCHLD handler
-//   to detect a SIGKILL'd worker child. This is inherently a multi-process
-//   test. In-process tokio tasks cannot be SIGKILL'd independently.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires built pyred binary; SIGKILL worker + supervisor respawn loop; run with --ignored"]
 async fn worker_respawn_on_crash() {
     let result = tokio::time::timeout(Duration::from_secs(30), run_worker_respawn()).await;
     match result {
@@ -390,15 +376,8 @@ async fn find_child_pid(parent_pid: u32) -> anyhow::Result<u32> {
 // ---------------------------------------------------------------------------
 // Test 3: close_pane evicts session shard
 // ---------------------------------------------------------------------------
-//
-// Why #[ignore]:
-//   Requires the built binary. In S1 the supervisor's `close_pane` is a stub
-//   (returns Ok) and pane_closed on the worker side triggers worker exit only
-//   when the last pane closes. The full eviction flow requires worker–supervisor
-//   IPC over real UDS.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires built pyred binary; close_pane eviction is end-to-end; run with --ignored"]
 async fn close_pane_evicts_session_shard() {
     let result = tokio::time::timeout(Duration::from_secs(30), run_close_pane_eviction()).await;
     match result {
@@ -531,7 +510,6 @@ async fn run_close_pane_eviction() -> anyhow::Result<()> {
 // hybrid uses the same supervisor stream proxy (see PaneMirrorHub in supervisor.rs).
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires built pyred binary in hybrid mode; run with --ignored"]
 async fn hybrid_wait_pane_state_rpc() {
     let result = tokio::time::timeout(Duration::from_secs(30), run_hybrid_wait_pane()).await;
     match result {
@@ -622,7 +600,6 @@ async fn run_hybrid_wait_pane() -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires built pyred binary in hybrid mode; run with --ignored"]
 async fn hybrid_replay_rpc_succeeds() {
     let result = tokio::time::timeout(Duration::from_secs(30), run_hybrid_replay()).await;
     match result {
