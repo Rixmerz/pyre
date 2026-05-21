@@ -23,6 +23,7 @@
 //! `--mode supervisor` (default): run as supervisor (or single, depending on
 //! config). `--mode worker`: run as a worker process (spawned by supervisor).
 
+mod agent_detect;
 mod config;
 mod hooks;
 mod index;
@@ -31,6 +32,7 @@ mod migration;
 mod parser;
 mod pty;
 mod ringbuf;
+mod search_filter;
 mod server;
 mod session;
 mod state;
@@ -39,15 +41,16 @@ mod stream;
 mod supervisor;
 mod worker;
 
+use std::collections::VecDeque;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use futures::StreamExt;
 use pyre_proto::service::PyreDaemon as _;
-use pyre_proto::{MODE_CONTROL, MODE_STREAM};
+use pyre_proto::{read_control_version_after_tag, MODE_CONTROL, MODE_STREAM, PROTO_VERSION};
 use tarpc::server::{BaseChannel, Channel};
 use tarpc::tokio_serde::formats::Bincode;
 use tokio::io::AsyncReadExt;
@@ -108,6 +111,7 @@ async fn handle_conn(
     registry: Arc<SessionRegistry>,
     store: Arc<Store>,
     block_index: Arc<BlockIndex>,
+    focus_queue: Arc<Mutex<VecDeque<String>>>,
 ) -> Result<()> {
     let mut sock = sock;
     let mut tag = [0u8; 1];
@@ -115,10 +119,14 @@ async fn handle_conn(
 
     match tag[0] {
         MODE_CONTROL => {
+            read_control_version_after_tag(&mut sock)
+                .await
+                .with_context(|| format!("control handshake (proto_version={PROTO_VERSION})"))?;
             let daemon = DaemonImpl {
                 registry: registry.clone(),
                 store: store.clone(),
                 block_index: block_index.clone(),
+                focus_queue: focus_queue.clone(),
             };
             let transport = tarpc::serde_transport::new(
                 Framed::new(sock, LengthDelimitedCodec::new()),
@@ -142,6 +150,9 @@ async fn run_single(path: PathBuf) -> Result<()> {
     tracing::info!("store opened at {}", store.data_dir().display());
 
     let index_dir = store.data_dir().join("index");
+    migration::maybe_migrate_tantivy_schema(&index_dir, &store)
+        .await
+        .context("tantivy schema migration")?;
     let block_index = Arc::new(
         tokio::task::spawn_blocking(move || BlockIndex::open(&index_dir))
             .await
@@ -150,6 +161,7 @@ async fn run_single(path: PathBuf) -> Result<()> {
     );
 
     let registry = Arc::new(SessionRegistry::new());
+    let focus_queue: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
 
     let hooks = Arc::new(HooksConfig::load());
     let _state_engine = spawn_state_engine(registry.clone(), hooks.clone());
@@ -186,8 +198,9 @@ async fn run_single(path: PathBuf) -> Result<()> {
                     let reg = registry.clone();
                     let st = store.clone();
                     let bi = block_index.clone();
+                    let fq = focus_queue.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_conn(sock, reg, st, bi).await {
+                        if let Err(e) = handle_conn(sock, reg, st, bi, fq).await {
                             tracing::warn!("connection error: {e:#}");
                         }
                     });
@@ -281,6 +294,9 @@ async fn main() -> Result<()> {
             tracing::info!("store opened at {}", store.data_dir().display());
 
             let index_dir = store.data_dir().join("index");
+            migration::maybe_migrate_tantivy_schema(&index_dir, &store)
+                .await
+                .context("tantivy schema migration")?;
             let block_index = Arc::new(
                 tokio::task::spawn_blocking(move || BlockIndex::open(&index_dir))
                     .await

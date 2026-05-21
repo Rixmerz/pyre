@@ -21,8 +21,8 @@ use futures::SinkExt;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use pyre_proto::{
-    InputFrame, OpenPaneReq, OutputFrame, PyreDaemonClient, SpawnReq, SpawnResp, MODE_CONTROL,
-    MODE_STREAM,
+    write_control_client, InputFrame, OpenPaneReq, OutputFrame, PyreDaemonClient, SpawnReq,
+    SpawnResp, MODE_STREAM,
 };
 use tarpc::client;
 use tarpc::tokio_serde::formats::Bincode;
@@ -35,7 +35,7 @@ use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 
 async fn connect_control(sock_path: &std::path::Path) -> anyhow::Result<PyreDaemonClient> {
     let mut sock = UnixStream::connect(sock_path).await?;
-    sock.write_all(&[MODE_CONTROL]).await?;
+    write_control_client(&mut sock).await?;
     let transport = tarpc::serde_transport::new(
         tokio_util::codec::Framed::new(sock, LengthDelimitedCodec::new()),
         Bincode::default(),

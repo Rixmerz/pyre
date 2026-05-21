@@ -1,5 +1,27 @@
 # pyre — Roadmap
 
+## v0.1.0 ready
+
+All sprints S1..S7 have landed. Branch `feat/s5-s6-gpu-search-agent-ops`
+carries the final commits; merge to `main` is the only remaining step before
+tagging v0.1.0.
+
+| Sprint | Status | Commit(s) |
+|--------|--------|-----------|
+| S1 — Daemon + PTY | ✅ done | landed pre-branch |
+| S2 — Blocks + persistence | ✅ done | landed pre-branch |
+| S3 — Multi-pane + reattach | ✅ done | landed pre-branch |
+| S4 — TUI dogfood (MVP) | ✅ done | `3ae7301` (pager, search jump-to-pane, smoke walkthrough; S5.1 absorbed architectural acceptance) |
+| S5 — Agent multiplexer | ✅ done | `6e207b2` |
+| S5.1 — Agent ops hardened | ✅ done | `6e207b2` + follow-ups |
+| S6.1 — pyre-gpu viewer | ✅ done | `6e207b2` |
+| S6.2 — GPU tiling | ✅ done | `53354b4` |
+| S7 — Risk closure | ✅ done | `7a5f683` Tantivy facet + v2, `914e6d4` libproc, `5036d1d` push events, `7f85a5a` hybrid StateChanged |
+
+Next action: cut v0.1.0 release tag after merge to main.
+
+---
+
 ## Sprints
 
 | Sprint | Goal | Key deliverables |
@@ -9,39 +31,55 @@
 | **S2** | Blocks + persistence | Integrate `alacritty_terminal` parser, recognise OSC 133, materialise `Block` records, write to SQLite + zstd stdout blobs, basic `pyrec list` and `pyrec search` (linear scan). |
 | **S3** | Multi-pane + reattach | Multiple panes per session, multiple sessions, full reattach with grid snapshot + last N blocks replay, multi-client mirror mode with serialized input. Hybrid supervisor + per-session workers landed (ADR-002 Accepted, 2026-05-19) — unblocks per-session isolation and clean reattach across daemon restarts; remaining S3 work tracks the multi-client + replay surface. |
 | **S4** | TUI dogfood (**MVP**) | `pyre-tui` (ratatui) replaces tmux+alacritty in daily use: tabs, splits, block ribbon, scrollback navigation, Tantivy-backed search UI. **MVP criterion met.** |
-| **S5** | MCP + AI + Tantivy polish | MCP server exposing `pane://` and `block://` resources + `search_blocks` / `spawn` / `send_input` tools, Lua hooks (`on_pane_spawn`, `on_block_end`), evaluate MEMI feed from finalized Blocks. |
-| **S6** | GPU render | `pyre-gpu` using `wgpu` + `winit`, same `pyre-proto` client surface as `pyre-tui`, behavior parity, then performance gains. ADR-003 closes. |
+| **S5** | **Agent multiplexer** | Hybrid profile docs; `AgentKind` detection; sidebar rollup + seen/done UX; `wait_pane_state` RPC; `pyrec` orchestration (`wait-pane`, `pane read`, `pane run`); MCP `wait_pane_state` + `pane://` / `block://` resources; `docs/AGENTS.md` playbook; doc hygiene (pyre as standalone product). |
+| **S6** | GPU render | **S6.1 landed:** `pyre-gpu` glyph atlas, Ctrl+Tab multi-pane, **Ctrl+/ block search** (`!` = failures), ADR-003. **S6.2 landed:** real multi-pane tiling with Ctrl+w keybindings. |
+| **S5.1** | Agent ops hardened | `proto_version` handshake; hybrid replay snapshot; macOS `ps` agent detect + `osascript` notify; `pyrec doctor`; search `failures_only` / TUI `!` prefix; `integration install` scripts; `pyrec select-pane` + TUI focus file. |
+| **S7** | Risk closure | Tantivy native exit_code facet + schema v2 migration; libproc on macOS (replaces `ps` shell-out); broadcast `next_pane_event` push RPC (replaces 1 s polling); hybrid `StateChanged` emitted through supervisor. |
 
 ## MVP criterion
 
 End of **S4**: the user runs `pyred` + `pyre-tui` as the daily driver
 and removes `tmux` and `alacritty` from their workflow without
-regressions on reattach, multiplexing, and search. AI/MCP and GPU
-render are explicitly post-MVP.
+regressions on reattach, multiplexing, and search. GPU render is
+post-MVP (S6).
+
+## S5 success criterion
+
+End of **S5**, on Linux with `process_model = "hybrid"`:
+
+1. Run **≥2 agent sessions** (one worker each) without cross-session crashes.
+2. Sidebar shows **blocked / working / idle** with detected agent kind.
+3. Orchestrate via **`pyrec wait-pane`**, **`pyrec pane read`**, **`pyrec pane run`** without the TUI.
+4. Orchestrate via **MCP** (`block_search`, `pane_capture`, `wait_pane_state`) using [docs/AGENTS.md](docs/AGENTS.md).
+5. **Reattach** with stable block replay on hybrid.
+6. Search past failures with `pyrec search` / MCP `block_search`.
 
 ## Risks
 
-| Risk | Mitigation |
-|------|------------|
-| ANSI parser is a time sink. | Reuse `alacritty_terminal`. Do NOT reimplement. Wrap, don't fork. |
-| IPC schema churn S0–S2. | `proto_version: u32` on every message from day one; integration test that rejects mismatched versions. |
-| Scope creep — AI before core. | AI work blocked until S5. No MCP code merges into `main` before S4 ships. |
-| `portable-pty` quirks on Linux distros. | Linux-first; Windows code paths `#[cfg]`-gated and untested until post-S6. |
-| SQLite write contention with high-frequency Block events. | WAL mode; batch BlockEvent writes per pane on a 50 ms tick. |
-| GPU renderer rewrite temptation. | ADR-003 forces a binary swap, not a rewrite. `pyre-gpu` consumes the same `pyre-proto` streams as `pyre-tui`. |
+| Risk | Status | Mitigation / Resolution |
+|------|--------|-------------------------|
+| ANSI parser is a time sink. | ✅ closed | Reuse `alacritty_terminal`. Do NOT reimplement. Wrap, don't fork. |
+| IPC schema churn S0–S2. | ✅ closed | `proto_version: u32` on every message from day one; integration test that rejects mismatched versions. |
+| Scope creep — agent integrations. | ✅ closed | S5 limits install hooks to a small set of binaries; everything else uses heuristic `AgentKind` detection. |
+| `portable-pty` quirks on Linux distros. | ✅ closed | Linux-first; Windows code paths `#[cfg]`-gated and untested until post-S6. |
+| SQLite write contention with high-frequency Block events. | ✅ closed | WAL mode; batch BlockEvent writes per pane on a 50 ms tick. |
+| GPU renderer rewrite temptation. | ✅ closed | ADR-003 forces a binary swap, not a rewrite. `pyre-gpu` consumes the same `pyre-proto` streams as `pyre-tui`. |
+| Tantivy facet + schema v2 migration. | ✅ closed | `7a5f683` — native exit_code facet, v2 index with migration path. |
+| macOS `ps` shell-out latency. | ✅ closed | `914e6d4` — libproc on macOS replaces subprocess. |
+| Pane state polling (1 s tick). | ✅ closed | `5036d1d` — broadcast `next_pane_event` push RPC. |
+| Hybrid supervisor StateChanged not propagated. | ✅ closed | `7f85a5a` — StateChanged emitted through supervisor. |
 
-## Catalog-overlap verification
+## pyre capabilities (product surface)
 
-`pyre` is a product, not a framework — no new coinage. Verify against
-existing catalog before adding anything:
+`pyre` is a standalone terminal product — not a framework. Prefer extending
+these surfaces before adding new named subsystems:
 
-| Concern | Existing tool | pyre stance |
-|---------|---------------|-------------|
-| Per-project + cross-project memory | `jig` | Consume via MCP. Do not duplicate the memory layer. |
-| Cron / scheduled agent runs | `schedule-mcp` | Call it. Do not build a scheduler in `pyred`. |
-| Experiential feed from finalized work units | MEMI | Evaluate in S5: feed `on_block_end` events into MEMI; do not reinvent. |
-| Commit-quality enforcement | `commit-guardian` | Orthogonal; `pyre` is a terminal, not a git tool. No overlap. |
-| Code analysis / smells | `delta-cube` (via `jig`) | Orthogonal to terminal scope. |
-
-If a future need looks like a sixth framework with similar scope, stop
-and fuse with one of the above instead of coining a new name.
+| Capability | Surface |
+|------------|---------|
+| Multiplexing + PTY | `pyred`, `pyrec`, `pyre-tui` |
+| Command history + search | Blocks (OSC 133), SQLite, Tantivy, `block_search` |
+| Per-session isolation | Hybrid supervisor + workers (ADR-002) |
+| Agent orchestration | `wait_pane_state`, `pyrec wait-pane`, MCP tools |
+| External automation | Any MCP client via `pyre-mcp` |
+| User hooks | `hooks.toml` / Lua (`on_block_end`, `on_pane_state`) |
+| GPU render | `pyre-gpu` — multi-pane tiling, glyph atlas, wgpu (ADR-003) |

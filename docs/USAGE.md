@@ -126,7 +126,7 @@ pyrec display-message "hello from script"
 | `tmux split-window -t <session>` | `pyrec split-window --session <id>` |
 | `tmux send-keys -t <pane> "cmd" Enter` | `pyrec send-keys --session <s> --pane <p> -- "cmd\n"` |
 | `tmux capture-pane -p -t <pane>` | `pyrec capture-pane --session <s> --pane <p>` |
-| `tmux select-pane -t <pane>` | TUI-only; no CLI equivalent in S1–S4 |
+| `tmux select-pane -t <pane>` | `pyrec select-pane -t <pane>` (requires running `pyre` TUI) |
 | `tmux display-message "msg"` | `pyrec display-message "msg"` |
 | `tmux attach-session -t <session>` | `pyrec attach <session>` |
 | `tmux detach-client` | `Ctrl-B d` in `pyre`, or close the pyrec process |
@@ -174,6 +174,39 @@ pyrec display-message "hello from script"
 
 ---
 
+## Agent orchestration (S5)
+
+These commands work against a running `pyred` (single or hybrid). See
+[AGENTS.md](AGENTS.md) for the multi-agent layout.
+
+```sh
+# Named session (hybrid: one worker)
+pyrec session-new --name api --cwd ~/projects/api -d
+
+# Wait until the agent is blocked on input (30s default)
+pyrec wait-pane --pane <pane-prefix> --state waiting --timeout 30
+
+# Read last command output (OSC 133 block) or ring buffer
+pyrec pane read --pane <pane-prefix> --source block-last
+pyrec pane read --pane <pane-prefix> --lines 80
+
+# Run a command in a session
+pyrec pane-run --session <session-prefix> -- echo hello
+
+# Install a hook snippet for self-reporting pane state
+pyrec integration install claude
+```
+
+Example: wait for work to finish, then read output:
+
+```sh
+pyrec wait-pane --pane abc12345 --state done --timeout 600
+pyrec pane read --pane abc12345 --source block-last
+pyrec search "error"
+```
+
+---
+
 ## Troubleshooting
 
 ### Daemon not starting
@@ -200,6 +233,21 @@ Enable OSC 133 in your shell:
 - **bash**: add `source /usr/share/bash-preexec/bash-preexec.sh && precmd() { printf '\033]133;A\007'; }; preexec() { printf '\033]133;B\007'; }` to `.bashrc`.
 - **zsh**: use the `precmd`/`preexec` hooks; many zsh prompt frameworks (Starship, Powerlevel10k) emit OSC 133 automatically.
 - **fish**: add `function fish_prompt; printf '\033]133;A\007'; end` to `config.fish`.
+
+### pyre-gpu (windowed viewer)
+
+GPU-backed viewer for a single session (ADR-003). Same daemon sockets as `pyre`.
+
+```sh
+pyre-gpu
+pyre-gpu --session <prefix> --pane <prefix>
+```
+
+| Key | Action |
+|-----|--------|
+| Ctrl+/ | Open block search overlay (`!query` = failures only) |
+| Ctrl+Tab / Ctrl+Shift+Tab | Cycle panes in the active session |
+| Esc | Close search overlay |
 
 ### pyre shows garbled characters
 

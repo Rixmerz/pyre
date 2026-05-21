@@ -11,14 +11,16 @@
 //!   XDG_RUNTIME_DIR=... PYRE_DATA_DIR=... XDG_CONFIG_HOME=... \
 //!   ./target/debug/examples/adr002_validate
 
-use std::path::PathBuf;
+#![allow(clippy::zombie_processes)]
+
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use pyre_proto::service::{PyreDaemonClient, SpawnReq, MODE_CONTROL};
+use pyre_proto::service::{PyreDaemonClient, SpawnReq};
+use pyre_proto::write_control_client;
 use tarpc::client;
 use tarpc::tokio_serde::formats::Bincode;
-use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
@@ -49,14 +51,13 @@ fn pyred_exe() -> PathBuf {
     manifest.join("../../target/debug/pyred")
 }
 
-async fn connect(sock: &PathBuf) -> Result<PyreDaemonClient> {
+async fn connect(sock: &Path) -> Result<PyreDaemonClient> {
     let mut stream = UnixStream::connect(sock)
         .await
         .with_context(|| format!("connect {}", sock.display()))?;
-    stream
-        .write_all(&[MODE_CONTROL])
+    write_control_client(&mut stream)
         .await
-        .context("write mode tag")?;
+        .context("control handshake")?;
     let transport = tarpc::serde_transport::new(
         Framed::new(stream, LengthDelimitedCodec::new()),
         Bincode::default(),
@@ -64,7 +65,7 @@ async fn connect(sock: &PathBuf) -> Result<PyreDaemonClient> {
     Ok(PyreDaemonClient::new(client::Config::default(), transport).spawn())
 }
 
-async fn wait_for_socket(path: &PathBuf, timeout_ms: u64) -> bool {
+async fn wait_for_socket(path: &Path, timeout_ms: u64) -> bool {
     let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
     while std::time::Instant::now() < deadline {
         if path.exists() {
@@ -425,6 +426,7 @@ async fn test3_block_detection() -> bool {
             pyre_proto::blocks::SearchBlocksReq {
                 query: "ls".into(),
                 limit: 10,
+                failures_only: false,
             },
         )
         .await

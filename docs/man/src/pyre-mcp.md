@@ -17,9 +17,9 @@ multiplexer. It connects to the **pyred** daemon over the pyre UDS and exposes
 sessions, panes, and blocks as MCP resources. It also provides MCP tools that
 let AI agents spawn sessions, send keystrokes, and read pane output.
 
-pyre-mcp is designed to be registered with an MCP-capable tool (such as
-**jig**, Claude Code, or any MCP client) by pointing the client at the
-pyre-mcp socket or running it as a stdio subprocess.
+pyre-mcp is designed to be registered with any MCP client by pointing the
+client at the pyre-mcp socket or running it as a stdio subprocess. See
+**docs/AGENTS.md** for the agent multiplexer playbook.
 
 # OPTIONS
 

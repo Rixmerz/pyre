@@ -12,8 +12,8 @@ use futures::{SinkExt, StreamExt};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use pyre_proto::{
-    InputFrame, ListBlocksReq, OutputFrame, PyreDaemonClient, SearchBlocksReq, SpawnReq, SpawnResp,
-    MODE_CONTROL, MODE_STREAM,
+    write_control_client, InputFrame, ListBlocksReq, OutputFrame, PyreDaemonClient,
+    SearchBlocksReq, SpawnReq, SpawnResp, MODE_STREAM,
 };
 use std::sync::{Arc, Mutex};
 use tarpc::client;
@@ -92,7 +92,7 @@ async fn run_tantivy_test() -> anyhow::Result<()> {
 
     // --- 5. Control connection ---
     let mut ctrl_sock = UnixStream::connect(&sock_path).await?;
-    ctrl_sock.write_all(&[MODE_CONTROL]).await?;
+    write_control_client(&mut ctrl_sock).await?;
     let transport = tarpc::serde_transport::new(
         tokio_util::codec::Framed::new(ctrl_sock, LengthDelimitedCodec::new()),
         Bincode::default(),
@@ -207,6 +207,7 @@ async fn run_tantivy_test() -> anyhow::Result<()> {
                     SearchBlocksReq {
                         query: "tantivytokenalpha".into(),
                         limit: 10,
+                        failures_only: false,
                     },
                 )
                 .await
@@ -244,6 +245,7 @@ async fn run_tantivy_test() -> anyhow::Result<()> {
                     SearchBlocksReq {
                         query: "tantivytokenbeta".into(),
                         limit: 10,
+                        failures_only: false,
                     },
                 )
                 .await

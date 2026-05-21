@@ -461,6 +461,108 @@ async fn collect_all_blocks(pool: &SqlitePool) -> Result<Vec<LegacyBlock>> {
 }
 
 // ---------------------------------------------------------------------------
+// Schema v2 migration: add exit_code field to Tantivy index
+// ---------------------------------------------------------------------------
+
+/// Detect whether the Tantivy index at `index_dir` is missing the `exit_code`
+/// field (schema v1). If so:
+///  1. Rename `index_dir` → `index_dir/../index.bak.YYYYMMDD-HHMMSS`.
+///  2. Recreate `index_dir` (empty).
+///  3. Walk the sqlite `blocks` table via `store` and reindex every block.
+///
+/// Idempotent: if the index already has `exit_code`, returns immediately.
+/// If `index_dir` does not exist yet, also returns immediately (fresh install).
+pub async fn maybe_migrate_tantivy_schema(
+    index_dir: &std::path::Path,
+    store: &crate::store::Store,
+) -> Result<()> {
+    // No existing index — nothing to migrate.
+    if !index_dir.exists() {
+        return Ok(());
+    }
+
+    // Detect schema version by checking for the exit_code field.
+    let needs_migration = {
+        let index_dir_owned = index_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || tantivy_has_exit_code_field(&index_dir_owned))
+            .await
+            .context("spawn_blocking schema detect")?
+    };
+
+    match needs_migration {
+        Ok(true) => {
+            tracing::info!("tantivy index schema v2 detected — no migration needed");
+            return Ok(());
+        }
+        Ok(false) => {
+            tracing::info!("tantivy index missing exit_code field — migrating to schema v2");
+        }
+        Err(e) => {
+            tracing::warn!("could not read tantivy schema ({e:#}) — will rebuild index");
+        }
+    }
+
+    // 1. Rename old index dir.
+    let suffix = Utc::now().format("%Y%m%d-%H%M%S").to_string();
+    let parent = index_dir
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let backup_dir = parent.join(format!("index.bak.{suffix}"));
+    std::fs::rename(index_dir, &backup_dir)
+        .with_context(|| format!("rename {} → {}", index_dir.display(), backup_dir.display()))?;
+    tracing::info!(backup = %backup_dir.display(), "old tantivy index backed up");
+
+    // 2. Recreate empty index dir.
+    std::fs::create_dir_all(index_dir).with_context(|| format!("mkdir {}", index_dir.display()))?;
+
+    // 3. Reindex all blocks from sqlite.
+    let index_dir_owned = index_dir.to_path_buf();
+    let block_index = tokio::task::spawn_blocking(move || BlockIndex::open(&index_dir_owned))
+        .await
+        .context("spawn_blocking BlockIndex::open for reindex")?
+        .context("open block index for schema v2 reindex")?;
+
+    // Collect all blocks. list_blocks(None, u32::MAX) returns newest-first;
+    // order doesn't matter for reindex correctness.
+    let all_blocks = store
+        .list_blocks(None, u32::MAX)
+        .await
+        .context("list_blocks for tantivy reindex")?;
+
+    let total = all_blocks.len();
+    tracing::info!(total, "tantivy reindex: starting");
+
+    let mut indexed = 0usize;
+    for block in &all_blocks {
+        let stdout = store.stdout_snippet(block.id, usize::MAX);
+        if let Err(e) = block_index.add_block(block, &stdout) {
+            tracing::warn!(block_id = %block.id, "reindex add_block failed: {e:#}");
+        }
+        indexed += 1;
+        if indexed.is_multiple_of(1000) {
+            tracing::info!(indexed, total, "tantivy reindex: progress");
+        }
+    }
+
+    tracing::info!(indexed, "tantivy reindex: complete");
+    Ok(())
+}
+
+/// Returns `Ok(true)` if the tantivy index at `path` already has an
+/// `exit_code` field (schema v2), `Ok(false)` if it exists but lacks the
+/// field, or `Err` if the index cannot be read at all.
+fn tantivy_has_exit_code_field(path: &std::path::Path) -> Result<bool> {
+    use tantivy::directory::MmapDirectory;
+    use tantivy::Index;
+
+    let dir = MmapDirectory::open(path)
+        .with_context(|| format!("open MmapDirectory at {}", path.display()))?;
+    let index =
+        Index::open(dir).with_context(|| format!("open tantivy index at {}", path.display()))?;
+    Ok(index.schema().get_field("exit_code").is_ok())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -673,5 +775,39 @@ mod tests {
 
         // Verify sentinel exists.
         assert!(sentinel_path().exists(), "sentinel should be written");
+    }
+
+    // -----------------------------------------------------------------------
+    // Schema v2 detection tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tantivy_v2_index_reports_has_exit_code() {
+        let tmp = TempDir::new().unwrap();
+        // Open a fresh BlockIndex (schema v2) and verify the field is detected.
+        BlockIndex::open(tmp.path()).unwrap();
+        let result = tantivy_has_exit_code_field(tmp.path()).unwrap();
+        assert!(result, "fresh index should have exit_code field");
+    }
+
+    #[test]
+    fn tantivy_v1_index_reports_missing_exit_code() {
+        use tantivy::schema::{SchemaBuilder, STORED, STRING, TEXT};
+        use tantivy::{Index, IndexWriter};
+
+        let tmp = TempDir::new().unwrap();
+
+        // Build a v1-style index (no exit_code field).
+        let mut sb = SchemaBuilder::new();
+        sb.add_text_field("block_id", STRING | STORED);
+        sb.add_text_field("command", TEXT | STORED);
+        sb.add_text_field("stdout", TEXT);
+        let schema = sb.build();
+        let index = Index::create_in_dir(tmp.path(), schema).unwrap();
+        let mut writer: IndexWriter = index.writer(50_000_000).unwrap();
+        writer.commit().unwrap();
+
+        let result = tantivy_has_exit_code_field(tmp.path()).unwrap();
+        assert!(!result, "v1 index should NOT have exit_code field");
     }
 }

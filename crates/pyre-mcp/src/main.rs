@@ -1,9 +1,8 @@
-//! pyre-mcp — Newline-delimited JSON-RPC 2.0 stdio server bridging Claude Code /
-//! jig / any MCP client to a running pyred daemon over UDS.
+//! pyre-mcp — Newline-delimited JSON-RPC 2.0 stdio server bridging any MCP
+//! client to a running pyred daemon over UDS.
 //!
 //! Transport: newline-delimited JSON over stdio (each request = one line; each
-//! response = one line). "Content-Length" framing (LSP variant) is NOT used —
-//! Claude Code and jig both speak newline-delimited.
+//! response = one line). "Content-Length" framing (LSP variant) is NOT used.
 //!
 //! Streaming subscribe: polled at 1 s intervals against `list_all_panes`.
 //! Adequate for v0.1; can be upgraded to true tarpc event pushing later.
@@ -14,8 +13,8 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use pyre_proto::{
-    ListBlocksReq, OpenPaneReq, PaneStateKind, PyreDaemonClient, SearchBlocksReq, SessionId,
-    SpawnReq, MODE_CONTROL,
+    write_control_client, ListBlocksReq, OpenPaneReq, PaneStateKind, PyreDaemonClient,
+    SearchBlocksReq, SessionId, SpawnReq,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -109,7 +108,7 @@ async fn control_client(socket: &Path) -> Result<PyreDaemonClient> {
     let mut sock = UnixStream::connect(socket)
         .await
         .with_context(|| format!("connect {}", socket.display()))?;
-    tokio::io::AsyncWriteExt::write_all(&mut sock, &[MODE_CONTROL]).await?;
+    write_control_client(&mut sock).await?;
 
     let transport = tarpc::serde_transport::new(
         tokio_util::codec::Framed::new(sock, LengthDelimitedCodec::new()),
@@ -401,37 +400,52 @@ impl Server {
         let uri_clone = uri.clone();
 
         let handle = tokio::spawn(async move {
-            let mut last_snapshot: Option<String> = None;
+            // Long-poll `next_pane_event` instead of 1 s polling on list_all_panes.
+            // seq=0 means "give me everything from the beginning"; each iteration
+            // advances seq to the last event seen so reconnects don't re-notify.
+            let mut seq: u64 = 0;
+            let mut backoff = std::time::Duration::from_millis(100);
 
             loop {
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-
-                let Ok(client) = control_client(&socket).await else {
-                    continue;
-                };
-                let Ok(Ok(panes)) = client.list_all_panes(tarpc::context::current()).await else {
-                    continue;
-                };
-
-                let Ok(snapshot) = serde_json::to_string(&panes) else {
-                    continue;
+                let client = match control_client(&socket).await {
+                    Ok(c) => c,
+                    Err(_) => {
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(std::time::Duration::from_secs(5));
+                        continue;
+                    }
                 };
 
-                let changed = last_snapshot
-                    .as_ref()
-                    .map(|prev| prev != &snapshot)
-                    .unwrap_or(true);
-
-                if changed {
-                    last_snapshot = Some(snapshot);
-                    let notif = Response::notification(
-                        "notifications/resources/updated",
-                        json!({ "uri": uri_clone }),
-                    );
-                    if let Ok(line) = serde_json::to_string(&notif) {
-                        if tx.send(line).await.is_err() {
-                            break;
+                match client
+                    .next_pane_event(tarpc::context::current(), seq, 30_000)
+                    .await
+                {
+                    Ok(Ok(events)) if !events.is_empty() => {
+                        // Advance cursor to the highest seq we received.
+                        if let Some(last) = events.last() {
+                            seq = last.seq;
                         }
+                        backoff = std::time::Duration::from_millis(100);
+                        // Any lifecycle event on a pane resource triggers an update
+                        // notification so the MCP client re-reads the resource.
+                        let notif = Response::notification(
+                            "notifications/resources/updated",
+                            json!({ "uri": uri_clone }),
+                        );
+                        if let Ok(line) = serde_json::to_string(&notif) {
+                            if tx.send(line).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(Ok(_)) => {
+                        // Empty response = normal long-poll timeout; loop immediately.
+                        backoff = std::time::Duration::from_millis(100);
+                    }
+                    _ => {
+                        // RPC error or transport failure — back off and reconnect.
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(std::time::Duration::from_secs(5));
                     }
                 }
             }
@@ -474,12 +488,13 @@ impl Server {
                 },
                 {
                     "name": "pane_capture",
-                    "description": "Capture the last N lines of a pane's ring buffer with CSI sequences stripped.",
+                    "description": "Capture pane output: ring buffer (default) or last finalized block stdout (block-last).",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "pane": { "type": "string", "description": "Pane id or ≥8-char prefix" },
-                            "lines": { "type": "integer", "description": "Number of lines to capture (default 50)", "default": 50 }
+                            "lines": { "type": "integer", "description": "Ring lines when source=ring (default 50)", "default": 50 },
+                            "source": { "type": "string", "enum": ["ring", "block-last"], "default": "ring" }
                         },
                         "required": ["pane"]
                     }
@@ -504,7 +519,8 @@ impl Server {
                         "type": "object",
                         "properties": {
                             "query": { "type": "string" },
-                            "limit": { "type": "integer", "default": 20 }
+                            "limit": { "type": "integer", "default": 20 },
+                            "failures_only": { "type": "boolean", "default": false, "description": "Only blocks with non-zero exit code" }
                         },
                         "required": ["query"]
                     }
@@ -547,6 +563,19 @@ impl Server {
                         },
                         "required": ["session"]
                     }
+                },
+                {
+                    "name": "wait_pane_state",
+                    "description": "Wait until a pane reaches a lifecycle state (blocked=WaitingInput, working=Running, etc.).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "pane": { "type": "string" },
+                            "state": { "type": "string", "description": "waiting, running, idle, done, crashed, interactive" },
+                            "timeout_secs": { "type": "integer", "default": 30 }
+                        },
+                        "required": ["pane", "state"]
+                    }
                 }
             ]
         })
@@ -568,6 +597,7 @@ impl Server {
             "session_spawn" => self.tool_session_spawn(args).await?,
             "session_close" => self.tool_session_close(args).await?,
             "pane_open" => self.tool_pane_open(args).await?,
+            "wait_pane_state" => self.tool_wait_pane_state(args).await?,
             other => return Err(anyhow!("unknown tool: {other}")),
         };
 
@@ -660,16 +690,76 @@ impl Server {
             .as_str()
             .ok_or_else(|| anyhow!("missing pane"))?;
         let lines = args["lines"].as_u64().unwrap_or(50) as u32;
+        let source = args["source"].as_str().unwrap_or("ring");
 
         let client = self.client().await?;
         let pane_id = self.resolve_pane_id(&client, pane_prefix).await?;
-        let bytes = client
-            .capture_pane(tarpc::context::current(), pane_id, lines)
+
+        let bytes = if source == "block-last" {
+            let block = client
+                .last_block_for_pane(tarpc::context::current(), pane_id)
+                .await
+                .context("rpc")?
+                .map_err(|e| anyhow!("{e}"))?;
+            match block {
+                Some(b) => client
+                    .get_block_stdout(tarpc::context::current(), b.id)
+                    .await
+                    .context("rpc")?
+                    .map_err(|e| anyhow!("{e}"))?,
+                None => Vec::new(),
+            }
+        } else {
+            client
+                .capture_pane(tarpc::context::current(), pane_id, lines)
+                .await
+                .context("rpc")?
+                .map_err(|e| anyhow!("{e}"))?
+        };
+
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    async fn tool_wait_pane_state(&self, args: &Value) -> Result<String> {
+        let pane_prefix = args["pane"]
+            .as_str()
+            .ok_or_else(|| anyhow!("missing pane"))?;
+        let state_str = args["state"]
+            .as_str()
+            .ok_or_else(|| anyhow!("missing state"))?;
+        let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(30) as u32;
+
+        let kind = match state_str.to_lowercase().as_str() {
+            "running" | "working" => PaneStateKind::Running,
+            "waiting" | "waitinginput" | "blocked" => PaneStateKind::WaitingInput,
+            "idle" => PaneStateKind::Idle,
+            "interactive" => PaneStateKind::Interactive,
+            "crashed" => PaneStateKind::Crashed,
+            "done" => PaneStateKind::Done,
+            other => return Err(anyhow!("unknown state: {other}")),
+        };
+
+        let client = self.client().await?;
+        let pane_id = self.resolve_pane_id(&client, pane_prefix).await?;
+        let reached = client
+            .wait_pane_state(
+                tarpc::context::current(),
+                pane_id,
+                kind,
+                timeout_secs.saturating_mul(1000),
+            )
             .await
             .context("rpc")?
             .map_err(|e| anyhow!("{e}"))?;
 
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
+        if reached {
+            Ok(format!(
+                "pane {} reached {state_str}",
+                &pane_id.0.to_string()[..8]
+            ))
+        } else {
+            Err(anyhow!("timeout after {timeout_secs}s"))
+        }
     }
 
     async fn tool_pane_set_state(&self, args: &Value) -> Result<String> {
@@ -711,10 +801,18 @@ impl Server {
             .ok_or_else(|| anyhow!("missing query"))?
             .to_owned();
         let limit = args["limit"].as_u64().unwrap_or(20) as u32;
+        let failures_only = args["failures_only"].as_bool().unwrap_or(false);
 
         let client = self.client().await?;
         let hits = client
-            .search_blocks(tarpc::context::current(), SearchBlocksReq { query, limit })
+            .search_blocks(
+                tarpc::context::current(),
+                SearchBlocksReq {
+                    query,
+                    limit,
+                    failures_only,
+                },
+            )
             .await
             .context("rpc")?
             .map_err(|e| anyhow!("{e}"))?;

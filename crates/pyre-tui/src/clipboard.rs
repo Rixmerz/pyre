@@ -17,6 +17,7 @@ use std::sync::OnceLock;
 use anyhow::{anyhow, Result};
 
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
 enum Backend {
     WlCopy,
     Xclip,

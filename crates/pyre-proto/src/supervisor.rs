@@ -106,6 +106,17 @@ pub trait SupervisorWorker {
     /// in-memory registry.
     async fn pane_closed(session_id: String, slot_idx: u32) -> Result<(), RpcError>;
 
+    /// Notify the supervisor that a pane's state has changed.
+    ///
+    /// The supervisor resolves the stable PaneId and emits a `StateChanged`
+    /// event into its `PaneEventBus` so MCP clients on the hybrid daemon
+    /// receive the same live state events as single-mode clients.
+    async fn pane_state_changed(
+        session_id: String,
+        slot_idx: u32,
+        state: crate::PaneStateKind,
+    ) -> Result<(), RpcError>;
+
     /// Liveness signal sent by the worker every 5 s.
     ///
     /// Supervisor times out at 15 s and triggers a forced respawn if no
@@ -164,4 +175,17 @@ pub trait WorkerControl {
 
     /// List all pane slot indices currently open in this worker.
     async fn list_panes() -> Result<Vec<u32>, RpcError>;
+
+    /// Live pane metadata for agent UX (state engine runs in the worker).
+    async fn get_pane_info(slot_idx: u32) -> Result<crate::PaneInfo, RpcError>;
+
+    /// Override pane state (self-report / integration hooks).
+    async fn set_pane_state(
+        slot_idx: u32,
+        state: crate::PaneStateKind,
+        reason: String,
+    ) -> Result<(), RpcError>;
+
+    /// Mark pane as seen by the user.
+    async fn mark_pane_seen(slot_idx: u32) -> Result<(), RpcError>;
 }

@@ -16,6 +16,7 @@ Daemon-owned terminal multiplexer with block-level history, full-text search, an
 - **Agent state monitoring** — a dedicated state tracker classifies each pane as idle, running, waiting for input, or error; exposed via the MCP server.
 - **MCP server (`pyre-mcp`)** — seven tools: `session_spawn`, `session_close`, `pane_open`, `pane_send_keys`, `pane_capture`, `pane_set_state`, `block_search`. Sessions, panes, and blocks are also exposed as MCP resources.
 - **Mouse-first TUI (Ember theme)** — ratatui + crossterm, Ember palette (amber on near-black), mouse click-to-focus, scroll wheel.
+- **Pyre fire motion** — startup splash and in-TUI accents use a shared procedural fire engine (`fire_motion.rs`): no animation libraries, no sprite packs. Blocked agents pulse like embers on the same palette as the launch animation.
 - **tmux-compatible CLI** — `pyrec` accepts `list-sessions`, `new-session`, `kill-session`, `send-keys`, `split-window`, and more.
 - **Clipboard integration** — `pyrec capture-pane --copy` copies output to the system clipboard via `wl-copy` (Wayland) or `xclip` (X11).
 - **Searchable scrollback** — ring buffer per pane with configurable depth; `PgUp`/`PgDn` in `pyre` or `capture-pane -S` in `pyrec`.
@@ -25,10 +26,10 @@ Daemon-owned terminal multiplexer with block-level history, full-text search, an
 ### 1. Build
 
 ```sh
-git clone https://github.com/<TODO>/pyre.git
+git clone https://github.com/Rixmerz/pyre.git
 cd pyre
 cargo build --release
-# binaries: target/release/{pyred,pyrec,pyre,pyre-mcp}
+# binaries: target/release/{pyred,pyrec,pyre,pyre-gpu,pyre-mcp}
 ```
 
 For a size- and performance-optimised binary use the `release-prod` profile:
@@ -62,6 +63,29 @@ pyrec sessions     # list active sessions
 pyrec list         # list recent blocks
 ```
 
+### Multi-agent quickstart (hybrid)
+
+With `process_model = "hybrid"` in config (see [docs/CONFIG.md](docs/CONFIG.md)):
+
+```sh
+pyrec session-new --name api --cwd ~/projects/api -d
+pyrec session-new --name web --cwd ~/projects/web -d
+pyre   # sidebar shows per-pane blocked/working + session rollup
+```
+
+From scripts or an MCP client: `pyrec wait-pane --pane <id> --state waiting`,
+`pyrec pane read --pane <id> --source block-last`. Playbook:
+[docs/AGENTS.md](docs/AGENTS.md).
+
+### GPU viewer (S6 Phase 1)
+
+```sh
+pyre-gpu   # windowed attach; Ctrl+/ search; Ctrl+Tab switch panes
+pyrec doctor
+```
+
+See [docs/adr/0003-render-backend.md](docs/adr/0003-render-backend.md).
+
 ## Key bindings (pyre)
 
 Prefix: `Ctrl-B`
@@ -86,6 +110,24 @@ Prefix: `Ctrl-B`
 | `PgUp` / `PgDn` | Scroll in scrollback mode |
 | Mouse click | Focus pane under cursor |
 | Mouse wheel | Scroll output |
+
+## Quickstart smoke test (10 min)
+
+Exercises daemon, TUI, `pyrec`, and search end-to-end on a single machine.
+Assumes binaries are built and `pyred` is not already running.
+
+1. `pyred &` — start the daemon in single-process mode (default). Use `pyred --config <path>` with `process_model = "hybrid"` for the supervisor model.
+2. `pyre` — launch the TUI; a fresh session opens automatically (the daemon spawns a default pane).
+3. `Ctrl-B "` — horizontal split; a second pane appears below the first.
+4. Type `echo hello && sleep 1 && echo done` in the lower pane and press Enter; wait for the block to finish (exit badge `b<id>` appears in the ribbon).
+5. `Ctrl-B [` — enter block ribbon mode on the focused pane; `←`/`→` (or `h`/`l`) move the cursor between recent blocks.
+6. Press `Enter` on a block — the modal pager opens showing the full stdout. `↑`/`↓` or `PgUp`/`PgDn` scroll; `q` or `Esc` closes.
+7. In a second terminal: `pyrec search "hello"` — confirm the block is indexed (output includes a snippet line).
+8. Back in the TUI: `Ctrl-B /` — open the search overlay; type `hello`; `↑`/`↓` navigate hits; `Enter` jumps focus to the source pane and highlights the block in the ribbon.
+9. `Ctrl-B y` — copy the last block's stdout to the clipboard (requires `wl-copy` on Wayland or `xclip` on X11).
+10. `pyrec kill-session <session-id>` (UUID prefix accepted) — close the session cleanly; `pyrec sessions` should return an empty list.
+
+Note: `pyrec wait-pane --pane <pane-id> --state waiting` can be used in step 5 instead of watching the TUI — it returns as soon as the pane transitions to `WaitingInput` (or the shell prompt reappears with OSC 133 integration installed).
 
 ## pyrec basics
 

@@ -26,7 +26,7 @@ Process model: see [docs/adr/0002-daemon-process-architecture.md](docs/adr/0002-
    +----------+                       |                       | <--- tantivy --> index/
                                       |                       | <--- mlua    --> init.lua
    +----------+      UDS (MCP)        |                       |
-   |   jig    |  <----------------->  |  (MCP resources)      |
+   | pyre-mcp |  <----------------->  |  (MCP resources)      |
    +----------+                       +-----------------------+
 ```
 

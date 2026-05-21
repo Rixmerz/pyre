@@ -1,17 +1,23 @@
 //! pyre shared protocol types: sessions, panes, blocks, IPC commands.
 
 pub mod blocks;
+pub mod handshake;
+pub mod paths;
 pub mod service;
 pub mod sessions;
 pub mod supervisor;
 pub use blocks::{BlockEvent, BlockHit, ListBlocksReq, SearchBlocksReq};
+pub use handshake::{
+    read_control_server, read_control_version_after_tag, write_control_client, PROTO_VERSION,
+};
+pub use paths::runtime_pyre_dir;
 pub use service::{
-    AttachAck, InputFrame, OutputFrame, PidInspect, PyreDaemon, PyreDaemonClient, PyreError,
-    SpawnReq, MODE_CONTROL, MODE_STREAM,
+    AttachAck, InputFrame, OutputFrame, PaneEvent, PaneEventKind, PidInspect, PyreDaemon,
+    PyreDaemonClient, PyreError, SpawnReq, MODE_CONTROL, MODE_STREAM,
 };
 pub use sessions::{
-    OpenPaneReq, PaneInfo, PaneStateKind, ReplayBlocks, ResizePaneReq, ResizePaneRes, SessionInfo,
-    SpawnResp,
+    AgentKind, OpenPaneReq, PaneInfo, PaneStateKind, ReplayBlocks, ResizePaneReq, ResizePaneRes,
+    SessionInfo, SpawnResp,
 };
 pub use supervisor::{
     BlockEvent as SupervisorBlockEvent, BlockKind, RegisterAck, RpcError as SupervisorRpcError,

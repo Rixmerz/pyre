@@ -9,8 +9,8 @@
   start/end/exit-code/duration, not just a stream of bytes.
 - Single binary set replaces the `tmux + alacritty` combination for a
   Linux daily driver — multiplexing, reattach, and rendering converge.
-- First-class AI integration: panes are MCP resources that agents
-  (`jig`, etc.) can read, search, and act on without screen-scraping.
+- First-class agent integration: panes are MCP resources that any MCP
+  client can read, search, and act on without screen-scraping.
 - Scriptable via Lua (mlua 5.4) at well-defined hook points.
 - Searchable history across all sessions via Tantivy.
 
@@ -149,8 +149,8 @@ Resources:
 - `block://<block_id>` — read one Block (command + stdout).
 - Tools: `search_blocks(query)`, `spawn(argv, session)`, `send_input(pane, text)`.
 
-This lets `jig` (and any other MCP client) consume pane state without
-screen-scraping.
+This lets any MCP client consume pane state without screen-scraping.
+See [docs/AGENTS.md](docs/AGENTS.md) for the agent multiplexer playbook.
 
 ## Security model
 
@@ -168,6 +168,5 @@ screen-scraping.
 - Windows and macOS support.
 - Built-in shell, multiplexer protocol compatibility with tmux.
 - Cloud sync, account systems, network-exposed daemon.
-- Reimplementing the ANSI parser, the cron scheduler (use
-  `schedule-mcp`), or experiential memory (consume `jig` / evaluate
-  MEMI in S5).
+- Reimplementing the ANSI parser, a cron scheduler, or an external
+  experiential memory layer — pyre exposes blocks and hooks locally.

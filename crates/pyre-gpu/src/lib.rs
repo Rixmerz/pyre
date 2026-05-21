@@ -1,1 +1,1 @@
-//! pyre GPU crate — stubs filled in later sprints
+//! pyre-gpu — GPU-backed terminal viewer (S6). See `pyre-gpu` binary.

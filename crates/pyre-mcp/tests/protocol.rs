@@ -1,8 +1,7 @@
 //! Integration tests for pyre-mcp JSON-RPC protocol.
 //!
 //! Test 1: initialize handshake — mandatory, always runs.
-//! Tests 2-3: require a live pyred subprocess; marked #[ignore] until
-//! the test harness gains subprocess lifecycle management (TODO S5e).
+//! Test 3 (`test_live_session_spawn`) spawns `pyred` via `CARGO_BIN_EXE_pyred`.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -134,8 +133,8 @@ fn test_tools_list() {
     let tools = resp["result"]["tools"].as_array().expect("tools is array");
 
     assert!(
-        tools.len() >= 6,
-        "expected at least 6 tools, got {}",
+        tools.len() >= 8,
+        "expected at least 8 tools, got {}",
         tools.len()
     );
 
@@ -148,6 +147,8 @@ fn test_tools_list() {
         "block_search",
         "session_spawn",
         "session_close",
+        "pane_open",
+        "wait_pane_state",
     ] {
         assert!(
             names.contains(expected),
@@ -163,32 +164,49 @@ fn test_tools_list() {
 /// Spawns pyred + pyre-mcp, calls session_spawn, pane_send_keys, then
 /// resources/read on the output, and asserts "hi" appears.
 ///
-/// Marked #[ignore] because it requires a real pyred binary in PATH and
-/// a writable XDG_RUNTIME_DIR socket. Run with:
-///   cargo test -- --ignored test_live_session_spawn
-///
-/// TODO S5e: wire this into the CI harness with pyred lifecycle management.
+/// Spawns `pyred` via `CARGO_BIN_EXE_pyred` (set by `cargo test`) with an
+/// isolated runtime dir, then exercises session_spawn → pane_send_keys → capture.
 #[test]
-#[ignore]
 fn test_live_session_spawn() {
     use std::time::Duration;
 
-    let socket_path = format!("/tmp/pyre-mcp-test-{}.sock", std::process::id());
+    let rt_dir = tempfile::tempdir().expect("tempdir");
+    let data_dir = rt_dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).expect("mkdir data");
+    let sock_path = rt_dir.path().join("pyre.sock");
 
-    // Start pyred.
-    let mut daemon = Command::new("pyred")
-        .env("XDG_RUNTIME_DIR", "/tmp")
-        .env("PYRE_SOCK", &socket_path)
+    let pyred_bin = std::env::var("CARGO_BIN_EXE_pyred").unwrap_or_else(|_| {
+        let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+        let mut p = std::path::PathBuf::from(manifest);
+        p.pop();
+        p.pop();
+        p.push("target/debug/pyred");
+        p.to_string_lossy().into_owned()
+    });
+
+    let mut daemon = Command::new(&pyred_bin)
+        .env_clear()
+        .env(
+            "HOME",
+            std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()),
+        )
+        .env("XDG_RUNTIME_DIR", rt_dir.path())
+        .env("PYRE_DATA_DIR", &data_dir)
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn pyred");
 
-    // Give it time to bind the socket.
-    std::thread::sleep(Duration::from_millis(400));
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while !sock_path.exists() {
+        if std::time::Instant::now() >= deadline {
+            panic!("pyred socket never appeared at {}", sock_path.display());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 
     let bin = pyre_mcp_bin();
     let mut child = Command::new(&bin)
-        .env("PYRE_SOCK", &socket_path)
+        .env("PYRE_SOCK", &sock_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

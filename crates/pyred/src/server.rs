@@ -1,9 +1,10 @@
 //! tarpc `PyreDaemon` service implementation.
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
 use pyre_proto::{
-    AttachAck, Block, BlockHit, BlockId, ListBlocksReq, OpenPaneReq, PaneId, PaneInfo,
+    AttachAck, Block, BlockHit, BlockId, ListBlocksReq, OpenPaneReq, PaneEvent, PaneId, PaneInfo,
     PaneStateKind, PyreError, ReplayBlocks, ResizePaneReq, ResizePaneRes, SearchBlocksReq,
     SessionId, SessionInfo, SpawnReq, SpawnResp,
 };
@@ -17,6 +18,9 @@ pub struct DaemonImpl {
     pub registry: Arc<SessionRegistry>,
     pub store: Arc<crate::store::Store>,
     pub block_index: Arc<BlockIndex>,
+    /// Pending focus requests enqueued by `request_focus` and dequeued by `take_focus_request`.
+    /// Shared across all control connections so pyrec and the TUI see the same queue.
+    pub focus_queue: Arc<Mutex<VecDeque<String>>>,
 }
 
 impl pyre_proto::service::PyreDaemon for DaemonImpl {
@@ -105,25 +109,30 @@ impl pyre_proto::service::PyreDaemon for DaemonImpl {
     ) -> Result<Vec<BlockHit>, PyreError> {
         let block_index = self.block_index.clone();
         let query = req.query.clone();
+        let failures_only = req.failures_only;
         let limit = req.limit;
-        let ids = tokio::task::spawn_blocking(move || block_index.search(&query, limit))
-            .await
-            .map_err(|e| PyreError::Io(e.to_string()))?
-            .map_err(|e| PyreError::Io(e.to_string()))?;
+        let ids =
+            tokio::task::spawn_blocking(move || block_index.search(&query, limit, failures_only))
+                .await
+                .map_err(|e| PyreError::Io(e.to_string()))?
+                .map_err(|e| PyreError::Io(e.to_string()))?;
 
-        let mut hits = Vec::with_capacity(ids.len());
+        let mut blocks = Vec::with_capacity(ids.len());
         for id in ids {
             match self.store.get_block(id).await {
-                Ok(Some(block)) => hits.push(BlockHit {
-                    block,
-                    snippet: String::new(),
-                }),
+                Ok(Some(block)) => blocks.push(block),
                 Ok(None) => {}
                 Err(e) => {
                     tracing::warn!("get_block {id:?}: {e:#}");
                 }
             }
         }
+        let store = self.store.clone();
+        let hits = tokio::task::spawn_blocking(move || {
+            crate::search_filter::hits_with_snippets(&store, blocks, 160)
+        })
+        .await
+        .map_err(|e| PyreError::Io(e.to_string()))?;
         Ok(hits)
     }
 
@@ -347,5 +356,156 @@ impl pyre_proto::service::PyreDaemon for DaemonImpl {
             })
             .map_err(|e| PyreError::Io(format!("resize: {e}")))?;
         Ok(ResizePaneRes { ok: true })
+    }
+
+    async fn wait_pane_state(
+        self,
+        _ctx: context::Context,
+        pane: PaneId,
+        state: PaneStateKind,
+        timeout_ms: u32,
+    ) -> Result<bool, PyreError> {
+        let (_session, pane_state) = self
+            .registry
+            .get_pane(pane)
+            .await
+            .ok_or(PyreError::NoSuchPane(pane))?;
+
+        let mut rx = {
+            let t = pane_state
+                .state_tracker
+                .lock()
+                .map_err(|_| PyreError::Io("tracker lock poisoned".into()))?;
+            if t.state == state {
+                return Ok(true);
+            }
+            t.subscribe()
+        };
+
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_millis(timeout_ms.max(1) as u64);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(remaining) => return Ok(false),
+                changed = rx.changed() => {
+                    if changed.is_err() {
+                        return Ok(false);
+                    }
+                    if *rx.borrow() == state {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn mark_pane_seen(self, _ctx: context::Context, pane: PaneId) -> Result<(), PyreError> {
+        let (_session, pane_state) = self
+            .registry
+            .get_pane(pane)
+            .await
+            .ok_or(PyreError::NoSuchPane(pane))?;
+        pane_state
+            .state_tracker
+            .lock()
+            .map_err(|_| PyreError::Io("tracker lock poisoned".into()))?
+            .mark_seen();
+        Ok(())
+    }
+
+    async fn last_block_for_pane(
+        self,
+        _ctx: context::Context,
+        pane: PaneId,
+    ) -> Result<Option<Block>, PyreError> {
+        let blocks = self
+            .store
+            .list_blocks_for_pane(pane, 1)
+            .await
+            .map_err(|e| PyreError::Io(e.to_string()))?;
+        Ok(blocks.into_iter().next())
+    }
+
+    async fn request_focus(
+        self,
+        _ctx: context::Context,
+        pane_id: String,
+    ) -> Result<bool, PyreError> {
+        self.focus_queue
+            .lock()
+            .map_err(|_| PyreError::Io("focus_queue lock poisoned".into()))?
+            .push_back(pane_id);
+        Ok(true)
+    }
+
+    async fn take_focus_request(self, _ctx: context::Context) -> Result<Option<String>, PyreError> {
+        Ok(self
+            .focus_queue
+            .lock()
+            .map_err(|_| PyreError::Io("focus_queue lock poisoned".into()))?
+            .pop_front())
+    }
+
+    async fn next_pane_event(
+        self,
+        _ctx: context::Context,
+        after_seq: u64,
+        timeout_ms: u32,
+    ) -> Result<Vec<PaneEvent>, PyreError> {
+        // Drain any already-buffered events with seq > after_seq and subscribe
+        // to the live broadcast in one atomic step so no event can slip through.
+        let (history, mut rx) = self.registry.events_after(after_seq);
+        if !history.is_empty() {
+            return Ok(history);
+        }
+
+        let deadline = tokio::time::Duration::from_millis(timeout_ms.max(1) as u64);
+        let mut collected: Vec<PaneEvent> = Vec::new();
+
+        // Collect the first event that arrives, then drain any additional
+        // events that land within a short coalescing window (1 ms) so callers
+        // receive a small batch rather than one event per RPC round-trip.
+        let got_first = tokio::time::timeout(deadline, async {
+            loop {
+                match rx.recv().await {
+                    Ok(ev) if ev.seq > after_seq => {
+                        collected.push(ev);
+                        break;
+                    }
+                    Ok(_) => continue, // stale event from before our cursor
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Receiver fell behind; drain ring for missed events.
+                        let (missed, new_rx) = self.registry.events_after(after_seq);
+                        rx = new_rx;
+                        if !missed.is_empty() {
+                            collected.extend(missed);
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        })
+        .await;
+
+        if got_first.is_err() {
+            // Timeout — normal; return empty vec.
+            return Ok(vec![]);
+        }
+
+        // Coalesce: drain any additional events that arrive within 1 ms.
+        let coalesce = tokio::time::Duration::from_millis(1);
+        loop {
+            match tokio::time::timeout(coalesce, rx.recv()).await {
+                Ok(Ok(ev)) if ev.seq > after_seq => collected.push(ev),
+                _ => break,
+            }
+        }
+
+        Ok(collected)
     }
 }
