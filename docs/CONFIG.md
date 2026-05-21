@@ -81,10 +81,37 @@ args = [
 
 ---
 
-## Future configuration knobs (TODO)
+## Multi-agent profile (hybrid)
 
-The following knobs are planned but not yet implemented. They will be added to
-`hooks.toml` or a separate `pyre.toml` as each sprint ships.
+For **one heavy agent per session** (recommended for S5), run the supervisor in
+hybrid mode so each session gets an isolated worker process:
+
+```toml
+[pyred]
+process_model = "hybrid"
+```
+
+| Pattern | Setting |
+|---------|---------|
+| Agent A (project `api`) | `pyrec session-new --name api --cwd ~/api` |
+| Agent B (project `web`) | `pyrec session-new --name web --cwd ~/web` |
+| Orchestration without TUI | `pyrec wait-pane`, `pyrec pane read`, MCP `wait_pane_state` |
+
+Crash isolation: killing one worker does not take down other sessions. Block
+search and replay are centralized in the supervisor store. Stream mirror
+(two clients on one pane) uses the same proxy path as single-mode; see
+`crates/pyred/tests/multi.rs` and `PaneMirrorHub` in the supervisor.
+
+See [docs/AGENTS.md](AGENTS.md) and
+[docs/adr/0002-daemon-process-architecture.md](adr/0002-daemon-process-architecture.md).
+
+---
+
+## Future configuration knobs (planned)
+
+The following knobs are not yet wired to `config.toml`. Ring buffer capacity is
+fixed in code today (`RingBuf::new` in `crates/pyred/src/pty.rs`). They will land
+in `hooks.toml` or `pyre.toml` in a later sprint.
 
 - `[ringbuf]` — `lines_per_pane = 10000` scrollback depth.
 - `[search]` — `index_path`, `writer_heap_mb = 64`.

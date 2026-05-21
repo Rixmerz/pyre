@@ -28,7 +28,8 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use pyre_proto::supervisor::{
     BlockEvent, BlockKind, RpcError, SupervisorWorkerClient, WorkerControl,
 };
-use pyre_proto::{InputFrame, OutputFrame, SessionId};
+use pyre_proto::{InputFrame, OutputFrame, PaneInfo, PaneStateKind, SessionId};
+use std::sync::Mutex as StdMutex;
 use tarpc::server::{BaseChannel, Channel};
 use tarpc::tokio_serde::formats::Bincode;
 use tarpc::{client, context};
@@ -88,6 +89,12 @@ impl WorkerEnv {
 // ---------------------------------------------------------------------------
 
 struct PaneHandle {
+    shell: String,
+    #[allow(dead_code)]
+    cwd: String,
+    cols: u16,
+    rows: u16,
+    created_at: chrono::DateTime<chrono::Utc>,
     /// OS PID of the shell child.
     child_pid: u32,
     /// PTY master — guarded because resize and the output reader both touch it.
@@ -101,6 +108,7 @@ struct PaneHandle {
     /// continue; they miss at most 256 chunks rather than racing the ring-buffer
     /// reader and stealing bytes from it.
     output_tx: broadcast::Sender<Bytes>,
+    state_tracker: Arc<StdMutex<crate::state::PaneStateTracker>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -386,12 +394,19 @@ impl WorkerState {
             })
             .context("spawn pty reader thread")?;
 
+        let (state_tracker, _) = crate::state::PaneStateTracker::new(child_pid);
         let handle = PaneHandle {
+            shell: shell.clone(),
+            cwd: cwd.clone(),
+            cols: if cols == 0 { 80 } else { cols },
+            rows: if rows == 0 { 24 } else { rows },
+            created_at: chrono::Utc::now(),
             child_pid,
             master,
             input_tx,
             ring_buf,
             output_tx,
+            state_tracker: Arc::new(StdMutex::new(state_tracker)),
         };
 
         self.panes.write().await.insert(slot_idx, handle);
@@ -437,6 +452,104 @@ impl WorkerState {
         }
         Ok(())
     }
+
+    async fn pane_info(&self, slot_idx: u32) -> Result<PaneInfo, RpcError> {
+        let panes = self.panes.read().await;
+        let h = panes
+            .get(&slot_idx)
+            .ok_or(RpcError::UnknownSlot(slot_idx))?;
+        let session_uuid = Uuid::parse_str(&self.session_id)
+            .map_err(|e| RpcError::Internal(format!("invalid session uuid: {e}")))?;
+        let (state, reason, last_activity, foreground_cmd, root_pid, agent, seen) = {
+            let t = h.state_tracker.lock().expect("tracker poisoned");
+            let last_activity = chrono::Utc::now()
+                - chrono::Duration::from_std(t.last_output_at.elapsed())
+                    .unwrap_or(chrono::Duration::zero());
+            (
+                t.state,
+                t.reason.clone(),
+                last_activity,
+                t.foreground_cmd.clone(),
+                t.root_pid,
+                t.agent,
+                t.seen,
+            )
+        };
+        Ok(PaneInfo {
+            id: pyre_proto::PaneId::default(),
+            session: SessionId(session_uuid),
+            cols: h.cols,
+            rows: h.rows,
+            shell: h.shell.clone(),
+            created_at: h.created_at,
+            closed_at: None,
+            state,
+            state_reason: reason,
+            last_activity,
+            foreground_cmd,
+            root_pid,
+            agent,
+            seen,
+        })
+    }
+
+    async fn set_pane_state(
+        &self,
+        slot_idx: u32,
+        state: PaneStateKind,
+        reason: String,
+    ) -> Result<()> {
+        let panes = self.panes.read().await;
+        let h = panes
+            .get(&slot_idx)
+            .ok_or_else(|| anyhow::anyhow!("unknown slot {slot_idx}"))?;
+        let override_secs: u64 = std::env::var("PYRE_OVERRIDE_WINDOW_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(30);
+        h.state_tracker
+            .lock()
+            .expect("tracker poisoned")
+            .set_override(state, reason, override_secs);
+        Ok(())
+    }
+
+    async fn mark_pane_seen(&self, slot_idx: u32) -> Result<()> {
+        let panes = self.panes.read().await;
+        let h = panes
+            .get(&slot_idx)
+            .ok_or_else(|| anyhow::anyhow!("unknown slot {slot_idx}"))?;
+        h.state_tracker.lock().expect("tracker poisoned").mark_seen();
+        Ok(())
+    }
+}
+
+fn spawn_worker_state_engine(state: Arc<WorkerState>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(500));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let trackers: Vec<(u32, Arc<StdMutex<crate::state::PaneStateTracker>>)> = {
+                let panes = state.panes.read().await;
+                panes
+                    .iter()
+                    .map(|(slot, h)| (*slot, h.state_tracker.clone()))
+                    .collect()
+            };
+            for (_slot, tracker_arc) in trackers {
+                let _ = tokio::task::spawn_blocking(move || {
+                    let mut t = tracker_arc.lock().expect("tracker poisoned");
+                    t.foreground_cmd = crate::state::foreground_of(t.root_pid);
+                    if let Some(ref cmd) = t.foreground_cmd {
+                        t.agent = crate::agent_detect::classify_foreground(cmd);
+                    }
+                    t.evaluate();
+                })
+                .await;
+            }
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -580,6 +693,38 @@ impl WorkerControl for WorkerControlImpl {
     async fn list_panes(self, _ctx: context::Context) -> Result<Vec<u32>, RpcError> {
         let panes = self.state.panes.read().await;
         Ok(panes.keys().cloned().collect())
+    }
+
+    async fn get_pane_info(
+        self,
+        _ctx: context::Context,
+        slot_idx: u32,
+    ) -> Result<PaneInfo, RpcError> {
+        self.state.pane_info(slot_idx).await
+    }
+
+    async fn set_pane_state(
+        self,
+        _ctx: context::Context,
+        slot_idx: u32,
+        state: PaneStateKind,
+        reason: String,
+    ) -> Result<(), RpcError> {
+        self.state
+            .set_pane_state(slot_idx, state, reason)
+            .await
+            .map_err(|e| RpcError::Internal(e.to_string()))
+    }
+
+    async fn mark_pane_seen(
+        self,
+        _ctx: context::Context,
+        slot_idx: u32,
+    ) -> Result<(), RpcError> {
+        self.state
+            .mark_pane_seen(slot_idx)
+            .await
+            .map_err(|e| RpcError::Internal(e.to_string()))
     }
 }
 
@@ -796,6 +941,8 @@ pub async fn run() -> Result<()> {
         sv_client: sv_client.clone(),
         shutdown_flag: shutdown_tx,
     });
+
+    let _worker_state_engine = spawn_worker_state_engine(state.clone());
 
     // --- Respawn recovery: re-open persisted panes ---
     {

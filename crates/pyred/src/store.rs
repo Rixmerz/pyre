@@ -169,6 +169,24 @@ impl Store {
         row.map(row_to_block).transpose()
     }
 
+    /// First `max_chars` of decompressed stdout, flattened to one line (for search UI).
+    pub fn stdout_snippet(&self, id: pyre_proto::BlockId, max_chars: usize) -> String {
+        match self.read_block_stdout(id) {
+            Ok(bytes) => bytes
+                .iter()
+                .map(|&b| {
+                    if b == b'\n' || b == b'\r' || b == b'\t' {
+                        ' '
+                    } else {
+                        char::from(b)
+                    }
+                })
+                .take(max_chars)
+                .collect(),
+            Err(_) => String::new(),
+        }
+    }
+
     /// Read and decompress the stdout blob for a block. Returns empty vec if blob does not exist.
     pub fn read_block_stdout(&self, id: pyre_proto::BlockId) -> Result<Vec<u8>> {
         let path = self.blob_path_for(id);

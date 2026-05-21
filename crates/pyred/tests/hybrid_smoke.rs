@@ -5,7 +5,8 @@
 //! They are marked `#[ignore]` and run with:
 //!   cargo test --test hybrid_smoke -- --ignored --nocapture
 //!
-//! Test 4 (`migration_idempotency`) is fully in-process and runs without
+//! Tests 4–5 (hybrid wait_pane_state, replay RPC) require the built binary (`--ignored`).
+//! Test 6 (`migration_idempotency`) is fully in-process and runs without
 //! `--ignored`.
 
 use std::time::Duration;
@@ -13,10 +14,9 @@ use tokio::sync::Mutex;
 
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
-use pyre_proto::{PyreDaemonClient, SpawnReq, SpawnResp, MODE_CONTROL};
+use pyre_proto::{PyreDaemonClient, SpawnReq, SpawnResp, write_control_client};
 use tarpc::client;
 use tarpc::tokio_serde::formats::Bincode;
-use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
@@ -49,7 +49,7 @@ async fn wait_for_socket(path: &std::path::Path, timeout: Duration) -> anyhow::R
 
 async fn connect_control(sock_path: &std::path::Path) -> anyhow::Result<PyreDaemonClient> {
     let mut sock = UnixStream::connect(sock_path).await?;
-    sock.write_all(&[MODE_CONTROL]).await?;
+    write_control_client(&mut sock).await?;
     let transport = tarpc::serde_transport::new(
         Framed::new(sock, LengthDelimitedCodec::new()),
         Bincode::default(),
@@ -184,6 +184,7 @@ async fn run_cross_session_search() -> anyhow::Result<()> {
             pyre_proto::SearchBlocksReq {
                 query: "hello".into(),
                 limit: 20,
+                failures_only: false,
             },
         )
         .await
@@ -523,7 +524,173 @@ async fn run_close_pane_eviction() -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Test 4: migration_idempotency — fully in-process, no binary required
+// Test 4: hybrid wait_pane_state (S5 RPC through supervisor → worker)
+// ---------------------------------------------------------------------------
+//
+// Multi-client mirror on one pane is covered for single-mode in `tests/multi.rs`;
+// hybrid uses the same supervisor stream proxy (see PaneMirrorHub in supervisor.rs).
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires built pyred binary in hybrid mode; run with --ignored"]
+async fn hybrid_wait_pane_state_rpc() {
+    let result = tokio::time::timeout(Duration::from_secs(30), run_hybrid_wait_pane()).await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => panic!("hybrid_wait_pane_state failed: {e:#}"),
+        Err(_) => panic!("hybrid_wait_pane_state timed out after 30s"),
+    }
+}
+
+async fn run_hybrid_wait_pane() -> anyhow::Result<()> {
+    use pyre_proto::PaneStateKind;
+
+    let tmpdir = tempfile::TempDir::new()?;
+    let rt_dir = tmpdir.path().join("run");
+    let state_dir = tmpdir.path().join("state");
+    std::fs::create_dir_all(&rt_dir)?;
+    std::fs::create_dir_all(&state_dir)?;
+    let cfg_dir = tmpdir.path().join("config").join("pyre");
+    std::fs::create_dir_all(&cfg_dir)?;
+    std::fs::write(
+        cfg_dir.join("config.toml"),
+        "[pyred]\nprocess_model = \"hybrid\"\n",
+    )?;
+    let sock_path = rt_dir.join("pyre.sock");
+
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_pyred"))
+        .arg("--mode")
+        .arg("supervisor")
+        .env("XDG_RUNTIME_DIR", &rt_dir)
+        .env("XDG_STATE_HOME", &state_dir)
+        .env("XDG_CONFIG_HOME", tmpdir.path().join("config"))
+        .env("PYRE_DATA_DIR", &state_dir)
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+
+    wait_for_socket(&sock_path, Duration::from_secs(8)).await?;
+    let rpc = connect_control(&sock_path).await?;
+
+    let SpawnResp { pane, .. } = rpc
+        .spawn(
+            tarpc::context::current(),
+            SpawnReq {
+                shell: Some("/bin/sh".into()),
+                cwd: None,
+                cols: 80,
+                rows: 24,
+                env: vec![],
+                name: None,
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("tarpc: {e}"))?
+        .map_err(|e| anyhow::anyhow!("spawn: {e:?}"))?;
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    rpc.set_pane_state(
+        tarpc::context::current(),
+        pane,
+        PaneStateKind::WaitingInput,
+        "test".into(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("tarpc set_pane_state: {e}"))?
+    .map_err(|e| anyhow::anyhow!("set_pane_state: {e:?}"))?;
+
+    let reached = rpc
+        .wait_pane_state(
+            tarpc::context::current(),
+            pane,
+            PaneStateKind::WaitingInput,
+            5_000,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("tarpc wait_pane_state: {e}"))?
+        .map_err(|e| anyhow::anyhow!("wait_pane_state: {e:?}"))?;
+
+    assert!(reached, "wait_pane_state should return true when state is already set");
+
+    drop(rpc);
+    let pid = Pid::from_raw(child.id() as i32);
+    kill(pid, Signal::SIGTERM).ok();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Test 5: hybrid replay RPC
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires built pyred binary in hybrid mode; run with --ignored"]
+async fn hybrid_replay_rpc_succeeds() {
+    let result = tokio::time::timeout(Duration::from_secs(30), run_hybrid_replay()).await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => panic!("hybrid_replay failed: {e:#}"),
+        Err(_) => panic!("hybrid_replay timed out after 30s"),
+    }
+}
+
+async fn run_hybrid_replay() -> anyhow::Result<()> {
+    let tmpdir = tempfile::TempDir::new()?;
+    let rt_dir = tmpdir.path().join("run");
+    let state_dir = tmpdir.path().join("state");
+    std::fs::create_dir_all(&rt_dir)?;
+    std::fs::create_dir_all(&state_dir)?;
+    let cfg_dir = tmpdir.path().join("config").join("pyre");
+    std::fs::create_dir_all(&cfg_dir)?;
+    std::fs::write(
+        cfg_dir.join("config.toml"),
+        "[pyred]\nprocess_model = \"hybrid\"\n",
+    )?;
+    let sock_path = rt_dir.join("pyre.sock");
+
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_pyred"))
+        .arg("--mode")
+        .arg("supervisor")
+        .env("XDG_RUNTIME_DIR", &rt_dir)
+        .env("XDG_STATE_HOME", &state_dir)
+        .env("XDG_CONFIG_HOME", tmpdir.path().join("config"))
+        .env("PYRE_DATA_DIR", &state_dir)
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+
+    wait_for_socket(&sock_path, Duration::from_secs(8)).await?;
+    let rpc = connect_control(&sock_path).await?;
+
+    let SpawnResp { pane, .. } = rpc
+        .spawn(
+            tarpc::context::current(),
+            SpawnReq {
+                shell: Some("/bin/sh".into()),
+                cwd: None,
+                cols: 80,
+                rows: 24,
+                env: vec![],
+                name: None,
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("tarpc: {e}"))?
+        .map_err(|e| anyhow::anyhow!("spawn: {e:?}"))?;
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let _replay = rpc
+        .replay(tarpc::context::current(), pane, 5)
+        .await
+        .map_err(|e| anyhow::anyhow!("tarpc replay: {e}"))?
+        .map_err(|e| anyhow::anyhow!("replay: {e:?}"))?;
+
+    drop(rpc);
+    let pid = Pid::from_raw(child.id() as i32);
+    kill(pid, Signal::SIGTERM).ok();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Test 6: migration_idempotency — fully in-process, no binary required
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -164,4 +164,17 @@ pub trait WorkerControl {
 
     /// List all pane slot indices currently open in this worker.
     async fn list_panes() -> Result<Vec<u32>, RpcError>;
+
+    /// Live pane metadata for agent UX (state engine runs in the worker).
+    async fn get_pane_info(slot_idx: u32) -> Result<crate::PaneInfo, RpcError>;
+
+    /// Override pane state (self-report / integration hooks).
+    async fn set_pane_state(
+        slot_idx: u32,
+        state: crate::PaneStateKind,
+        reason: String,
+    ) -> Result<(), RpcError>;
+
+    /// Mark pane as seen by the user.
+    async fn mark_pane_seen(slot_idx: u32) -> Result<(), RpcError>;
 }

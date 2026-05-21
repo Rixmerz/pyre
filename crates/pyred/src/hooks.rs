@@ -102,16 +102,24 @@ impl HooksConfig {
             });
         }
 
-        // notify-send when entering WaitingInput — Linux desktop only.
-        // On macOS and other non-Linux platforms this is a no-op; users can
-        // set notify_send = false in hooks.toml (already the default).
-        #[cfg(target_os = "linux")]
         if self.on_state_change.notify_send && state == PaneStateKind::WaitingInput {
             let pane_short = pane_short.to_string();
+            #[cfg(target_os = "linux")]
             tokio::task::spawn_blocking(move || {
                 let _ = std::process::Command::new("notify-send")
                     .arg("pyre")
                     .arg(format!("pane {pane_short} waiting for input"))
+                    .status();
+            });
+            #[cfg(target_os = "macos")]
+            tokio::task::spawn_blocking(move || {
+                let body = format!("pane {pane_short} waiting for input");
+                let script = format!(
+                    r#"display notification "{}" with title "pyre""#,
+                    body.replace('\\', "\\\\").replace('"', "\\\"")
+                );
+                let _ = std::process::Command::new("osascript")
+                    .args(["-e", &script])
                     .status();
             });
         }

@@ -105,26 +105,35 @@ impl pyre_proto::service::PyreDaemon for DaemonImpl {
     ) -> Result<Vec<BlockHit>, PyreError> {
         let block_index = self.block_index.clone();
         let query = req.query.clone();
-        let limit = req.limit;
-        let ids = tokio::task::spawn_blocking(move || block_index.search(&query, limit))
+        let failures_only = req.failures_only;
+        let fetch_limit = if failures_only {
+            req.limit.saturating_mul(4).max(req.limit)
+        } else {
+            req.limit
+        };
+        let ids = tokio::task::spawn_blocking(move || block_index.search(&query, fetch_limit))
             .await
             .map_err(|e| PyreError::Io(e.to_string()))?
             .map_err(|e| PyreError::Io(e.to_string()))?;
 
-        let mut hits = Vec::with_capacity(ids.len());
+        let mut blocks = Vec::with_capacity(ids.len());
         for id in ids {
             match self.store.get_block(id).await {
-                Ok(Some(block)) => hits.push(BlockHit {
-                    block,
-                    snippet: String::new(),
-                }),
+                Ok(Some(block)) => blocks.push(block),
                 Ok(None) => {}
                 Err(e) => {
                     tracing::warn!("get_block {id:?}: {e:#}");
                 }
             }
         }
-        Ok(hits)
+        blocks.truncate(req.limit as usize);
+        let store = self.store.clone();
+        let hits = tokio::task::spawn_blocking(move || {
+            crate::search_filter::hits_with_snippets(&store, blocks, 160)
+        })
+        .await
+        .map_err(|e| PyreError::Io(e.to_string()))?;
+        Ok(crate::search_filter::filter_hits(hits, failures_only))
     }
 
     async fn list_sessions(self, _ctx: context::Context) -> Result<Vec<SessionInfo>, PyreError> {
@@ -347,5 +356,81 @@ impl pyre_proto::service::PyreDaemon for DaemonImpl {
             })
             .map_err(|e| PyreError::Io(format!("resize: {e}")))?;
         Ok(ResizePaneRes { ok: true })
+    }
+
+    async fn wait_pane_state(
+        self,
+        _ctx: context::Context,
+        pane: PaneId,
+        state: PaneStateKind,
+        timeout_ms: u32,
+    ) -> Result<bool, PyreError> {
+        let (_session, pane_state) = self
+            .registry
+            .get_pane(pane)
+            .await
+            .ok_or(PyreError::NoSuchPane(pane))?;
+
+        let mut rx = {
+            let t = pane_state
+                .state_tracker
+                .lock()
+                .map_err(|_| PyreError::Io("tracker lock poisoned".into()))?;
+            if t.state == state {
+                return Ok(true);
+            }
+            t.subscribe()
+        };
+
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_millis(timeout_ms.max(1) as u64);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(remaining) => return Ok(false),
+                changed = rx.changed() => {
+                    if changed.is_err() {
+                        return Ok(false);
+                    }
+                    if *rx.borrow() == state {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn mark_pane_seen(
+        self,
+        _ctx: context::Context,
+        pane: PaneId,
+    ) -> Result<(), PyreError> {
+        let (_session, pane_state) = self
+            .registry
+            .get_pane(pane)
+            .await
+            .ok_or(PyreError::NoSuchPane(pane))?;
+        pane_state
+            .state_tracker
+            .lock()
+            .map_err(|_| PyreError::Io("tracker lock poisoned".into()))?
+            .mark_seen();
+        Ok(())
+    }
+
+    async fn last_block_for_pane(
+        self,
+        _ctx: context::Context,
+        pane: PaneId,
+    ) -> Result<Option<Block>, PyreError> {
+        let blocks = self
+            .store
+            .list_blocks_for_pane(pane, 1)
+            .await
+            .map_err(|e| PyreError::Io(e.to_string()))?;
+        Ok(blocks.into_iter().next())
     }
 }

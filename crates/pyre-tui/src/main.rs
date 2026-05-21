@@ -41,8 +41,8 @@ use futures::SinkExt;
 use futures::StreamExt;
 use pyre_proto::{
     blocks::{BlockHit, SearchBlocksReq},
-    Block, InputFrame, OpenPaneReq, OutputFrame, PaneId, PidInspect, PyreDaemonClient, SessionId,
-    SpawnReq, SpawnResp, MODE_CONTROL, MODE_STREAM,
+    focus_request_path, Block, InputFrame, OpenPaneReq, OutputFrame, PaneId, PidInspect,
+    PyreDaemonClient, SessionId, SpawnReq, SpawnResp, write_control_client, MODE_STREAM,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -54,12 +54,14 @@ use ratatui::widgets::{
 };
 use ratatui::Terminal;
 mod clipboard;
+mod fire_motion;
 mod splash;
 mod theme;
 use std::collections::HashMap;
 use std::process::Stdio;
 use tarpc::client;
 use tarpc::tokio_serde::formats::Bincode;
+use fire_motion::AnimClock;
 use theme::EMBER;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
@@ -255,7 +257,7 @@ async fn try_connect_control(socket: &Path) -> Result<PyreDaemonClient> {
     let mut sock = UnixStream::connect(socket)
         .await
         .with_context(|| format!("connect {}", socket.display()))?;
-    sock.write_all(&[MODE_CONTROL]).await?;
+    write_control_client(&mut sock).await?;
 
     let transport = tarpc::serde_transport::new(
         tokio_util::codec::Framed::new(sock, LengthDelimitedCodec::new()),
@@ -632,7 +634,18 @@ struct SearchState {
     results: Vec<BlockHit>,
     last_query_at: Instant,
     pending_query: Option<String>,
+    /// Prefix `!` in the search box sets this (non-zero exit only).
+    failures_only: bool,
     rx: Option<mpsc::Receiver<Vec<BlockHit>>>,
+}
+
+/// Split `!query` failures filter from the tantivy query string.
+fn parse_search_input(input: &str) -> (String, bool) {
+    if let Some(rest) = input.strip_prefix('!') {
+        (rest.trim_start().to_string(), true)
+    } else {
+        (input.to_string(), false)
+    }
 }
 
 impl Default for SearchState {
@@ -644,6 +657,7 @@ impl Default for SearchState {
             results: Vec::new(),
             last_query_at: Instant::now(),
             pending_query: None,
+            failures_only: false,
             rx: None,
         }
     }
@@ -824,6 +838,8 @@ struct AppState {
     /// Latest block snapshot delivered by the background poll task.
     /// Key = PaneId, value = blocks for that pane (up to 20, newest last).
     blocks_rx: watch::Receiver<HashMap<PaneId, Vec<Block>>>,
+    /// In-TUI ember motion (shared curves with startup splash).
+    anim: AnimClock,
 }
 
 impl AppState {
@@ -1082,6 +1098,13 @@ async fn attach_pane(
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
+fn pane_needs_attention(meta: &[pyre_proto::PaneInfo], pane_id: PaneId) -> bool {
+    meta.iter().any(|p| {
+        p.id == pane_id && p.state == pyre_proto::PaneStateKind::WaitingInput && !p.seen
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn render_pane(
     frame: &mut ratatui::Frame,
     area: Rect,
@@ -1090,16 +1113,40 @@ fn render_pane(
     selection: Option<&Selection>,
     slot_idx: usize,
     pending_resizes: &mut Vec<(PaneId, pyre_proto::PaneSize)>,
+    anim_frame: u64,
+    attention: bool,
 ) {
     let short8: String = slot.pane_id.0.to_string().chars().take(8).collect();
+    let seed = slot.pane_id.0.as_u128() as u32;
     let border_block = if focused {
+        let border_style = if attention {
+            fire_motion::ember_border_style(anim_frame, seed, EMBER.border_focus, EMBER.spark)
+        } else {
+            EMBER.border_focus()
+        };
+        let title_style = if attention {
+            fire_motion::ember_title_style(anim_frame, seed, EMBER.primary, EMBER.spark)
+        } else {
+            EMBER.title(EMBER.primary)
+        };
         RatatuiBlock::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Thick)
-            .border_style(EMBER.border_focus())
+            .border_style(border_style)
+            .title(Span::styled(format!(" pane {short8} "), title_style))
+    } else if attention {
+        RatatuiBlock::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(fire_motion::ember_border_style(
+                anim_frame,
+                seed,
+                EMBER.border,
+                EMBER.primary,
+            ))
             .title(Span::styled(
                 format!(" pane {short8} "),
-                EMBER.title(EMBER.primary),
+                fire_motion::ember_title_style(anim_frame, seed, EMBER.text_dim, EMBER.secondary),
             ))
     } else {
         RatatuiBlock::default()
@@ -1420,11 +1467,14 @@ fn render_layout(
     boundaries: &mut Vec<SplitBoundary>,
     selection: Option<&Selection>,
     pending_resizes: &mut Vec<(PaneId, pyre_proto::PaneSize)>,
+    anim_frame: u64,
+    panes_meta: &[pyre_proto::PaneInfo],
 ) {
     match node {
         LayoutNode::Leaf(slot_idx) => {
             if let Some(slot) = slots[*slot_idx].as_mut() {
                 let focused = current_path == focus_path;
+                let attention = pane_needs_attention(panes_meta, slot.pane_id);
                 render_pane(
                     frame,
                     area,
@@ -1433,6 +1483,8 @@ fn render_layout(
                     selection,
                     *slot_idx,
                     pending_resizes,
+                    anim_frame,
+                    attention,
                 );
             }
         }
@@ -1468,6 +1520,8 @@ fn render_layout(
                     boundaries,
                     selection,
                     pending_resizes,
+                    anim_frame,
+                    panes_meta,
                 );
                 current_path.pop();
             }
@@ -1504,6 +1558,8 @@ fn render_layout(
                     boundaries,
                     selection,
                     pending_resizes,
+                    anim_frame,
+                    panes_meta,
                 );
                 current_path.pop();
             }
@@ -1529,7 +1585,7 @@ fn render_search_overlay(frame: &mut ratatui::Frame, app: &AppState) {
         .borders(Borders::ALL)
         .border_type(BorderType::Double)
         .border_style(EMBER.border_focus())
-        .title(Span::styled(" search ", EMBER.title(EMBER.primary)))
+        .title(Span::styled(" search (! = failures) ", EMBER.title(EMBER.primary)))
         .style(EMBER.overlay());
     let inner = outer.inner(overlay_rect);
     frame.render_widget(outer, overlay_rect);
@@ -1544,10 +1600,14 @@ fn render_search_overlay(frame: &mut ratatui::Frame, app: &AppState) {
     let results_area = split[1];
 
     // Input box — prompt prefix `> ` in primary, query in text, cursor █ in spark.
+    let cursor_f = app.anim.frame();
     let input_spans = vec![
         Span::styled("> ", Style::default().fg(EMBER.primary)),
         Span::styled(app.search.input.as_str(), Style::default().fg(EMBER.text)),
-        Span::styled("█", Style::default().fg(EMBER.spark)),
+        Span::styled(
+            "█",
+            fire_motion::ember_fg_style(cursor_f, 0x_a11ce, EMBER.spark, EMBER.secondary, 0.9),
+        ),
     ];
     let input_block = RatatuiBlock::default()
         .borders(Borders::ALL)
@@ -1577,8 +1637,11 @@ fn render_search_overlay(frame: &mut ratatui::Frame, app: &AppState) {
             let b = &hit.block;
             let pane_short: String = b.pane.0.to_string().chars().take(8).collect();
             let ts_short = b.started_at.format("%H:%M:%S").to_string();
-            // TODO: real stdout snippet once daemon returns it
-            let snippet: String = b.command.chars().take(80).collect();
+            let snippet: String = if hit.snippet.is_empty() {
+                b.command.chars().take(80).collect()
+            } else {
+                hit.snippet.chars().take(80).collect()
+            };
             ListItem::new(format!("[{pane_short}] {ts_short} {snippet}"))
                 .style(Style::default().fg(EMBER.text))
         })
@@ -1629,12 +1692,60 @@ fn state_dot_color(state: pyre_proto::PaneStateKind) -> Color {
     }
 }
 
+/// Agent-friendly label for sidebar (maps daemon state + seen flag).
+fn agent_ui_label(state: pyre_proto::PaneStateKind, seen: bool) -> &'static str {
+    use pyre_proto::PaneStateKind::*;
+    match (state, seen) {
+        (WaitingInput, _) => "blocked",
+        (Running, _) => "working",
+        (Interactive, _) => "interactive",
+        (Crashed, _) => "crashed",
+        (Done, false) => "done",
+        (Done, true) => "idle",
+        (Idle, _) => "idle",
+    }
+}
+
+/// Worst pane in a session (for session-strip rollup).
+fn session_worst_pane(
+    sidebar: &[pyre_proto::PaneInfo],
+    session_id: pyre_proto::SessionId,
+) -> Option<&pyre_proto::PaneInfo> {
+    use pyre_proto::PaneStateKind::*;
+    let rank = |s: pyre_proto::PaneStateKind| -> u8 {
+        match s {
+            Crashed => 0,
+            WaitingInput => 1,
+            Running => 2,
+            Interactive => 3,
+            Idle => 4,
+            Done => 5,
+        }
+    };
+    sidebar
+        .iter()
+        .filter(|p| p.session == session_id)
+        .min_by_key(|p| rank(p.state))
+}
+
+fn session_name_for(state: &AppState, session_id: pyre_proto::SessionId) -> String {
+    state
+        .sessions
+        .iter()
+        .find(|s| s.id == session_id)
+        .map(|s| s.name.clone())
+        .unwrap_or_else(|| {
+            let s = session_id.0.to_string();
+            s[..8.min(s.len())].to_string()
+        })
+}
+
 fn render_sidebar(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
     let block = RatatuiBlock::default()
         .borders(Borders::RIGHT)
         .border_type(BorderType::Rounded)
         .style(EMBER.bg_style())
-        .title(Span::styled(" panes ", EMBER.title(EMBER.primary)));
+        .title(Span::styled(" agents ", EMBER.title(EMBER.primary)));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1644,11 +1755,24 @@ fn render_sidebar(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
         .enumerate()
         .take(inner.height as usize)
         .map(|(i, info)| {
+            let sess = session_name_for(state, info.session);
             let dot = state_dot_char(info.state);
-            let dot_color = state_dot_color(info.state);
+            let anim_f = state.anim.frame();
+            let seed = info.id.0.as_u128() as u32;
+            let dot_color = if info.state == pyre_proto::PaneStateKind::WaitingInput && !info.seen {
+                let p = fire_motion::pulse_phase(anim_f, seed, 9.0);
+                fire_motion::lerp_rgb(
+                    fire_motion::rgb_tuple(state_dot_color(info.state)),
+                    fire_motion::rgb_tuple(EMBER.secondary),
+                    p * 0.55,
+                )
+            } else {
+                state_dot_color(info.state)
+            };
+            let label = agent_ui_label(info.state, info.seen);
+            let agent = info.agent.label();
             let id_str = info.id.0.to_string();
             let pane_short = &id_str[..8.min(id_str.len())];
-            let fg = info.foreground_cmd.as_deref().unwrap_or("-");
             let row_style = if i == state.sidebar_cursor && state.sidebar_focused {
                 Style::default()
                     .fg(EMBER.bg)
@@ -1656,13 +1780,18 @@ fn render_sidebar(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
                     .add_modifier(Modifier::BOLD)
             } else if i == state.sidebar_cursor {
                 Style::default().add_modifier(Modifier::REVERSED)
+            } else if info.state == pyre_proto::PaneStateKind::WaitingInput && !info.seen {
+                fire_motion::ember_fg_style(anim_f, seed, EMBER.spark, EMBER.text, 0.45)
             } else {
                 Style::default().fg(EMBER.text)
             };
             ListItem::new(Line::from(vec![
                 Span::styled("  ", row_style),
                 Span::styled(dot.to_string(), Style::default().fg(dot_color)),
-                Span::styled(format!(" {pane_short} {fg}"), row_style),
+                Span::styled(
+                    format!(" {sess} {label} {agent} {pane_short}"),
+                    row_style,
+                ),
             ]))
         })
         .collect();
@@ -1672,7 +1801,7 @@ fn render_sidebar(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
 }
 
 /// Render the name-prompt overlay and position the host cursor.
-fn render_name_prompt(frame: &mut ratatui::Frame, prompt: &NamePrompt) {
+fn render_name_prompt(frame: &mut ratatui::Frame, prompt: &NamePrompt, anim_frame: u64) {
     let area = frame.area();
     let w = (area.width as f32 * 0.60) as u16;
     let h: u16 = 5;
@@ -1713,7 +1842,10 @@ fn render_name_prompt(frame: &mut ratatui::Frame, prompt: &NamePrompt) {
     let input_spans = vec![
         Span::styled("> ", Style::default().fg(EMBER.primary)),
         Span::styled(prompt.input.as_str(), Style::default().fg(EMBER.text)),
-        Span::styled("█", Style::default().fg(EMBER.spark)),
+        Span::styled(
+            "█",
+            fire_motion::ember_fg_style(anim_frame, 0xc0ffee, EMBER.spark, EMBER.secondary, 0.9),
+        ),
     ];
     frame.render_widget(Paragraph::new(Line::from(input_spans)), input_area);
 
@@ -1763,10 +1895,26 @@ fn draw_frame(
             let mut x_cursor: u16 = sessions_area.x;
 
             for (i, sv) in state.sessions.iter().enumerate() {
-                let label = format!(" {} {} ", i + 1, sv.name);
+                let rollup = session_worst_pane(&state.sidebar_data, sv.id);
+                let rollup_tag = rollup
+                    .map(|p| format!(":{}", agent_ui_label(p.state, p.seen)))
+                    .unwrap_or_default();
+                let label = format!(" {} {}{} ", i + 1, sv.name, rollup_tag);
                 let len = label.chars().count() as u16;
+                let needs_attention = rollup
+                    .is_some_and(|p| p.state == pyre_proto::PaneStateKind::WaitingInput && !p.seen);
+                let anim_f = state.anim.frame();
                 let style = if i == state.active_session {
                     EMBER.tab_active()
+                } else if needs_attention {
+                    fire_motion::ember_fg_style(
+                        anim_f,
+                        sv.id.0.as_u128() as u32,
+                        EMBER.spark,
+                        EMBER.primary,
+                        1.0,
+                    )
+                    .bg(EMBER.bg)
                 } else {
                     EMBER.tab_inactive()
                 };
@@ -1884,10 +2032,14 @@ fn draw_frame(
         let root_ptr: *const LayoutNode =
             &state.sessions[state.active_session].tabs[active_tab_idx].root;
 
+        let anim_frame = state.anim.frame();
+        let panes_meta = state.sidebar_data.as_slice();
+
         if let Some(ref zoom_path) = zoomed {
             // Zoom mode: render only the zoomed leaf filling pane_body_area.
             if let Some(slot_idx) = slot_at(unsafe { &*root_ptr }, zoom_path) {
                 if let Some(slot) = state.slots[slot_idx].as_mut() {
+                    let attention = pane_needs_attention(panes_meta, slot.pane_id);
                     render_pane(
                         frame,
                         pane_body_area,
@@ -1896,6 +2048,8 @@ fn draw_frame(
                         state.selection.as_ref(),
                         slot_idx,
                         &mut state.pending_resizes,
+                        anim_frame,
+                        attention,
                     );
                 }
             }
@@ -1911,6 +2065,8 @@ fn draw_frame(
                 &mut new_boundaries,
                 state.selection.as_ref(),
                 &mut state.pending_resizes,
+                anim_frame,
+                panes_meta,
             );
         }
         state.sessions[state.active_session].tabs[active_tab_idx].boundaries = new_boundaries;
@@ -2005,7 +2161,7 @@ fn draw_frame(
         // Only one pane (the focused one, live view) owns the cursor.
         // Overlays or scrollback suppress it.
         if let Some(ref prompt) = state.prompt {
-            render_name_prompt(frame, prompt);
+            render_name_prompt(frame, prompt, state.anim.frame());
         } else if state.search.open {
             // Search overlay — drawn on top of everything else and owns cursor.
             render_search_overlay(frame, state);
@@ -2477,6 +2633,38 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
     }
 }
 
+/// Apply `pyrec select-pane` focus request if present (file is removed after read).
+fn apply_focus_request(state: &mut AppState) {
+    let path = focus_request_path(&state.socket);
+    let Ok(data) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let _ = std::fs::remove_file(&path);
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) else {
+        return;
+    };
+    let Some(pane_str) = v.get("pane_id").and_then(|x| x.as_str()) else {
+        return;
+    };
+    let Ok(pane_uuid) = uuid::Uuid::parse_str(pane_str) else {
+        return;
+    };
+    let pane_id = PaneId(pane_uuid);
+    if let Some(slot_idx) = state
+        .slots
+        .iter()
+        .position(|s| s.as_ref().is_some_and(|slot| slot.pane_id == pane_id))
+    {
+        focus_slot(state, slot_idx);
+        let short: String = pane_str.chars().take(8).collect();
+        state.status_msg = Some(format!("focused pane {short} (select-pane)"));
+    } else {
+        state.status_msg = Some(format!(
+            "select-pane: pane {pane_str} not open in this TUI — attach it first"
+        ));
+    }
+}
+
 /// Update active session's active tab focus_path to point at the given slot index.
 fn focus_slot(state: &mut AppState, target_slot_idx: usize) {
     // Collect candidate paths first to avoid simultaneous borrow of sessions + slots.
@@ -2776,6 +2964,7 @@ fn initial_app_state(
         // Force an immediate session-list sync on the first loop iteration.
         session_list_last_poll: Instant::now() - Duration::from_secs(10),
         blocks_rx,
+        anim: AnimClock::new(),
     }
 }
 
@@ -3053,11 +3242,17 @@ async fn run_tui(
             && state.search.pending_query.is_some()
             && state.search.last_query_at.elapsed() >= Duration::from_millis(150)
         {
-            let query = state.search.pending_query.take().expect("checked Some");
+            let raw = state.search.pending_query.take().expect("checked Some");
+            let (query, failures_only) = parse_search_input(&raw);
+            state.search.failures_only = failures_only;
             let (tx, rx) = mpsc::channel::<Vec<BlockHit>>(1);
             state.search.rx = Some(rx);
             let client = state.control.clone();
-            let req = SearchBlocksReq { query, limit: 20 };
+            let req = SearchBlocksReq {
+                query,
+                limit: 20,
+                failures_only,
+            };
             tokio::spawn(async move {
                 let hits = client
                     .search_blocks(tarpc::context::current(), req)
@@ -3077,6 +3272,8 @@ async fn run_tui(
             }
         }
 
+        apply_focus_request(&mut state);
+
         // Sidebar poll — 1s when open, up to 50 panes.
         if state.sidebar_open && state.sidebar_last_poll.elapsed() >= Duration::from_secs(1) {
             state.sidebar_last_poll = Instant::now();
@@ -3086,6 +3283,11 @@ async fn run_tui(
                 .await
             {
                 panes.truncate(50);
+                panes.sort_by(|a, b| {
+                    session_name_for(&state, a.session)
+                        .cmp(&session_name_for(&state, b.session))
+                        .then_with(|| a.id.0.cmp(&b.id.0))
+                });
                 state.sidebar_data = panes;
                 state.sidebar_cursor = state
                     .sidebar_cursor
@@ -3280,6 +3482,7 @@ async fn run_tui(
             break;
         }
 
+        state.anim.tick();
         // Draw — pass state as mut so render_pane can store last_screen_rect.
         draw_frame(&mut terminal, &mut state, prefix_active)?;
         loop_frames_drawn += 1;
@@ -3694,6 +3897,10 @@ async fn run_tui(
                                 if let Some(path) = found {
                                     tab.focus_path = path.clone();
                                     state.sidebar_focused = false;
+                                    let _ = state
+                                        .control
+                                        .mark_pane_seen(tarpc::context::current(), target)
+                                        .await;
                                 } else {
                                     state.status_msg =
                                         Some("open this pane first in a tab to focus".to_owned());

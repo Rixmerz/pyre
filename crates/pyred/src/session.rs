@@ -374,7 +374,7 @@ impl SessionRegistry {
 
 /// Build a `PaneInfo` from a live `PaneState`, reading the tracker under lock.
 fn pane_info_from_state(p: &Arc<PaneState>) -> PaneInfo {
-    let (state, reason, last_activity, foreground_cmd, root_pid) = {
+    let (state, reason, last_activity, foreground_cmd, root_pid, agent, seen) = {
         let t = p.state_tracker.lock().expect("tracker poisoned");
         let last_activity = chrono::Utc::now()
             - chrono::Duration::from_std(t.last_output_at.elapsed())
@@ -385,6 +385,8 @@ fn pane_info_from_state(p: &Arc<PaneState>) -> PaneInfo {
             last_activity,
             t.foreground_cmd.clone(),
             t.root_pid,
+            t.agent,
+            t.seen,
         )
     };
     PaneInfo {
@@ -400,5 +402,7 @@ fn pane_info_from_state(p: &Arc<PaneState>) -> PaneInfo {
         last_activity,
         foreground_cmd,
         root_pid,
+        agent,
+        seen,
     }
 }

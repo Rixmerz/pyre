@@ -130,6 +130,16 @@ pub trait PyreDaemon {
     async fn resize_pane(req: crate::ResizePaneReq) -> Result<crate::ResizePaneRes, PyreError>;
     /// Rename an existing session. Persists to SQLite immediately.
     async fn rename_session(session: SessionId, name: String) -> Result<(), PyreError>;
+    /// Block until `pane` reaches `state` or `timeout_ms` elapses. Returns `true` if reached.
+    async fn wait_pane_state(
+        pane: PaneId,
+        state: crate::PaneStateKind,
+        timeout_ms: u32,
+    ) -> Result<bool, PyreError>;
+    /// Mark a pane as seen (clears "done unseen" in agent UX).
+    async fn mark_pane_seen(pane: PaneId) -> Result<(), PyreError>;
+    /// Return the most recently finalized block for a pane, if any.
+    async fn last_block_for_pane(pane: PaneId) -> Result<Option<crate::Block>, PyreError>;
 }
 
 /// Process metadata returned by `inspect_pid`.

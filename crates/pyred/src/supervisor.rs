@@ -338,6 +338,15 @@ impl PaneMirrorRegistry {
     async fn remove(&self, pane_uuid: uuid::Uuid) {
         self.hubs.write().await.remove(&pane_uuid);
     }
+
+    /// Ring-buffer snapshot last received from the worker for this pane (hybrid reattach).
+    pub async fn last_snapshot_for(&self, pane_uuid: uuid::Uuid) -> bytes::Bytes {
+        if let Some(hub) = self.get(pane_uuid).await {
+            hub.last_snapshot.lock().await.clone()
+        } else {
+            bytes::Bytes::new()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -462,7 +471,6 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
         let shell = req.shell.clone().unwrap_or_default();
         let cwd = req
             .cwd
-            .as_ref()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
         let cols = req.cols;
@@ -547,24 +555,33 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
     ) -> Result<Vec<BlockHit>, PyreError> {
         let block_index = self.block_index.clone();
         let query = req.query.clone();
-        let limit = req.limit;
-        let ids = tokio::task::spawn_blocking(move || block_index.search(&query, limit))
+        let failures_only = req.failures_only;
+        let fetch_limit = if failures_only {
+            req.limit.saturating_mul(4).max(req.limit)
+        } else {
+            req.limit
+        };
+        let ids = tokio::task::spawn_blocking(move || block_index.search(&query, fetch_limit))
             .await
             .map_err(|e| PyreError::Io(e.to_string()))?
             .map_err(|e| PyreError::Io(e.to_string()))?;
 
-        let mut hits = Vec::with_capacity(ids.len());
+        let mut blocks = Vec::with_capacity(ids.len());
         for id in ids {
             match self.store.get_block(id).await {
-                Ok(Some(block)) => hits.push(BlockHit {
-                    block,
-                    snippet: String::new(),
-                }),
+                Ok(Some(block)) => blocks.push(block),
                 Ok(None) => {}
                 Err(e) => tracing::warn!("get_block {id:?}: {e:#}"),
             }
         }
-        Ok(hits)
+        blocks.truncate(req.limit as usize);
+        let store = self.store.clone();
+        let hits = tokio::task::spawn_blocking(move || {
+            crate::search_filter::hits_with_snippets(&store, blocks, 160)
+        })
+        .await
+        .map_err(|e| PyreError::Io(e.to_string()))?;
+        Ok(crate::search_filter::filter_hits(hits, failures_only))
     }
 
     async fn list_sessions(self, _ctx: context::Context) -> Result<Vec<SessionInfo>, PyreError> {
@@ -606,27 +623,22 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
             .await
             .map_err(|e| PyreError::Io(e.to_string()))?
             .map_err(|e| PyreError::Io(e.to_string()))?;
-        let now = Utc::now();
         let mut panes = Vec::with_capacity(slots.len());
         for slot_idx in slots {
             let Some(pane_uuid) = self.registry.get_or_alloc_pane_by_slot(&id, slot_idx).await
             else {
                 continue;
             };
-            panes.push(PaneInfo {
-                id: PaneId(pane_uuid),
-                session,
-                cols: 80,
-                rows: 24,
-                shell: String::new(),
-                created_at: now,
-                closed_at: None,
-                state: pyre_proto::PaneStateKind::Running,
-                state_reason: format!("slot {slot_idx}"),
-                last_activity: now,
-                foreground_cmd: None,
-                root_pid: 0,
-            });
+            let mut info = match client
+                .get_pane_info(context::current(), slot_idx)
+                .await
+            {
+                Ok(Ok(pi)) => pi,
+                _ => continue,
+            };
+            info.id = PaneId(pane_uuid);
+            info.session = session;
+            panes.push(info);
         }
         Ok(panes)
     }
@@ -646,7 +658,6 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
         let shell = req.shell.unwrap_or_default();
         let cwd = req
             .cwd
-            .as_ref()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
         let cols = req.cols;
@@ -683,16 +694,16 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
         pane: PaneId,
         recent_blocks: u32,
     ) -> Result<ReplayBlocks, PyreError> {
-        // Read recent blocks from the supervisor store (same path written by
-        // the block_event batcher). Snapshot bytes are deferred to S3.
+        // Recent blocks from the supervisor store; grid snapshot from mirror hub.
         let blocks = self
             .store
             .list_blocks_for_pane(pane, recent_blocks)
             .await
             .map_err(|e| PyreError::Io(e.to_string()))?;
+        let snapshot = self.mirror_registry.last_snapshot_for(pane.0).await;
         Ok(ReplayBlocks {
             recent: blocks,
-            snapshot: bytes::Bytes::new(),
+            snapshot,
         })
     }
 
@@ -751,18 +762,30 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
     async fn set_pane_state(
         self,
         _ctx: context::Context,
-        _pane: PaneId,
-        _state: PaneStateKind,
-        _reason: String,
+        pane: PaneId,
+        state: PaneStateKind,
+        reason: String,
     ) -> Result<(), PyreError> {
-        // State override is a heuristic engine concern; deferred to S3.
-        Ok(())
+        let (session_id_str, slot_idx) = self
+            .registry
+            .lookup_pane(pane.0)
+            .await
+            .ok_or(PyreError::NoSuchPane(pane))?;
+        let client = self
+            .registry
+            .get_ctrl_client(&session_id_str)
+            .await
+            .ok_or(PyreError::NoSuchPane(pane))?;
+        client
+            .set_pane_state(context::current(), slot_idx, state, reason)
+            .await
+            .map_err(|e| PyreError::Io(e.to_string()))?
+            .map_err(|e| PyreError::Io(e.to_string()))
     }
 
     async fn list_all_panes(self, _ctx: context::Context) -> Result<Vec<PaneInfo>, PyreError> {
         let handles = self.registry.inner.read().await;
         let mut all = Vec::new();
-        let now = Utc::now();
         for (session_id_str, handle) in handles.iter() {
             let sid = match uuid::Uuid::parse_str(session_id_str) {
                 Ok(u) => SessionId(u),
@@ -780,23 +803,79 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
                 else {
                     continue;
                 };
-                all.push(PaneInfo {
-                    id: PaneId(pane_uuid),
-                    session: sid,
-                    cols: 80,
-                    rows: 24,
-                    shell: String::new(),
-                    created_at: now,
-                    closed_at: None,
-                    state: pyre_proto::PaneStateKind::Running,
-                    state_reason: format!("slot {slot_idx}"),
-                    last_activity: now,
-                    foreground_cmd: None,
-                    root_pid: 0,
-                });
+                let mut info = match handle
+                    .ctrl_client
+                    .get_pane_info(context::current(), slot_idx)
+                    .await
+                {
+                    Ok(Ok(pi)) => pi,
+                    _ => continue,
+                };
+                info.id = PaneId(pane_uuid);
+                info.session = sid;
+                all.push(info);
             }
         }
         Ok(all)
+    }
+
+    async fn wait_pane_state(
+        self,
+        ctx: context::Context,
+        pane: PaneId,
+        state: PaneStateKind,
+        timeout_ms: u32,
+    ) -> Result<bool, PyreError> {
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms.max(1) as u64);
+        let this = self.clone();
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
+            let panes = this.clone().list_all_panes(ctx).await?;
+            if let Some(p) = panes.iter().find(|p| p.id == pane) {
+                if p.state == state {
+                    return Ok(true);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    }
+
+    async fn mark_pane_seen(
+        self,
+        _ctx: context::Context,
+        pane: PaneId,
+    ) -> Result<(), PyreError> {
+        let (session_id_str, slot_idx) = self
+            .registry
+            .lookup_pane(pane.0)
+            .await
+            .ok_or(PyreError::NoSuchPane(pane))?;
+        let client = self
+            .registry
+            .get_ctrl_client(&session_id_str)
+            .await
+            .ok_or(PyreError::NoSuchPane(pane))?;
+        client
+            .mark_pane_seen(context::current(), slot_idx)
+            .await
+            .map_err(|e| PyreError::Io(e.to_string()))?
+            .map_err(|e| PyreError::Io(e.to_string()))
+    }
+
+    async fn last_block_for_pane(
+        self,
+        _ctx: context::Context,
+        pane: PaneId,
+    ) -> Result<Option<pyre_proto::Block>, PyreError> {
+        let blocks = self
+            .store
+            .list_blocks_for_pane(pane, 1)
+            .await
+            .map_err(|e| PyreError::Io(e.to_string()))?;
+        Ok(blocks.into_iter().next())
     }
 
     async fn send_keys(
@@ -1739,7 +1818,7 @@ async fn handle_public_conn(
     _store: Arc<Store>,
     _block_index: Arc<BlockIndex>,
 ) -> Result<()> {
-    use pyre_proto::{MODE_CONTROL, MODE_STREAM};
+    use pyre_proto::{read_control_version_after_tag, MODE_CONTROL, MODE_STREAM, PROTO_VERSION};
 
     let mut sock = sock;
     let mut tag = [0u8; 1];
@@ -1747,6 +1826,9 @@ async fn handle_public_conn(
 
     match tag[0] {
         MODE_CONTROL => {
+            read_control_version_after_tag(&mut sock)
+                .await
+                .with_context(|| format!("control handshake (proto_version={PROTO_VERSION})"))?;
             let transport = tarpc::serde_transport::new(
                 Framed::new(sock, LengthDelimitedCodec::new()),
                 Bincode::default(),

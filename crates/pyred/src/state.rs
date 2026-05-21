@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::watch;
 
-use pyre_proto::PaneStateKind;
+use pyre_proto::{AgentKind, PaneStateKind};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // OSC 133 marker enum
@@ -73,6 +73,8 @@ pub struct PaneStateTracker {
     /// Wall-clock instant the last D marker was received.
     pub last_d_at: Option<Instant>,
     pub foreground_cmd: Option<String>,
+    pub agent: AgentKind,
+    pub seen: bool,
     pub root_pid: u32,
     /// Override: if `Some`, ignore heuristic until this instant.
     pub override_until: Option<Instant>,
@@ -92,6 +94,8 @@ impl PaneStateTracker {
             last_marker: None,
             last_d_at: None,
             foreground_cmd: None,
+            agent: AgentKind::Unknown,
+            seen: true,
             root_pid,
             override_until: None,
             overridden_state: None,
@@ -199,10 +203,21 @@ impl PaneStateTracker {
         if self.state == new_state {
             return false;
         }
+        if new_state == PaneStateKind::Done {
+            self.seen = false;
+        }
         self.state = new_state;
         self.reason = new_reason;
         let _ = self.watch_tx.send_replace(new_state);
         true
+    }
+
+    pub fn subscribe(&self) -> watch::Receiver<PaneStateKind> {
+        self.watch_tx.subscribe()
+    }
+
+    pub fn mark_seen(&mut self) {
+        self.seen = true;
     }
 }
 
@@ -266,9 +281,23 @@ fn read_comm(pid: u32) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
-/// On non-Linux, /proc/comm is unavailable. Return None so callers fall
-/// back to heuristics that don't depend on process name.
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn read_comm(pid: u32) -> Option<String> {
+    use std::process::Command;
+    let out = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+        .ok()?;
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// Non-Linux, non-macOS: no portable comm reader.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn read_comm(_pid: u32) -> Option<String> {
     None
 }
@@ -293,6 +322,9 @@ pub fn spawn_state_engine(
                 let (changed, new_state, reason) = {
                     let mut t = tracker_arc.lock().expect("tracker poisoned");
                     t.foreground_cmd = foreground_of(t.root_pid);
+                    if let Some(ref cmd) = t.foreground_cmd {
+                        t.agent = crate::agent_detect::classify_foreground(cmd);
+                    }
                     let changed = t.evaluate();
                     (changed, t.state, t.reason.clone())
                 };
@@ -342,6 +374,23 @@ mod tests {
         t.foreground_cmd = Some("nvim".to_string());
         t.evaluate();
         assert_eq!(t.state, PaneStateKind::Interactive);
+    }
+
+    #[test]
+    fn watch_notifies_on_state_change() {
+        let mut t = make_tracker();
+        let mut rx = t.subscribe();
+        t.set_override(PaneStateKind::WaitingInput, "test".into(), 60);
+        assert!(t.evaluate());
+        assert_eq!(*rx.borrow_and_update(), PaneStateKind::WaitingInput);
+    }
+
+    #[test]
+    fn done_clears_seen_flag() {
+        let mut t = make_tracker();
+        t.seen = true;
+        t.apply(PaneStateKind::Done, "exit".into());
+        assert!(!t.seen);
     }
 
     #[test]

@@ -16,6 +16,7 @@ Daemon-owned terminal multiplexer with block-level history, full-text search, an
 - **Agent state monitoring** — a dedicated state tracker classifies each pane as idle, running, waiting for input, or error; exposed via the MCP server.
 - **MCP server (`pyre-mcp`)** — seven tools: `session_spawn`, `session_close`, `pane_open`, `pane_send_keys`, `pane_capture`, `pane_set_state`, `block_search`. Sessions, panes, and blocks are also exposed as MCP resources.
 - **Mouse-first TUI (Ember theme)** — ratatui + crossterm, Ember palette (amber on near-black), mouse click-to-focus, scroll wheel.
+- **Pyre fire motion** — startup splash and in-TUI accents use a shared procedural fire engine (`fire_motion.rs`): no animation libraries, no sprite packs. Blocked agents pulse like embers on the same palette as the launch animation.
 - **tmux-compatible CLI** — `pyrec` accepts `list-sessions`, `new-session`, `kill-session`, `send-keys`, `split-window`, and more.
 - **Clipboard integration** — `pyrec capture-pane --copy` copies output to the system clipboard via `wl-copy` (Wayland) or `xclip` (X11).
 - **Searchable scrollback** — ring buffer per pane with configurable depth; `PgUp`/`PgDn` in `pyre` or `capture-pane -S` in `pyrec`.
@@ -25,10 +26,10 @@ Daemon-owned terminal multiplexer with block-level history, full-text search, an
 ### 1. Build
 
 ```sh
-git clone https://github.com/<TODO>/pyre.git
+git clone https://github.com/Rixmerz/pyre.git
 cd pyre
 cargo build --release
-# binaries: target/release/{pyred,pyrec,pyre,pyre-mcp}
+# binaries: target/release/{pyred,pyrec,pyre,pyre-gpu,pyre-mcp}
 ```
 
 For a size- and performance-optimised binary use the `release-prod` profile:
@@ -61,6 +62,29 @@ pyrec              # spawn + attach default shell
 pyrec sessions     # list active sessions
 pyrec list         # list recent blocks
 ```
+
+### Multi-agent quickstart (hybrid)
+
+With `process_model = "hybrid"` in config (see [docs/CONFIG.md](docs/CONFIG.md)):
+
+```sh
+pyrec session-new --name api --cwd ~/projects/api -d
+pyrec session-new --name web --cwd ~/projects/web -d
+pyre   # sidebar shows per-pane blocked/working + session rollup
+```
+
+From scripts or an MCP client: `pyrec wait-pane --pane <id> --state waiting`,
+`pyrec pane read --pane <id> --source block-last`. Playbook:
+[docs/AGENTS.md](docs/AGENTS.md).
+
+### GPU viewer (S6 Phase 1)
+
+```sh
+pyre-gpu   # windowed attach; Ctrl+/ search; Ctrl+Tab switch panes
+pyrec doctor
+```
+
+See [docs/adr/0003-render-backend.md](docs/adr/0003-render-backend.md).
 
 ## Key bindings (pyre)
 

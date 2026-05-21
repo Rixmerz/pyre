@@ -9,10 +9,9 @@ use std::time::Duration;
 
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
-use pyre_proto::{PyreDaemonClient, SpawnReq, SpawnResp, MODE_CONTROL};
+use pyre_proto::{PyreDaemonClient, SpawnReq, SpawnResp, write_control_client};
 use tarpc::client;
 use tarpc::tokio_serde::formats::Bincode;
-use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio_util::codec::LengthDelimitedCodec;
 
@@ -132,7 +131,7 @@ async fn run_send_keys() -> anyhow::Result<()> {
 
 async fn connect_control(sock_path: &std::path::Path) -> anyhow::Result<PyreDaemonClient> {
     let mut sock = UnixStream::connect(sock_path).await?;
-    sock.write_all(&[MODE_CONTROL]).await?;
+    write_control_client(&mut sock).await?;
     let transport = tarpc::serde_transport::new(
         tokio_util::codec::Framed::new(sock, LengthDelimitedCodec::new()),
         Bincode::default(),

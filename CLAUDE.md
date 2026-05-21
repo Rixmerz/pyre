@@ -11,18 +11,17 @@ the hybrid daemon (ADR-002 Accepted, 2026-05-19): supervisor on
 `pyre.sock` + per-session workers on `pyre/session-<id>.sock`,
 selectable via `pyred.process_model = "single" | "hybrid"`.
 
-Current work front:
+**S5 — Agent multiplexer** has landed (detection, `wait_pane_state`, pyrec/MCP
+orchestration, sidebar rollup, [docs/AGENTS.md](docs/AGENTS.md)).
 
-- Drive the TUI dogfood loop on hybrid: multi-pane within a session,
-  multi-session switching, scrollback + block ribbon polish.
-- Harden reattach: grid snapshot + last-N block replay over the
-  proxied stream-mode (`0x02`) path.
-- Multi-client mirror mode with serialized input through the
-  supervisor → worker proxy.
-- S4 (TUI dogfood / MVP criterion) follows once S3 stabilises.
+**S5.1 — Agent ops hardened** landed (`proto_version`, hybrid replay snapshot,
+`pyrec doctor`, search failures filter, integration scripts).
 
-Hybrid is opt-in; `"single"` remains the default for v0.1.0. AI/MCP
-work is still blocked until S5.
+**S6.1** landed: `pyre-gpu` glyph atlas, Ctrl+Tab multi-pane, Ctrl+/ block search;
+`pyrec select-pane` writes `focus.request` for the TUI.
+
+Hybrid is opt-in; `"single"` remains the default for v0.1.0. Dogfood hybrid on
+Linux with `process_model = "hybrid"` when validating S5 criteria.
 
 ## Files to read first
 
@@ -30,11 +29,11 @@ work is still blocked until S5.
    Block model, security stance.
 2. [ARCHITECTURE.md](ARCHITECTURE.md) — crate map, process diagram,
    Block lifecycle, decision points.
-3. [ROADMAP.md](ROADMAP.md) — sprint table, MVP criterion, risks,
-   catalog-overlap verification.
-4. [docs/adr/ADR-001-ipc.md](docs/adr/ADR-001-ipc.md) — the
+3. [ROADMAP.md](ROADMAP.md) — sprint table, MVP criterion, risks.
+4. [docs/AGENTS.md](docs/AGENTS.md) — agent multiplexer playbook.
+5. [docs/adr/ADR-001-ipc.md](docs/adr/ADR-001-ipc.md) — the
    `tonic` vs `tarpc` decision record.
-5. [docs/adr/0002-daemon-process-architecture.md](docs/adr/0002-daemon-process-architecture.md) —
+6. [docs/adr/0002-daemon-process-architecture.md](docs/adr/0002-daemon-process-architecture.md) —
    single vs hybrid daemon (Accepted 2026-05-19, hybrid implemented
    behind `pyred.process_model = "hybrid"`).
 
@@ -55,10 +54,9 @@ work is still blocked until S5.
   Do not invest in cross-platform polish before S6.
 - **No telemetry, no Electron, no cloud default.** These are
   identity-level constraints, not preferences.
-- **No framework coinage.** `pyre` is a product. Before introducing a
-  new abstraction with a name, check against `jig`, `schedule-mcp`,
-  MEMI, `commit-guardian`, `delta-cube` (see ROADMAP catalog-overlap
-  table) and prefer fusion to a new name.
+- **No framework coinage.** `pyre` is a standalone product. Prefer
+  extending existing pyre surfaces (blocks, MCP, hooks) over new
+  named abstractions.
 
 ## Expected blockers
 
@@ -71,9 +69,8 @@ work is still blocked until S5.
 - **ANSI parser scope guard** — if you find yourself touching
   `alacritty_terminal` internals or reading the VT100 spec, stop.
   Wrap, don't fork. Open an issue instead of patching.
-- **AI / MCP temptation** — explicitly blocked until S5. Do not merge
-  any `mcp::` module into `main` before S4 ships. The MVP is the
-  terminal, not the agent integration.
+- **Scope guard** — S5 agent work stays on detection, orchestration,
+  and MCP; no remote thin client, no GPU renderer, no nested tab model.
 
 ## Workflow
 

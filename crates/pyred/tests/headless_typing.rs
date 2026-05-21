@@ -16,7 +16,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
-use pyre_proto::{OutputFrame, PyreDaemonClient, SpawnReq, SpawnResp, MODE_CONTROL, MODE_STREAM};
+use pyre_proto::{OutputFrame, PyreDaemonClient, SpawnReq, SpawnResp, write_control_client, MODE_STREAM};
 use tarpc::client;
 use tarpc::tokio_serde::formats::Bincode;
 use tokio::io::AsyncWriteExt;
@@ -225,13 +225,11 @@ async fn run_headless_typing() -> anyhow::Result<()> {
     // or PTY echo).
     if !raw_found && !screen_found {
         // Print whatever capture_pane returns for additional evidence.
-        if let Ok(cap) = ctrl.capture_pane(tarpc::context::current(), pane, 50).await {
-            if let Ok(bytes) = cap {
-                eprintln!(
-                    "\n--- capture_pane output ---\n{}",
-                    String::from_utf8_lossy(&bytes)
-                );
-            }
+        if let Ok(Ok(bytes)) = ctrl.capture_pane(tarpc::context::current(), pane, 50).await {
+            eprintln!(
+                "\n--- capture_pane output ---\n{}",
+                String::from_utf8_lossy(&bytes)
+            );
         }
         panic!(
             "'fastfetch' not found in raw bytes ({raw_found}) \
@@ -273,7 +271,7 @@ async fn run_headless_typing() -> anyhow::Result<()> {
 
 async fn connect_control(sock_path: &std::path::Path) -> anyhow::Result<PyreDaemonClient> {
     let mut sock = UnixStream::connect(sock_path).await?;
-    sock.write_all(&[MODE_CONTROL]).await?;
+    write_control_client(&mut sock).await?;
     let transport = tarpc::serde_transport::new(
         tokio_util::codec::Framed::new(sock, LengthDelimitedCodec::new()),
         Bincode::default(),

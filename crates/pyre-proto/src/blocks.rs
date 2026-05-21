@@ -39,6 +39,9 @@ pub struct ListBlocksReq {
 pub struct SearchBlocksReq {
     pub query: String,
     pub limit: u32,
+    /// When true, only blocks with a non-zero exit code are returned.
+    #[serde(default)]
+    pub failures_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -18,7 +18,7 @@
 //! `kill-session`    → close_session RPC
 //! `send-keys`       → write bytes to pane via stream connection
 //! `split-window`    → open_pane (layout managed by TUI)
-//! `select-pane`     → stub (TUI-only)
+//! `select-pane`     → write focus.request for running `pyre` TUI
 //! `display-message` → print to stderr
 
 use std::path::{Path, PathBuf};
@@ -28,8 +28,9 @@ use bytes::Bytes;
 use clap::Parser;
 use futures::{SinkExt, StreamExt};
 use pyre_proto::{
-    BlockHit, InputFrame, ListBlocksReq, OpenPaneReq, OutputFrame, PaneId, PaneStateKind,
-    PyreDaemonClient, SearchBlocksReq, SessionId, SpawnReq, SpawnResp, MODE_CONTROL, MODE_STREAM,
+    focus_request_path, BlockHit, InputFrame, ListBlocksReq, OpenPaneReq, OutputFrame, PaneId,
+    PaneStateKind, PyreDaemonClient, SearchBlocksReq, SessionId, SpawnReq, SpawnResp,
+    write_control_client, PROTO_VERSION, MODE_STREAM,
 };
 use tarpc::client;
 use tarpc::tokio_serde::formats::Bincode;
@@ -99,12 +100,18 @@ enum Sub {
         limit: u32,
     },
 
-    /// Linear-scan search across stdout blobs
+    /// Full-text search across indexed block stdout (Tantivy)
     Search {
         query: String,
         #[arg(long, default_value_t = 20)]
         limit: u32,
+        /// Only blocks with non-zero exit code
+        #[arg(long)]
+        failures: bool,
     },
+
+    /// Check daemon socket, RPC handshake, and data paths
+    Doctor,
 
     /// Capture the last N lines of a pane's ring buffer (CSI stripped)
     CapturePane {
@@ -198,7 +205,7 @@ enum Sub {
         vertical: bool,
     },
 
-    /// [tmux compat] Select (focus) a pane — stub; focus is TUI-managed
+    /// [tmux compat] Request pane focus in a running `pyre` TUI
     #[command(name = "select-pane")]
     SelectPane {
         /// Target pane id or ≥8-char prefix (-t <pane>)
@@ -211,6 +218,83 @@ enum Sub {
     DisplayMessage {
         /// Message to print
         message: String,
+    },
+
+    /// Wait until a pane reaches a lifecycle state
+    #[command(name = "wait-pane")]
+    WaitPane {
+        /// Pane id or ≥8-char prefix
+        #[arg(long)]
+        pane: String,
+        /// Target state: running, waiting, idle, interactive, crashed, done
+        #[arg(long, default_value = "waiting")]
+        state: String,
+        /// Timeout in seconds (default 30)
+        #[arg(long, default_value_t = 30)]
+        timeout: u32,
+    },
+
+    /// Pane operations (read output, etc.)
+    Pane {
+        #[command(subcommand)]
+        cmd: PaneCmd,
+    },
+
+    /// Run a command in a session (send keys + Enter)
+    #[command(name = "pane-run")]
+    PaneRun {
+        /// Session id or ≥8-char prefix
+        #[arg(long)]
+        session: String,
+        /// Command and arguments
+        #[arg(trailing_var_arg = true)]
+        command: Vec<String>,
+    },
+
+    /// Create a named session (spawn + print ids)
+    #[command(name = "session-new")]
+    SessionNew {
+        /// Human-readable session name
+        #[arg(long)]
+        name: String,
+        /// Working directory for the pane
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// Detach after spawn (do not attach)
+        #[arg(short = 'd', long)]
+        detach: bool,
+    },
+
+    /// Print integration hook instructions for an agent CLI
+    #[command(name = "integration")]
+    Integration {
+        #[command(subcommand)]
+        cmd: IntegrationCmd,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum PaneCmd {
+    /// Read output (default: ring buffer)
+    Read {
+        /// Pane id or ≥8-char prefix
+        pane: String,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(short = 'N', long, default_value_t = 50)]
+        lines: u32,
+        /// Source: ring (scrollback) or block-last (last finalized block stdout)
+        #[arg(long, default_value = "ring")]
+        source: String,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum IntegrationCmd {
+    /// Show how to hook an agent CLI into pyre state reporting
+    Install {
+        /// Agent id: claude, codex, pi, opencode, cursor
+        agent: String,
     },
 }
 
@@ -243,7 +327,7 @@ async fn control_client(socket: &Path) -> Result<PyreDaemonClient> {
     let mut sock = UnixStream::connect(socket)
         .await
         .with_context(|| format!("connect {}", socket.display()))?;
-    sock.write_all(&[MODE_CONTROL]).await?;
+    write_control_client(&mut sock).await?;
 
     let transport = tarpc::serde_transport::new(
         tokio_util::codec::Framed::new(sock, LengthDelimitedCodec::new()),
@@ -303,6 +387,39 @@ async fn resolve_pane(
 }
 
 /// Pick the first pane in a session.
+fn parse_pane_state(s: &str) -> Result<PaneStateKind> {
+    match s.to_lowercase().as_str() {
+        "running" | "working" => Ok(PaneStateKind::Running),
+        "waiting" | "waitinginput" | "blocked" => Ok(PaneStateKind::WaitingInput),
+        "idle" => Ok(PaneStateKind::Idle),
+        "interactive" => Ok(PaneStateKind::Interactive),
+        "crashed" => Ok(PaneStateKind::Crashed),
+        "done" => Ok(PaneStateKind::Done),
+        other => Err(anyhow!(
+            "unknown state '{other}'; use running, waiting, idle, interactive, crashed, or done"
+        )),
+    }
+}
+
+async fn resolve_pane_global(client: &PyreDaemonClient, prefix: &str) -> Result<PaneId> {
+    let panes = client
+        .list_all_panes(tarpc::context::current())
+        .await
+        .context("rpc transport")?
+        .map_err(|e| anyhow!("daemon list_all_panes: {e}"))?;
+    let matches: Vec<_> = panes
+        .iter()
+        .filter(|p| p.id.0.to_string().starts_with(prefix))
+        .collect();
+    match matches.len() {
+        0 => Err(anyhow!("no pane matches prefix '{prefix}'")),
+        1 => Ok(matches[0].id),
+        n => Err(anyhow!(
+            "{n} panes match prefix '{prefix}'; provide a longer prefix"
+        )),
+    }
+}
+
 async fn first_pane(client: &PyreDaemonClient, session: SessionId) -> Result<PaneId> {
     let panes = client
         .list_panes(tarpc::context::current(), session)
@@ -576,10 +693,17 @@ async fn run_list(socket: PathBuf, limit: u32) -> Result<()> {
     Ok(())
 }
 
-async fn run_search(socket: PathBuf, query: String, limit: u32) -> Result<()> {
+async fn run_search(socket: PathBuf, query: String, limit: u32, failures: bool) -> Result<()> {
     let client = control_client(&socket).await?;
     let hits: Vec<BlockHit> = client
-        .search_blocks(tarpc::context::current(), SearchBlocksReq { query, limit })
+        .search_blocks(
+            tarpc::context::current(),
+            SearchBlocksReq {
+                query,
+                limit,
+                failures_only: failures,
+            },
+        )
         .await
         .context("rpc transport")?
         .map_err(|e| anyhow!("daemon search_blocks: {e}"))?;
@@ -795,6 +919,245 @@ async fn run_send_keys(
         .map_err(|e| anyhow!("daemon send_keys: {e}"))
 }
 
+async fn run_wait_pane(socket: PathBuf, pane_prefix: String, state: String, timeout: u32) -> Result<()> {
+    let client = control_client(&socket).await?;
+    let pane = resolve_pane_global(&client, &pane_prefix).await?;
+    let kind = parse_pane_state(&state)?;
+    let reached = client
+        .wait_pane_state(
+            tarpc::context::current(),
+            pane,
+            kind,
+            timeout.saturating_mul(1000),
+        )
+        .await
+        .context("rpc transport")?
+        .map_err(|e| anyhow!("daemon wait_pane_state: {e}"))?;
+    if reached {
+        println!("reached {kind}");
+        Ok(())
+    } else {
+        Err(anyhow!("timeout after {timeout}s waiting for {kind}"))
+    }
+}
+
+async fn run_pane_read(
+    socket: PathBuf,
+    pane_prefix: String,
+    session: Option<String>,
+    lines: u32,
+    source: &str,
+) -> Result<()> {
+    let client = control_client(&socket).await?;
+    let pane = if let Some(sess) = session {
+        resolve_pane(&client, resolve_session(&client, &sess).await?, &pane_prefix).await?
+    } else {
+        resolve_pane_global(&client, &pane_prefix).await?
+    };
+
+    match source {
+        "ring" => {
+            let bytes = client
+                .capture_pane(tarpc::context::current(), pane, lines)
+                .await
+                .context("rpc transport")?
+                .map_err(|e| anyhow!("daemon capture_pane: {e}"))?;
+            print!("{}", String::from_utf8_lossy(&bytes));
+        }
+        "block-last" => {
+            let block = client
+                .last_block_for_pane(tarpc::context::current(), pane)
+                .await
+                .context("rpc transport")?
+                .map_err(|e| anyhow!("daemon last_block_for_pane: {e}"))?;
+            let Some(block) = block else {
+                eprintln!("no blocks for pane");
+                return Ok(());
+            };
+            let stdout = client
+                .get_block_stdout(tarpc::context::current(), block.id)
+                .await
+                .context("rpc transport")?
+                .map_err(|e| anyhow!("daemon get_block_stdout: {e}"))?;
+            print!("{}", String::from_utf8_lossy(&stdout));
+        }
+        other => return Err(anyhow!("unknown source '{other}'; use ring or block-last")),
+    }
+    Ok(())
+}
+
+async fn run_pane_run(socket: PathBuf, session_prefix: String, command: Vec<String>) -> Result<()> {
+    if command.is_empty() {
+        return Err(anyhow!("pane-run requires a command"));
+    }
+    let client = control_client(&socket).await?;
+    let session = resolve_session(&client, &session_prefix).await?;
+    let pane = first_pane(&client, session).await?;
+    let mut text = command.join(" ");
+    text.push('\r');
+    client
+        .send_keys(tarpc::context::current(), pane, text.into_bytes())
+        .await
+        .context("rpc transport")?
+        .map_err(|e| anyhow!("daemon send_keys: {e}"))?;
+    println!("sent to pane {}", pane.0);
+    Ok(())
+}
+
+async fn run_session_new(
+    socket: PathBuf,
+    name: String,
+    cwd: Option<PathBuf>,
+    shell: Option<String>,
+    detach: bool,
+) -> Result<()> {
+    let client = control_client(&socket).await?;
+    let (cols, rows) = term_size();
+    let req = SpawnReq {
+        shell: shell.or_else(|| std::env::var("SHELL").ok()),
+        cwd,
+        cols,
+        rows,
+        env: std::env::vars().collect(),
+        name: Some(name),
+    };
+    let SpawnResp { session, pane } = client
+        .spawn(tarpc::context::current(), req)
+        .await
+        .context("rpc transport")?
+        .map_err(|e| anyhow!("daemon spawn: {e}"))?;
+    println!("session={} pane={}", session.0, pane.0);
+    if !detach {
+        run_attach(&socket, session, pane).await?;
+    }
+    Ok(())
+}
+
+fn integration_config_dir() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("pyre")
+        .join("integrations")
+}
+
+fn run_integration_install(agent: &str) -> Result<()> {
+    let dir = integration_config_dir();
+    std::fs::create_dir_all(&dir)?;
+    let script_path = dir.join("pyre-notify.sh");
+    if !script_path.exists() {
+        let script = r#"#!/usr/bin/env sh
+# Notify pyred that an agent pane needs attention (or resumed).
+# Usage: pyre-notify.sh <state> <pane-prefix>
+#   state: waiting | running | done | idle
+#   pane-prefix: first 8+ chars of pane uuid (pyrec status --json)
+set -eu
+STATE="${1:-waiting}"
+PANE="${2:-}"
+if [ -z "$PANE" ]; then
+  echo "usage: pyre-notify.sh <state> <pane-prefix>" >&2
+  exit 2
+fi
+SOCKET="${PYRE_SOCKET:-}"
+if [ -z "$SOCKET" ]; then
+  UID="$(id -u)"
+  SOCKET="/tmp/pyre-${UID}.sock"
+fi
+export PYRE_SOCKET="$SOCKET"
+exec pyrec wait-pane --socket "$SOCKET" --pane "$PANE" --state "$STATE" --timeout "${PYRE_WAIT_TIMEOUT:-120}"
+"#;
+        std::fs::write(&script_path, script)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))?;
+        }
+        println!("wrote {}", script_path.display());
+    }
+
+    let path = dir.join(format!("{agent}.md"));
+    let body = format!(
+        r#"# pyre integration: {agent}
+
+## Quick hook
+
+After starting a pane, copy its id prefix from `pyrec status --json`, then:
+
+```bash
+export PYRE_SOCKET="${{PYRE_SOCKET:-/tmp/pyre-$(id -u).sock}}"
+~/.config/pyre/integrations/pyre-notify.sh waiting <pane-prefix>
+```
+
+When the agent finishes or needs no more input:
+
+```bash
+~/.config/pyre/integrations/pyre-notify.sh running <pane-prefix>
+```
+
+## {agent}-specific
+
+- Map your tool's "needs approval" / "blocked" event → `waiting`
+- Map "running" / "tool use" → `running`
+- Optional: call `pyrec doctor` to verify socket + RPC (`proto_version={PROTO_VERSION}`)
+
+See `docs/AGENTS.md` and `docs/agent-skill.md` in the pyre repository.
+"#
+    );
+    std::fs::write(&path, body)?;
+    println!("wrote {}", path.display());
+    Ok(())
+}
+
+async fn run_doctor(socket: PathBuf) -> Result<()> {
+    let mut failed = false;
+    let mut mark_fail = |msg: &str| {
+        eprintln!("FAIL: {msg}");
+        failed = true;
+    };
+    let mark_ok = |msg: &str| {
+        eprintln!("OK: {msg}");
+    };
+
+    if socket.exists() {
+        mark_ok(&format!("socket exists ({})", socket.display()));
+    } else {
+        mark_fail(&format!("socket missing ({})", socket.display()));
+    }
+
+    match control_client(&socket).await {
+        Ok(client) => {
+            mark_ok(&format!("RPC handshake (proto_version={PROTO_VERSION})"));
+            match client
+                .list_sessions(tarpc::context::current())
+                .await
+            {
+                Ok(Ok(sessions)) => mark_ok(&format!("list_sessions → {} session(s)", sessions.len())),
+                Ok(Err(e)) => mark_fail(&format!("list_sessions daemon error: {e}")),
+                Err(e) => mark_fail(&format!("list_sessions transport: {e}")),
+            }
+        }
+        Err(e) => mark_fail(&format!("connect/handshake: {e:#}")),
+    }
+
+    let data_dir = std::env::var("PYRE_DATA_DIR")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| dirs::data_dir().map(|d| d.join("pyre")));
+    if let Some(dir) = data_dir {
+        if dir.join("state.db").exists() {
+            mark_ok(&format!("state.db at {}", dir.display()));
+        } else {
+            mark_fail(&format!("state.db missing under {}", dir.display()));
+        }
+    } else {
+        mark_fail("could not resolve data directory (set PYRE_DATA_DIR)");
+    }
+
+    if failed {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 async fn run_split_window(socket: PathBuf, session_prefix: String) -> Result<()> {
     let client = control_client(&socket).await?;
     let session = resolve_session(&client, &session_prefix).await?;
@@ -813,6 +1176,37 @@ async fn run_split_window(socket: PathBuf, session_prefix: String) -> Result<()>
         .context("rpc transport")?
         .map_err(|e| anyhow!("daemon open_pane: {e}"))?;
     println!("{}", pane_id.0);
+    Ok(())
+}
+
+async fn run_select_pane(sock_path: PathBuf, target: String) -> Result<()> {
+    let client = control_client(&sock_path).await?;
+    let pane = resolve_pane_global(&client, &target).await?;
+    let panes = client
+        .list_all_panes(tarpc::context::current())
+        .await
+        .context("rpc transport")?
+        .map_err(|e| anyhow!("daemon list_all_panes: {e}"))?;
+    let session = panes
+        .iter()
+        .find(|p| p.id == pane)
+        .map(|p| p.session)
+        .ok_or_else(|| anyhow!("pane {pane:?} not found in session list"))?;
+
+    let path = focus_request_path(&sock_path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let body = serde_json::json!({
+        "session_id": session.0.to_string(),
+        "pane_id": pane.0.to_string(),
+    });
+    std::fs::write(&path, serde_json::to_string(&body)?)?;
+    println!(
+        "focus requested for pane {} (session {}); open `pyre` to apply",
+        &pane.0.to_string()[..8],
+        &session.0.to_string()[..8]
+    );
     Ok(())
 }
 
@@ -847,7 +1241,12 @@ async fn main() -> Result<()> {
         }) => run_new_pane(sock_path, session, shell, cols, rows).await,
         Some(Sub::Status { waiting, json }) => run_status(sock_path, waiting, json).await,
         Some(Sub::List { limit }) => run_list(sock_path, limit).await,
-        Some(Sub::Search { query, limit }) => run_search(sock_path, query, limit).await,
+        Some(Sub::Search {
+            query,
+            limit,
+            failures,
+        }) => run_search(sock_path, query, limit, failures).await,
+        Some(Sub::Doctor) => run_doctor(sock_path).await,
         Some(Sub::CapturePane {
             pane,
             session,
@@ -894,13 +1293,32 @@ async fn main() -> Result<()> {
             enter,
         }) => run_send_keys(sock_path, target, keys, enter).await,
         Some(Sub::SplitWindow { target, .. }) => run_split_window(sock_path, target).await,
-        Some(Sub::SelectPane { target }) => {
-            eprintln!("select-pane: pane focus is TUI-managed; target={target}");
-            Ok(())
-        }
+        Some(Sub::SelectPane { target }) => run_select_pane(sock_path, target).await,
         Some(Sub::DisplayMessage { message }) => {
             eprintln!("{message}");
             Ok(())
         }
+        Some(Sub::WaitPane {
+            pane,
+            state,
+            timeout,
+        }) => run_wait_pane(sock_path, pane, state, timeout).await,
+        Some(Sub::Pane { cmd }) => match cmd {
+            PaneCmd::Read {
+                pane,
+                session,
+                lines,
+                source,
+            } => run_pane_read(sock_path, pane, session, lines, &source).await,
+        },
+        Some(Sub::PaneRun { session, command }) => {
+            run_pane_run(sock_path, session, command).await
+        }
+        Some(Sub::SessionNew { name, cwd, detach }) => {
+            run_session_new(sock_path, name, cwd, cli.shell, detach).await
+        }
+        Some(Sub::Integration { cmd }) => match cmd {
+            IntegrationCmd::Install { agent } => run_integration_install(&agent),
+        },
     }
 }

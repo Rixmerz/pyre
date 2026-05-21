@@ -23,6 +23,7 @@
 //! `--mode supervisor` (default): run as supervisor (or single, depending on
 //! config). `--mode worker`: run as a worker process (spawned by supervisor).
 
+mod agent_detect;
 mod config;
 mod hooks;
 mod index;
@@ -31,6 +32,7 @@ mod migration;
 mod parser;
 mod pty;
 mod ringbuf;
+mod search_filter;
 mod server;
 mod session;
 mod state;
@@ -47,7 +49,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use futures::StreamExt;
 use pyre_proto::service::PyreDaemon as _;
-use pyre_proto::{MODE_CONTROL, MODE_STREAM};
+use pyre_proto::{read_control_version_after_tag, MODE_CONTROL, MODE_STREAM, PROTO_VERSION};
 use tarpc::server::{BaseChannel, Channel};
 use tarpc::tokio_serde::formats::Bincode;
 use tokio::io::AsyncReadExt;
@@ -115,6 +117,9 @@ async fn handle_conn(
 
     match tag[0] {
         MODE_CONTROL => {
+            read_control_version_after_tag(&mut sock)
+                .await
+                .with_context(|| format!("control handshake (proto_version={PROTO_VERSION})"))?;
             let daemon = DaemonImpl {
                 registry: registry.clone(),
                 store: store.clone(),

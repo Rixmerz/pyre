@@ -8,6 +8,37 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Block, PaneId, SessionId};
 
+/// Detected coding-agent or shell kind for a pane (heuristic).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum AgentKind {
+    #[default]
+    Unknown,
+    Shell,
+    ClaudeCode,
+    Codex,
+    Pi,
+    OpenCode,
+    CursorAgent,
+    Droid,
+    Amp,
+}
+
+impl AgentKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Shell => "shell",
+            Self::ClaudeCode => "claude",
+            Self::Codex => "codex",
+            Self::Pi => "pi",
+            Self::OpenCode => "opencode",
+            Self::CursorAgent => "cursor",
+            Self::Droid => "droid",
+            Self::Amp => "amp",
+        }
+    }
+}
+
 /// Coarse lifecycle state of a pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum PaneStateKind {
@@ -67,6 +98,16 @@ pub struct PaneInfo {
     pub foreground_cmd: Option<String>,
     /// Root PID of the PTY child process.
     pub root_pid: u32,
+    /// Heuristic agent classification from foreground process.
+    #[serde(default)]
+    pub agent: AgentKind,
+    /// User has focused this pane since it entered `Done` (agent UX).
+    #[serde(default = "default_seen")]
+    pub seen: bool,
+}
+
+fn default_seen() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

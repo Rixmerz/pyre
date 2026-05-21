@@ -10,9 +10,8 @@ use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
-use pyre_proto::{
-    InputFrame, OpenPaneReq, OutputFrame, PyreDaemonClient, SpawnReq, SpawnResp, MODE_CONTROL,
-    MODE_STREAM,
+use pyre_proto::{write_control_client, 
+    InputFrame, OpenPaneReq, OutputFrame, PyreDaemonClient, SpawnReq, SpawnResp, MODE_STREAM,
 };
 use tarpc::client;
 use tarpc::tokio_serde::formats::Bincode;
@@ -78,7 +77,7 @@ async fn spawn_pyred() -> anyhow::Result<(PyredHandle, PyreDaemonClient)> {
 
 async fn connect_control(sock_path: &std::path::Path) -> anyhow::Result<PyreDaemonClient> {
     let mut ctrl_sock = UnixStream::connect(sock_path).await?;
-    ctrl_sock.write_all(&[MODE_CONTROL]).await?;
+    write_control_client(&mut ctrl_sock).await?;
     let transport = tarpc::serde_transport::new(
         tokio_util::codec::Framed::new(ctrl_sock, LengthDelimitedCodec::new()),
         Bincode::default(),
