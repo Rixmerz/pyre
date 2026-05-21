@@ -5,23 +5,12 @@ on `pyre`. Read it first, then follow the links below.
 
 ## Next step
 
-S1 (daemon + PTY) and S2 (Blocks + persistence) have landed. The
-active surface is **S3 — multi-pane + reattach**, now unblocked by
-the hybrid daemon (ADR-002 Accepted, 2026-05-19): supervisor on
-`pyre.sock` + per-session workers on `pyre/session-<id>.sock`,
-selectable via `pyred.process_model = "single" | "hybrid"`.
+**v0.1.0 surface complete** as of branch `feat/s5-s6-gpu-search-agent-ops`
+(commits 6e207b2..3ae7301). All of S1..S7 landed: hybrid daemon, multi-pane,
+reattach, mirror, blocks+Tantivy v2 facet, agent multiplexer, GPU tiling, push
+events, libproc, smoke walkthrough.
 
-**S5 — Agent multiplexer** has landed (detection, `wait_pane_state`, pyrec/MCP
-orchestration, sidebar rollup, [docs/AGENTS.md](docs/AGENTS.md)).
-
-**S5.1 — Agent ops hardened** landed (`proto_version`, hybrid replay snapshot,
-`pyrec doctor`, search failures filter, integration scripts).
-
-**S6.1** landed: `pyre-gpu` glyph atlas, Ctrl+Tab multi-pane, Ctrl+/ block search;
-`pyrec select-pane` writes `focus.request` for the TUI.
-
-Hybrid is opt-in; `"single"` remains the default for v0.1.0. Dogfood hybrid on
-Linux with `process_model = "hybrid"` when validating S5 criteria.
+Next: cut v0.1.0 release tag after merge to main.
 
 ## Files to read first
 
@@ -29,13 +18,13 @@ Linux with `process_model = "hybrid"` when validating S5 criteria.
    Block model, security stance.
 2. [ARCHITECTURE.md](ARCHITECTURE.md) — crate map, process diagram,
    Block lifecycle, decision points.
-3. [ROADMAP.md](ROADMAP.md) — sprint table, MVP criterion, risks.
+3. [ROADMAP.md](ROADMAP.md) — sprint table, v0.1.0 banner, risks (all closed).
 4. [docs/AGENTS.md](docs/AGENTS.md) — agent multiplexer playbook.
-5. [docs/adr/ADR-001-ipc.md](docs/adr/ADR-001-ipc.md) — the
-   `tonic` vs `tarpc` decision record.
+5. [docs/adr/ADR-001-ipc.md](docs/adr/ADR-001-ipc.md) — IPC decision record.
 6. [docs/adr/0002-daemon-process-architecture.md](docs/adr/0002-daemon-process-architecture.md) —
-   single vs hybrid daemon (Accepted 2026-05-19, hybrid implemented
-   behind `pyred.process_model = "hybrid"`).
+   single vs hybrid daemon (Accepted 2026-05-19).
+7. [docs/adr/ADR-003.md](docs/adr/ADR-003.md) — GPU renderer binary-swap
+   contract (`pyre-gpu` / `pyre-tui` parity surface).
 
 ## Project rules
 

@@ -1,5 +1,27 @@
 # pyre — Roadmap
 
+## v0.1.0 ready
+
+All sprints S1..S7 have landed. Branch `feat/s5-s6-gpu-search-agent-ops`
+carries the final commits; merge to `main` is the only remaining step before
+tagging v0.1.0.
+
+| Sprint | Status | Commit(s) |
+|--------|--------|-----------|
+| S1 — Daemon + PTY | ✅ done | landed pre-branch |
+| S2 — Blocks + persistence | ✅ done | landed pre-branch |
+| S3 — Multi-pane + reattach | ✅ done | landed pre-branch |
+| S4 — TUI dogfood (MVP) | ✅ done | `3ae7301` (pager, search jump-to-pane, smoke walkthrough; S5.1 absorbed architectural acceptance) |
+| S5 — Agent multiplexer | ✅ done | `6e207b2` |
+| S5.1 — Agent ops hardened | ✅ done | `6e207b2` + follow-ups |
+| S6.1 — pyre-gpu viewer | ✅ done | `6e207b2` |
+| S6.2 — GPU tiling | ✅ done | `53354b4` |
+| S7 — Risk closure | ✅ done | `7a5f683` Tantivy facet + v2, `914e6d4` libproc, `5036d1d` push events, `7f85a5a` hybrid StateChanged |
+
+Next action: cut v0.1.0 release tag after merge to main.
+
+---
+
 ## Sprints
 
 | Sprint | Goal | Key deliverables |
@@ -10,8 +32,9 @@
 | **S3** | Multi-pane + reattach | Multiple panes per session, multiple sessions, full reattach with grid snapshot + last N blocks replay, multi-client mirror mode with serialized input. Hybrid supervisor + per-session workers landed (ADR-002 Accepted, 2026-05-19) — unblocks per-session isolation and clean reattach across daemon restarts; remaining S3 work tracks the multi-client + replay surface. |
 | **S4** | TUI dogfood (**MVP**) | `pyre-tui` (ratatui) replaces tmux+alacritty in daily use: tabs, splits, block ribbon, scrollback navigation, Tantivy-backed search UI. **MVP criterion met.** |
 | **S5** | **Agent multiplexer** | Hybrid profile docs; `AgentKind` detection; sidebar rollup + seen/done UX; `wait_pane_state` RPC; `pyrec` orchestration (`wait-pane`, `pane read`, `pane run`); MCP `wait_pane_state` + `pane://` / `block://` resources; `docs/AGENTS.md` playbook; doc hygiene (pyre as standalone product). |
-| **S6** | GPU render | **S6.1 landed:** `pyre-gpu` glyph atlas, Ctrl+Tab multi-pane, **Ctrl+/ block search** (`!` = failures), ADR-003. **Later:** layout parity with TUI, optional `wgpu`. |
+| **S6** | GPU render | **S6.1 landed:** `pyre-gpu` glyph atlas, Ctrl+Tab multi-pane, **Ctrl+/ block search** (`!` = failures), ADR-003. **S6.2 landed:** real multi-pane tiling with Ctrl+w keybindings. |
 | **S5.1** | Agent ops hardened | `proto_version` handshake; hybrid replay snapshot; macOS `ps` agent detect + `osascript` notify; `pyrec doctor`; search `failures_only` / TUI `!` prefix; `integration install` scripts; `pyrec select-pane` + TUI focus file. |
+| **S7** | Risk closure | Tantivy native exit_code facet + schema v2 migration; libproc on macOS (replaces `ps` shell-out); broadcast `next_pane_event` push RPC (replaces 1 s polling); hybrid `StateChanged` emitted through supervisor. |
 
 ## MVP criterion
 
@@ -33,14 +56,18 @@ End of **S5**, on Linux with `process_model = "hybrid"`:
 
 ## Risks
 
-| Risk | Mitigation |
-|------|------------|
-| ANSI parser is a time sink. | Reuse `alacritty_terminal`. Do NOT reimplement. Wrap, don't fork. |
-| IPC schema churn S0–S2. | `proto_version: u32` on every message from day one; integration test that rejects mismatched versions. |
-| Scope creep — agent integrations. | S5 limits install hooks to a small set of binaries; everything else uses heuristic `AgentKind` detection. |
-| `portable-pty` quirks on Linux distros. | Linux-first; Windows code paths `#[cfg]`-gated and untested until post-S6. |
-| SQLite write contention with high-frequency Block events. | WAL mode; batch BlockEvent writes per pane on a 50 ms tick. |
-| GPU renderer rewrite temptation. | ADR-003 forces a binary swap, not a rewrite. `pyre-gpu` consumes the same `pyre-proto` streams as `pyre-tui`. |
+| Risk | Status | Mitigation / Resolution |
+|------|--------|-------------------------|
+| ANSI parser is a time sink. | ✅ closed | Reuse `alacritty_terminal`. Do NOT reimplement. Wrap, don't fork. |
+| IPC schema churn S0–S2. | ✅ closed | `proto_version: u32` on every message from day one; integration test that rejects mismatched versions. |
+| Scope creep — agent integrations. | ✅ closed | S5 limits install hooks to a small set of binaries; everything else uses heuristic `AgentKind` detection. |
+| `portable-pty` quirks on Linux distros. | ✅ closed | Linux-first; Windows code paths `#[cfg]`-gated and untested until post-S6. |
+| SQLite write contention with high-frequency Block events. | ✅ closed | WAL mode; batch BlockEvent writes per pane on a 50 ms tick. |
+| GPU renderer rewrite temptation. | ✅ closed | ADR-003 forces a binary swap, not a rewrite. `pyre-gpu` consumes the same `pyre-proto` streams as `pyre-tui`. |
+| Tantivy facet + schema v2 migration. | ✅ closed | `7a5f683` — native exit_code facet, v2 index with migration path. |
+| macOS `ps` shell-out latency. | ✅ closed | `914e6d4` — libproc on macOS replaces subprocess. |
+| Pane state polling (1 s tick). | ✅ closed | `5036d1d` — broadcast `next_pane_event` push RPC. |
+| Hybrid supervisor StateChanged not propagated. | ✅ closed | `7f85a5a` — StateChanged emitted through supervisor. |
 
 ## pyre capabilities (product surface)
 
@@ -55,3 +82,4 @@ these surfaces before adding new named subsystems:
 | Agent orchestration | `wait_pane_state`, `pyrec wait-pane`, MCP tools |
 | External automation | Any MCP client via `pyre-mcp` |
 | User hooks | `hooks.toml` / Lua (`on_block_end`, `on_pane_state`) |
+| GPU render | `pyre-gpu` — multi-pane tiling, glyph atlas, wgpu (ADR-003) |
