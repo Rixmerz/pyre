@@ -140,6 +140,10 @@ pub trait PyreDaemon {
     async fn mark_pane_seen(pane: PaneId) -> Result<(), PyreError>;
     /// Return the most recently finalized block for a pane, if any.
     async fn last_block_for_pane(pane: PaneId) -> Result<Option<crate::Block>, PyreError>;
+    /// Enqueue a focus request for a pane (replaces the focus.request dropfile).
+    async fn request_focus(pane_id: String) -> Result<bool, PyreError>;
+    /// Dequeue the oldest pending focus request, if any (polled by the TUI each tick).
+    async fn take_focus_request() -> Result<Option<String>, PyreError>;
 }
 
 /// Process metadata returned by `inspect_pid`.

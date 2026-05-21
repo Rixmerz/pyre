@@ -10,7 +10,7 @@ pub use blocks::{BlockEvent, BlockHit, ListBlocksReq, SearchBlocksReq};
 pub use handshake::{
     read_control_server, read_control_version_after_tag, write_control_client, PROTO_VERSION,
 };
-pub use paths::{focus_request_path, runtime_pyre_dir};
+pub use paths::runtime_pyre_dir;
 pub use service::{
     AttachAck, InputFrame, OutputFrame, PidInspect, PyreDaemon, PyreDaemonClient, PyreError,
     SpawnReq, MODE_CONTROL, MODE_STREAM,

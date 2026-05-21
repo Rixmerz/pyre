@@ -28,9 +28,9 @@ use bytes::Bytes;
 use clap::Parser;
 use futures::{SinkExt, StreamExt};
 use pyre_proto::{
-    focus_request_path, BlockHit, InputFrame, ListBlocksReq, OpenPaneReq, OutputFrame, PaneId,
-    PaneStateKind, PyreDaemonClient, SearchBlocksReq, SessionId, SpawnReq, SpawnResp,
-    write_control_client, PROTO_VERSION, MODE_STREAM,
+    write_control_client, BlockHit, InputFrame, ListBlocksReq, OpenPaneReq, OutputFrame, PaneId,
+    PaneStateKind, PyreDaemonClient, SearchBlocksReq, SessionId, SpawnReq, SpawnResp, MODE_STREAM,
+    PROTO_VERSION,
 };
 use tarpc::client;
 use tarpc::tokio_serde::formats::Bincode;
@@ -919,7 +919,12 @@ async fn run_send_keys(
         .map_err(|e| anyhow!("daemon send_keys: {e}"))
 }
 
-async fn run_wait_pane(socket: PathBuf, pane_prefix: String, state: String, timeout: u32) -> Result<()> {
+async fn run_wait_pane(
+    socket: PathBuf,
+    pane_prefix: String,
+    state: String,
+    timeout: u32,
+) -> Result<()> {
     let client = control_client(&socket).await?;
     let pane = resolve_pane_global(&client, &pane_prefix).await?;
     let kind = parse_pane_state(&state)?;
@@ -950,7 +955,12 @@ async fn run_pane_read(
 ) -> Result<()> {
     let client = control_client(&socket).await?;
     let pane = if let Some(sess) = session {
-        resolve_pane(&client, resolve_session(&client, &sess).await?, &pane_prefix).await?
+        resolve_pane(
+            &client,
+            resolve_session(&client, &sess).await?,
+            &pane_prefix,
+        )
+        .await?
     } else {
         resolve_pane_global(&client, &pane_prefix).await?
     };
@@ -1126,11 +1136,10 @@ async fn run_doctor(socket: PathBuf) -> Result<()> {
     match control_client(&socket).await {
         Ok(client) => {
             mark_ok(&format!("RPC handshake (proto_version={PROTO_VERSION})"));
-            match client
-                .list_sessions(tarpc::context::current())
-                .await
-            {
-                Ok(Ok(sessions)) => mark_ok(&format!("list_sessions → {} session(s)", sessions.len())),
+            match client.list_sessions(tarpc::context::current()).await {
+                Ok(Ok(sessions)) => {
+                    mark_ok(&format!("list_sessions → {} session(s)", sessions.len()))
+                }
                 Ok(Err(e)) => mark_fail(&format!("list_sessions daemon error: {e}")),
                 Err(e) => mark_fail(&format!("list_sessions transport: {e}")),
             }
@@ -1182,30 +1191,14 @@ async fn run_split_window(socket: PathBuf, session_prefix: String) -> Result<()>
 async fn run_select_pane(sock_path: PathBuf, target: String) -> Result<()> {
     let client = control_client(&sock_path).await?;
     let pane = resolve_pane_global(&client, &target).await?;
-    let panes = client
-        .list_all_panes(tarpc::context::current())
+    client
+        .request_focus(tarpc::context::current(), pane.0.to_string())
         .await
         .context("rpc transport")?
-        .map_err(|e| anyhow!("daemon list_all_panes: {e}"))?;
-    let session = panes
-        .iter()
-        .find(|p| p.id == pane)
-        .map(|p| p.session)
-        .ok_or_else(|| anyhow!("pane {pane:?} not found in session list"))?;
-
-    let path = focus_request_path(&sock_path);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let body = serde_json::json!({
-        "session_id": session.0.to_string(),
-        "pane_id": pane.0.to_string(),
-    });
-    std::fs::write(&path, serde_json::to_string(&body)?)?;
+        .map_err(|e| anyhow!("daemon request_focus: {e}"))?;
     println!(
-        "focus requested for pane {} (session {}); open `pyre` to apply",
+        "focus requested for pane {}; open `pyre` to apply",
         &pane.0.to_string()[..8],
-        &session.0.to_string()[..8]
     );
     Ok(())
 }
@@ -1311,9 +1304,7 @@ async fn main() -> Result<()> {
                 source,
             } => run_pane_read(sock_path, pane, session, lines, &source).await,
         },
-        Some(Sub::PaneRun { session, command }) => {
-            run_pane_run(sock_path, session, command).await
-        }
+        Some(Sub::PaneRun { session, command }) => run_pane_run(sock_path, session, command).await,
         Some(Sub::SessionNew { name, cwd, detach }) => {
             run_session_new(sock_path, name, cwd, cli.shell, detach).await
         }

@@ -41,9 +41,10 @@ mod stream;
 mod supervisor;
 mod worker;
 
+use std::collections::VecDeque;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
@@ -110,6 +111,7 @@ async fn handle_conn(
     registry: Arc<SessionRegistry>,
     store: Arc<Store>,
     block_index: Arc<BlockIndex>,
+    focus_queue: Arc<Mutex<VecDeque<String>>>,
 ) -> Result<()> {
     let mut sock = sock;
     let mut tag = [0u8; 1];
@@ -124,6 +126,7 @@ async fn handle_conn(
                 registry: registry.clone(),
                 store: store.clone(),
                 block_index: block_index.clone(),
+                focus_queue: focus_queue.clone(),
             };
             let transport = tarpc::serde_transport::new(
                 Framed::new(sock, LengthDelimitedCodec::new()),
@@ -155,6 +158,7 @@ async fn run_single(path: PathBuf) -> Result<()> {
     );
 
     let registry = Arc::new(SessionRegistry::new());
+    let focus_queue: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
 
     let hooks = Arc::new(HooksConfig::load());
     let _state_engine = spawn_state_engine(registry.clone(), hooks.clone());
@@ -191,8 +195,9 @@ async fn run_single(path: PathBuf) -> Result<()> {
                     let reg = registry.clone();
                     let st = store.clone();
                     let bi = block_index.clone();
+                    let fq = focus_queue.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_conn(sock, reg, st, bi).await {
+                        if let Err(e) = handle_conn(sock, reg, st, bi, fq).await {
                             tracing::warn!("connection error: {e:#}");
                         }
                     });

@@ -41,8 +41,8 @@ use futures::SinkExt;
 use futures::StreamExt;
 use pyre_proto::{
     blocks::{BlockHit, SearchBlocksReq},
-    focus_request_path, Block, InputFrame, OpenPaneReq, OutputFrame, PaneId, PidInspect,
-    PyreDaemonClient, SessionId, SpawnReq, SpawnResp, write_control_client, MODE_STREAM,
+    write_control_client, Block, InputFrame, OpenPaneReq, OutputFrame, PaneId, PidInspect,
+    PyreDaemonClient, SessionId, SpawnReq, SpawnResp, MODE_STREAM,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -57,11 +57,11 @@ mod clipboard;
 mod fire_motion;
 mod splash;
 mod theme;
+use fire_motion::AnimClock;
 use std::collections::HashMap;
 use std::process::Stdio;
 use tarpc::client;
 use tarpc::tokio_serde::formats::Bincode;
-use fire_motion::AnimClock;
 use theme::EMBER;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
@@ -1099,9 +1099,8 @@ async fn attach_pane(
 
 #[allow(clippy::too_many_arguments)]
 fn pane_needs_attention(meta: &[pyre_proto::PaneInfo], pane_id: PaneId) -> bool {
-    meta.iter().any(|p| {
-        p.id == pane_id && p.state == pyre_proto::PaneStateKind::WaitingInput && !p.seen
-    })
+    meta.iter()
+        .any(|p| p.id == pane_id && p.state == pyre_proto::PaneStateKind::WaitingInput && !p.seen)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1585,7 +1584,10 @@ fn render_search_overlay(frame: &mut ratatui::Frame, app: &AppState) {
         .borders(Borders::ALL)
         .border_type(BorderType::Double)
         .border_style(EMBER.border_focus())
-        .title(Span::styled(" search (! = failures) ", EMBER.title(EMBER.primary)))
+        .title(Span::styled(
+            " search (! = failures) ",
+            EMBER.title(EMBER.primary),
+        ))
         .style(EMBER.overlay());
     let inner = outer.inner(overlay_rect);
     frame.render_widget(outer, overlay_rect);
@@ -1788,10 +1790,7 @@ fn render_sidebar(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
             ListItem::new(Line::from(vec![
                 Span::styled("  ", row_style),
                 Span::styled(dot.to_string(), Style::default().fg(dot_color)),
-                Span::styled(
-                    format!(" {sess} {label} {agent} {pane_short}"),
-                    row_style,
-                ),
+                Span::styled(format!(" {sess} {label} {agent} {pane_short}"), row_style),
             ]))
         })
         .collect();
@@ -2633,20 +2632,19 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
     }
 }
 
-/// Apply `pyrec select-pane` focus request if present (file is removed after read).
-fn apply_focus_request(state: &mut AppState) {
-    let path = focus_request_path(&state.socket);
-    let Ok(data) = std::fs::read_to_string(&path) else {
+/// Poll the daemon for a pending `pyrec select-pane` focus request and apply it.
+///
+/// Replaces the former dropfile (`focus.request`) approach with an RPC call so
+/// that concurrent `pyrec select-pane` invocations are handled atomically.
+async fn apply_focus_request(state: &mut AppState) {
+    let Ok(Ok(Some(pane_str))) = state
+        .control
+        .take_focus_request(tarpc::context::current())
+        .await
+    else {
         return;
     };
-    let _ = std::fs::remove_file(&path);
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) else {
-        return;
-    };
-    let Some(pane_str) = v.get("pane_id").and_then(|x| x.as_str()) else {
-        return;
-    };
-    let Ok(pane_uuid) = uuid::Uuid::parse_str(pane_str) else {
+    let Ok(pane_uuid) = uuid::Uuid::parse_str(&pane_str) else {
         return;
     };
     let pane_id = PaneId(pane_uuid);
@@ -3272,7 +3270,7 @@ async fn run_tui(
             }
         }
 
-        apply_focus_request(&mut state);
+        apply_focus_request(&mut state).await;
 
         // Sidebar poll — 1s when open, up to 50 panes.
         if state.sidebar_open && state.sidebar_last_poll.elapsed() >= Duration::from_secs(1) {

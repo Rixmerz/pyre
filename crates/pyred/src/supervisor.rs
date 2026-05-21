@@ -374,6 +374,8 @@ pub struct SupervisorImpl {
     pub pending_registrations: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
     /// Per-pane broadcast hubs: one worker connection shared by N TUI clients.
     pub mirror_registry: PaneMirrorRegistry,
+    /// Pending focus requests enqueued by `request_focus`, dequeued by `take_focus_request`.
+    pub focus_queue: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
 }
 
 impl SupervisorImpl {
@@ -629,10 +631,7 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
             else {
                 continue;
             };
-            let mut info = match client
-                .get_pane_info(context::current(), slot_idx)
-                .await
-            {
+            let mut info = match client.get_pane_info(context::current(), slot_idx).await {
                 Ok(Ok(pi)) => pi,
                 _ => continue,
             };
@@ -826,8 +825,8 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
         state: PaneStateKind,
         timeout_ms: u32,
     ) -> Result<bool, PyreError> {
-        let deadline =
-            tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms.max(1) as u64);
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_millis(timeout_ms.max(1) as u64);
         let this = self.clone();
         loop {
             if tokio::time::Instant::now() >= deadline {
@@ -843,11 +842,7 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
         }
     }
 
-    async fn mark_pane_seen(
-        self,
-        _ctx: context::Context,
-        pane: PaneId,
-    ) -> Result<(), PyreError> {
+    async fn mark_pane_seen(self, _ctx: context::Context, pane: PaneId) -> Result<(), PyreError> {
         let (session_id_str, slot_idx) = self
             .registry
             .lookup_pane(pane.0)
@@ -958,6 +953,26 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
             .map_err(|e| PyreError::Io(e.to_string()))?
             .map_err(|e| PyreError::Io(e.to_string()))?;
         Ok(ResizePaneRes { ok: true })
+    }
+
+    async fn request_focus(
+        self,
+        _ctx: context::Context,
+        pane_id: String,
+    ) -> Result<bool, PyreError> {
+        self.focus_queue
+            .lock()
+            .map_err(|_| PyreError::Io("focus_queue lock poisoned".into()))?
+            .push_back(pane_id);
+        Ok(true)
+    }
+
+    async fn take_focus_request(self, _ctx: context::Context) -> Result<Option<String>, PyreError> {
+        Ok(self
+            .focus_queue
+            .lock()
+            .map_err(|_| PyreError::Io("focus_queue lock poisoned".into()))?
+            .pop_front())
     }
 }
 
@@ -1410,6 +1425,9 @@ pub async fn run(
     let pending_registrations: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
+    let focus_queue: Arc<std::sync::Mutex<std::collections::VecDeque<String>>> =
+        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+
     let supervisor_impl = SupervisorImpl {
         registry: registry.clone(),
         store: store.clone(),
@@ -1418,6 +1436,7 @@ pub async fn run(
         supervisor_sock: supervisor_sock.clone(),
         pending_registrations: pending_registrations.clone(),
         mirror_registry: mirror_registry.clone(),
+        focus_queue: focus_queue.clone(),
     };
 
     // Bind the supervisor callback socket (workers dial here to register).

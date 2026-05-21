@@ -1,6 +1,7 @@
 //! tarpc `PyreDaemon` service implementation.
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
 use pyre_proto::{
     AttachAck, Block, BlockHit, BlockId, ListBlocksReq, OpenPaneReq, PaneId, PaneInfo,
@@ -17,6 +18,9 @@ pub struct DaemonImpl {
     pub registry: Arc<SessionRegistry>,
     pub store: Arc<crate::store::Store>,
     pub block_index: Arc<BlockIndex>,
+    /// Pending focus requests enqueued by `request_focus` and dequeued by `take_focus_request`.
+    /// Shared across all control connections so pyrec and the TUI see the same queue.
+    pub focus_queue: Arc<Mutex<VecDeque<String>>>,
 }
 
 impl pyre_proto::service::PyreDaemon for DaemonImpl {
@@ -403,11 +407,7 @@ impl pyre_proto::service::PyreDaemon for DaemonImpl {
         }
     }
 
-    async fn mark_pane_seen(
-        self,
-        _ctx: context::Context,
-        pane: PaneId,
-    ) -> Result<(), PyreError> {
+    async fn mark_pane_seen(self, _ctx: context::Context, pane: PaneId) -> Result<(), PyreError> {
         let (_session, pane_state) = self
             .registry
             .get_pane(pane)
@@ -432,5 +432,25 @@ impl pyre_proto::service::PyreDaemon for DaemonImpl {
             .await
             .map_err(|e| PyreError::Io(e.to_string()))?;
         Ok(blocks.into_iter().next())
+    }
+
+    async fn request_focus(
+        self,
+        _ctx: context::Context,
+        pane_id: String,
+    ) -> Result<bool, PyreError> {
+        self.focus_queue
+            .lock()
+            .map_err(|_| PyreError::Io("focus_queue lock poisoned".into()))?
+            .push_back(pane_id);
+        Ok(true)
+    }
+
+    async fn take_focus_request(self, _ctx: context::Context) -> Result<Option<String>, PyreError> {
+        Ok(self
+            .focus_queue
+            .lock()
+            .map_err(|_| PyreError::Io("focus_queue lock poisoned".into()))?
+            .pop_front())
     }
 }
