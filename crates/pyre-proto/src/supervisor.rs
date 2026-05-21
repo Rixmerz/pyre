@@ -106,6 +106,17 @@ pub trait SupervisorWorker {
     /// in-memory registry.
     async fn pane_closed(session_id: String, slot_idx: u32) -> Result<(), RpcError>;
 
+    /// Notify the supervisor that a pane's state has changed.
+    ///
+    /// The supervisor resolves the stable PaneId and emits a `StateChanged`
+    /// event into its `PaneEventBus` so MCP clients on the hybrid daemon
+    /// receive the same live state events as single-mode clients.
+    async fn pane_state_changed(
+        session_id: String,
+        slot_idx: u32,
+        state: crate::PaneStateKind,
+    ) -> Result<(), RpcError>;
+
     /// Liveness signal sent by the worker every 5 s.
     ///
     /// Supervisor times out at 15 s and triggers a forced respawn if no

@@ -540,16 +540,31 @@ fn spawn_worker_state_engine(state: Arc<WorkerState>) -> tokio::task::JoinHandle
                     .map(|(slot, h)| (*slot, h.state_tracker.clone()))
                     .collect()
             };
-            for (_slot, tracker_arc) in trackers {
-                let _ = tokio::task::spawn_blocking(move || {
+            for (slot_idx, tracker_arc) in trackers {
+                let result = tokio::task::spawn_blocking(move || {
                     let mut t = tracker_arc.lock().expect("tracker poisoned");
                     t.foreground_cmd = crate::state::foreground_of(t.root_pid);
                     if let Some(ref cmd) = t.foreground_cmd {
                         t.agent = crate::agent_detect::classify_foreground(cmd);
                     }
-                    t.evaluate();
+                    let changed = t.evaluate();
+                    (changed, t.state)
                 })
                 .await;
+
+                if let Ok((true, new_state)) = result {
+                    // Forward the state change to the supervisor so it can emit
+                    // a StateChanged event into the PaneEventBus. Fire-and-forget:
+                    // a missed notification is non-fatal; the client will catch up
+                    // on the next poll.
+                    let sv = state.sv_client.clone();
+                    let session_id = state.session_id.clone();
+                    tokio::spawn(async move {
+                        let _ = sv
+                            .pane_state_changed(context::current(), session_id, slot_idx, new_state)
+                            .await;
+                    });
+                }
             }
         }
     })

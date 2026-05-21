@@ -1198,6 +1198,32 @@ impl SupervisorWorker for SupervisorWorkerImpl {
         Ok(())
     }
 
+    async fn pane_state_changed(
+        self,
+        _ctx: context::Context,
+        session_id: String,
+        slot_idx: u32,
+        state: PaneStateKind,
+    ) -> Result<(), RpcError> {
+        // Resolve the stable PaneId for this (session_id, slot_idx) pair.
+        // If the slot is already dead (pane_closed fired first), discard silently.
+        let Some(pane_uuid) = self
+            .registry
+            .get_or_alloc_pane_by_slot(&session_id, slot_idx)
+            .await
+        else {
+            tracing::debug!(
+                session_id,
+                slot_idx,
+                "pane_state_changed: slot dead, skipping"
+            );
+            return Ok(());
+        };
+        self.pane_event_bus
+            .emit(PaneId(pane_uuid), PaneEventKind::StateChanged, Some(state));
+        Ok(())
+    }
+
     async fn heartbeat(self, _ctx: context::Context, session_id: String) -> Result<(), RpcError> {
         self.registry.touch_heartbeat(&session_id).await;
         Ok(())
