@@ -7,7 +7,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::MODE_CONTROL;
 
 /// Wire protocol version. Bump when breaking RPC or stream framing changes.
-pub const PROTO_VERSION: u32 = 1;
+/// v2: adds `exit_code` i64 FAST+INDEXED field to Tantivy schema.
+pub const PROTO_VERSION: u32 = 2;
 
 /// Client: write `MODE_CONTROL` + little-endian `PROTO_VERSION`.
 pub async fn write_control_client<W: AsyncWrite + Unpin>(w: &mut W) -> io::Result<()> {

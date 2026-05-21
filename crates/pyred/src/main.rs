@@ -150,6 +150,9 @@ async fn run_single(path: PathBuf) -> Result<()> {
     tracing::info!("store opened at {}", store.data_dir().display());
 
     let index_dir = store.data_dir().join("index");
+    migration::maybe_migrate_tantivy_schema(&index_dir, &store)
+        .await
+        .context("tantivy schema migration")?;
     let block_index = Arc::new(
         tokio::task::spawn_blocking(move || BlockIndex::open(&index_dir))
             .await
@@ -291,6 +294,9 @@ async fn main() -> Result<()> {
             tracing::info!("store opened at {}", store.data_dir().display());
 
             let index_dir = store.data_dir().join("index");
+            migration::maybe_migrate_tantivy_schema(&index_dir, &store)
+                .await
+                .context("tantivy schema migration")?;
             let block_index = Arc::new(
                 tokio::task::spawn_blocking(move || BlockIndex::open(&index_dir))
                     .await

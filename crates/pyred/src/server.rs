@@ -110,15 +110,12 @@ impl pyre_proto::service::PyreDaemon for DaemonImpl {
         let block_index = self.block_index.clone();
         let query = req.query.clone();
         let failures_only = req.failures_only;
-        let fetch_limit = if failures_only {
-            req.limit.saturating_mul(4).max(req.limit)
-        } else {
-            req.limit
-        };
-        let ids = tokio::task::spawn_blocking(move || block_index.search(&query, fetch_limit))
-            .await
-            .map_err(|e| PyreError::Io(e.to_string()))?
-            .map_err(|e| PyreError::Io(e.to_string()))?;
+        let limit = req.limit;
+        let ids =
+            tokio::task::spawn_blocking(move || block_index.search(&query, limit, failures_only))
+                .await
+                .map_err(|e| PyreError::Io(e.to_string()))?
+                .map_err(|e| PyreError::Io(e.to_string()))?;
 
         let mut blocks = Vec::with_capacity(ids.len());
         for id in ids {
@@ -130,14 +127,13 @@ impl pyre_proto::service::PyreDaemon for DaemonImpl {
                 }
             }
         }
-        blocks.truncate(req.limit as usize);
         let store = self.store.clone();
         let hits = tokio::task::spawn_blocking(move || {
             crate::search_filter::hits_with_snippets(&store, blocks, 160)
         })
         .await
         .map_err(|e| PyreError::Io(e.to_string()))?;
-        Ok(crate::search_filter::filter_hits(hits, failures_only))
+        Ok(hits)
     }
 
     async fn list_sessions(self, _ctx: context::Context) -> Result<Vec<SessionInfo>, PyreError> {

@@ -1,23 +1,12 @@
-//! Post-filters and snippet helpers for `search_blocks` RPC results.
+//! Snippet helpers for `search_blocks` RPC results.
+//!
+//! `filter_hits` / `block_is_failure` were removed in schema v2: the
+//! `failures_only` flag is now handled at the Tantivy layer via a
+//! `RangeQuery` on the `exit_code` FAST field. See `index.rs`.
 
 use pyre_proto::{Block, BlockHit};
 
 use crate::store::Store;
-
-/// True when the block finished with a non-zero exit code.
-pub fn block_is_failure(block: &Block) -> bool {
-    block.exit_code.is_some_and(|c| c != 0)
-}
-
-/// Apply `failures_only` after tantivy search.
-pub fn filter_hits(hits: Vec<BlockHit>, failures_only: bool) -> Vec<BlockHit> {
-    if !failures_only {
-        return hits;
-    }
-    hits.into_iter()
-        .filter(|h| block_is_failure(&h.block))
-        .collect()
-}
 
 /// Build `BlockHit` rows with stdout snippets from the store.
 pub fn hits_with_snippets(store: &Store, blocks: Vec<Block>, max_chars: usize) -> Vec<BlockHit> {
