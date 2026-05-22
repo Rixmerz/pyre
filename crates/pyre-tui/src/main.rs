@@ -5770,7 +5770,20 @@ async fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
-    splash::play_splash(cli.no_splash);
+    // Load the theme config before the splash so the flame uses the user's palette.
+    // Non-fatal: falls back to built-in ember palette on any error.
+    let splash_colors = {
+        let reg = pyre_themes::Registry::builtin();
+        let name = pyre_themes::config::load_theme_name()
+            .unwrap_or(None)
+            .unwrap_or_else(|| pyre_themes::Registry::default_theme().to_owned());
+        let theme = reg
+            .get(&name)
+            .or_else(|| reg.get(pyre_themes::Registry::default_theme()))
+            .expect("ember always present");
+        splash::SplashColors::from_palette(&theme.palette)
+    };
+    splash::play_splash(cli.no_splash, Some(splash_colors));
     let socket = cli.socket.unwrap_or_else(default_socket);
     let shell = resolve_shell(cli.shell);
 
