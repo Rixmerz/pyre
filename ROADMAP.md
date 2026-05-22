@@ -1,5 +1,22 @@
 # pyre — Roadmap
 
+## v0.3.0 ready
+
+Layout-aware daemon (M7 complete). LayoutNode is now a first-class
+persisted, RPC-exposed type; TUI and GPU clients mirror layout state from
+the daemon rather than mutating it locally. PROTO_VERSION=4.
+
+| Milestone | Scope | Status | Commit / Artifact |
+|-----------|-------|--------|-------------------|
+| **M7-A** | ADR-0005: layout-aware daemon design | ✅ landed | `f36b1ef` |
+| **M7-B** | LayoutNode lift + PROTO_VERSION=4 in pyre-proto | ✅ landed | `b3e79a5` |
+| **M7-C** | pyred persists session.layout + RPCs: `open_pane_split`, `set_pane_weight`, `get_session_layout` | ✅ landed | `7a8e7b8` |
+| **M7-D** | pyre-tui consumes layout via daemon (no local mutation) | ✅ landed | `87859d5` |
+| **M7-E** | pyre-mcp: `session_layout` accepts split spec + 2 new tools | ✅ landed | `748bf9a` |
+| **M7-F** | pyre-gpu mirrors layout state from daemon | ✅ landed | `7643c84` |
+
+---
+
 ## v0.2.0 ready
 
 All five UX milestones landed. pyre now matches herdr on theme breadth,

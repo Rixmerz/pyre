@@ -5,16 +5,12 @@ on `pyre`. Read it first, then follow the links below.
 
 ## Next step
 
-**v0.2 UX sprint complete.** M1 themes (7ae5089, bd87faf), M2 toasts
-(c1ecbc0), M3 mouse polish (1221f54), M4 GPU parity (1795fa0), M5 remote
-attach (2f72dd1, ADR-0004). pyre now matches herdr on theme breadth,
-in-TUI notifications, mouse polish, and remote attach helper; pulls ahead
-on process isolation, MCP-first, and Tantivy block-indexed search.
+**v0.3.0 layout-aware daemon shipped.** M7-A..F: LayoutNode in pyre-proto (b3e79a5), pyred persists session.layout + open_pane_split/set_pane_weight/get_session_layout RPCs (7a8e7b8), TUI consumes via daemon (87859d5), GPU mirrors (7643c84), MCP session_layout accepts split spec + 2 new tools (748bf9a). PROTO_VERSION=4. ADR-0005 documents the design.
 
-Next: cut v0.2.0 release tag.
+Next: cut v0.3.0 release tag after final verify + reinstall.
 
-See [ROADMAP.md](ROADMAP.md) `## v0.2` for milestone table and risks.
-v0.1.0 surface (S1..S7) remains complete and is documented below.
+See [ROADMAP.md](ROADMAP.md) `## v0.3.0 ready` for milestone table.
+v0.2.0 surface (M1..M5) and v0.1.0 surface (S1..S7) remain complete and documented below.
 
 ## Files to read first
 
