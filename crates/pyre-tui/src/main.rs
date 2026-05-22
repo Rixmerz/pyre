@@ -17,6 +17,7 @@
 //!   Ctrl-B [  — enter block ribbon scrollback for focused pane
 //!   Ctrl-B ]  — exit block ribbon scrollback
 //!   Ctrl-B /  — open search overlay (Tantivy full-text search)
+//!   Ctrl-B N  — toggle toast notifications on/off
 //!   In scrollback mode: Left/h = prev block, Right/l = next block, Enter/Esc = exit
 //!   Search overlay: type to query, Up/Ctrl-P / Down/Ctrl-N to navigate, Enter to jump, Esc to close
 //!   Mouse scroll: ScrollUp/ScrollDown over a pane to scroll its scrollback buffer
@@ -77,6 +78,209 @@ use alacritty_terminal::index::{Column as TermColumn, Line as TermLine, Point as
 use alacritty_terminal::term::{cell::Flags as CellFlags, Config as TermConfig};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Processor as AnsiProcessor};
 use alacritty_terminal::Term;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Toast notification subsystem
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Visual kind of a toast notification; controls border colour from the palette.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToastKind {
+    Info,
+    Success,
+    Warn,
+    Error,
+}
+
+/// A single ephemeral notification card.
+#[derive(Debug, Clone)]
+struct Toast {
+    /// Bold title line, e.g. "claude · pane #a1b2c3d4".
+    title: String,
+    /// Dimmed body line, e.g. "Waiting for input".
+    body: String,
+    /// Determines border colour.
+    kind: ToastKind,
+    /// When the toast was created.
+    born_at: Instant,
+    /// How long before it expires.
+    ttl: Duration,
+}
+
+impl Toast {
+    /// Fraction of TTL remaining [0.0, 1.0].
+    fn remaining_fraction(&self) -> f32 {
+        let elapsed = self.born_at.elapsed();
+        if elapsed >= self.ttl {
+            0.0
+        } else {
+            1.0 - (elapsed.as_secs_f32() / self.ttl.as_secs_f32())
+        }
+    }
+
+    fn is_expired(&self) -> bool {
+        self.born_at.elapsed() >= self.ttl
+    }
+}
+
+/// Stack of live toasts rendered bottom-right.
+struct ToastDeck {
+    toasts: std::collections::VecDeque<Toast>,
+    max_visible: usize,
+    /// Whether toast display is enabled (toggleable via Ctrl-B N).
+    enabled: bool,
+    /// TTL applied to new toasts.
+    ttl: Duration,
+}
+
+impl ToastDeck {
+    fn new(enabled: bool, ttl_ms: u64, max_visible: usize) -> Self {
+        Self {
+            toasts: std::collections::VecDeque::new(),
+            max_visible,
+            enabled,
+            ttl: Duration::from_millis(ttl_ms),
+        }
+    }
+
+    /// Push a new toast; trims oldest when over `max_visible`.
+    fn push(&mut self, title: String, body: String, kind: ToastKind) {
+        if !self.enabled {
+            return;
+        }
+        let toast = Toast {
+            title,
+            body,
+            kind,
+            born_at: Instant::now(),
+            ttl: self.ttl,
+        };
+        self.toasts.push_back(toast);
+        while self.toasts.len() > self.max_visible {
+            self.toasts.pop_front();
+        }
+    }
+
+    /// Drop expired toasts. Call once per UI tick.
+    fn tick(&mut self) {
+        self.toasts.retain(|t| !t.is_expired());
+    }
+}
+
+/// Map a `PaneEvent` to an optional toast.
+/// Returns `None` for Idle/Running (spam suppression) and unknown states.
+fn pane_event_to_toast(event: &pyre_proto::PaneEvent, ttl: Duration) -> Option<Toast> {
+    use pyre_proto::{PaneEventKind, PaneStateKind};
+
+    let short: String = event.pane_id.chars().take(8).collect();
+    let agent_label = event
+        .agent
+        .map(|a| format!(" ({})", a.label()))
+        .unwrap_or_default();
+    let title = format!("{short}{agent_label}");
+
+    let (body, kind) = match event.kind {
+        PaneEventKind::Spawned => ("Spawned".to_owned(), ToastKind::Info),
+        PaneEventKind::Closed => ("Closed".to_owned(), ToastKind::Info),
+        PaneEventKind::StateChanged => {
+            match event.state {
+                Some(PaneStateKind::WaitingInput) => {
+                    ("Waiting for input".to_owned(), ToastKind::Warn)
+                }
+                Some(PaneStateKind::Done) => ("Done".to_owned(), ToastKind::Success),
+                Some(PaneStateKind::Crashed) => ("Failed".to_owned(), ToastKind::Error),
+                // Idle and Running are high-frequency — suppress.
+                Some(PaneStateKind::Idle) | Some(PaneStateKind::Running) => return None,
+                _ => return None,
+            }
+        }
+    };
+
+    Some(Toast {
+        title,
+        body,
+        kind,
+        born_at: Instant::now(),
+        ttl,
+    })
+}
+
+/// Render the toast deck in the bottom-right corner of `frame`.
+///
+/// Each card is 3 rows tall and 40 columns wide. Cards stack upward with a
+/// 1-row gap. Border colour comes from the active palette.
+fn render_toast_deck(frame: &mut ratatui::Frame, deck: &ToastDeck, t: &theme::LegacyTheme) {
+    if !deck.enabled || deck.toasts.is_empty() {
+        return;
+    }
+
+    let area = frame.area();
+    const CARD_W: u16 = 40;
+    const CARD_H: u16 = 3;
+    const GAP: u16 = 1;
+    const MARGIN_RIGHT: u16 = 1;
+    const MARGIN_BOTTOM: u16 = 2; // above the status bar
+
+    // Iterate newest-first (back of deque) and place cards bottom-up.
+    let visible: Vec<&Toast> = deck.toasts.iter().rev().take(deck.max_visible).collect();
+
+    for (i, toast) in visible.iter().enumerate() {
+        let card_x = area.width.saturating_sub(CARD_W + MARGIN_RIGHT);
+        let card_bottom = area
+            .height
+            .saturating_sub(MARGIN_BOTTOM + i as u16 * (CARD_H + GAP));
+        if card_bottom < CARD_H {
+            break; // not enough vertical space
+        }
+        let card_y = card_bottom - CARD_H;
+        let card_rect = Rect::new(card_x, card_y, CARD_W.min(area.width), CARD_H);
+
+        let border_color = match toast.kind {
+            ToastKind::Info => t.info,
+            ToastKind::Success => t.ok,
+            ToastKind::Warn => t.spark,
+            ToastKind::Error => t.err,
+        };
+
+        // Clear backing cells so pane content doesn't bleed through.
+        frame.render_widget(Clear, card_rect);
+
+        let outer = RatatuiBlock::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(border_color))
+            .style(Style::default().bg(t.muted_bg));
+        let inner = outer.inner(card_rect);
+        frame.render_widget(outer, card_rect);
+
+        // inner is 1 row tall (3 - 2 borders). Split into title + body
+        // using the single row: title bold / body dim / progress bar via title suffix.
+        let frac = toast.remaining_fraction();
+        let bar_width = (inner.width as f32 * frac) as usize;
+        let bar_empty = inner.width as usize - bar_width;
+        let progress: String = format!("{}{}", "━".repeat(bar_width), "░".repeat(bar_empty));
+
+        // With only 1 inner row we pack title + progress on the same line.
+        // Two-row inner is possible when the terminal is tall enough; keep
+        // rendering simple and always use 1 row body + title in the border.
+        let title_span = Span::styled(
+            format!(" {} ", toast.title),
+            Style::default()
+                .fg(border_color)
+                .add_modifier(Modifier::BOLD),
+        );
+        let body_span = Span::styled(format!("{} ", toast.body), Style::default().fg(t.text_dim));
+        let prog_span = Span::styled(progress, Style::default().fg(border_color));
+
+        // Render title in the block title position via a Paragraph on inner.
+        // Pack: [bold title]  [body dim]  [progress].
+        let line = Line::from(vec![title_span, body_span, prog_span]);
+        frame.render_widget(
+            Paragraph::new(line).style(Style::default().bg(t.muted_bg)),
+            inner,
+        );
+    }
+}
 
 /// Minimal Dimensions impl for creating/resizing an alacritty Term.
 struct TermSize {
@@ -901,6 +1105,10 @@ struct AppState {
     theme: Theme,
     /// Theme picker overlay (Some = open, None = closed).
     theme_picker: Option<ThemePickerState>,
+    /// Ephemeral toast notifications (pane state changes).
+    toast_deck: ToastDeck,
+    /// Receiver for toasts produced by the background push-event task.
+    toast_rx: mpsc::Receiver<Toast>,
 }
 
 impl AppState {
@@ -2405,6 +2613,10 @@ fn draw_frame(
             );
         }
 
+        // Toast deck — rendered before blocking overlays so toasts appear
+        // under modal dialogs (which is fine; user can still see them).
+        render_toast_deck(frame, &state.toast_deck, &t);
+
         // Host-terminal cursor positioning.
         // Only one pane (the focused one, live view) owns the cursor.
         // Overlays or scrollback suppress it.
@@ -3180,6 +3392,8 @@ fn initial_app_state(
     shell: Option<String>,
     blocks_rx: watch::Receiver<HashMap<PaneId, Vec<Block>>>,
     theme: Theme,
+    toast_deck: ToastDeck,
+    toast_rx: mpsc::Receiver<Toast>,
 ) -> AppState {
     AppState {
         sessions: vec![SessionView {
@@ -3222,6 +3436,8 @@ fn initial_app_state(
         pager: None,
         theme,
         theme_picker: None,
+        toast_deck,
+        toast_rx,
     }
 }
 
@@ -3364,6 +3580,59 @@ async fn run_tui(
             .clone()
     };
 
+    // Load notification config (non-fatal — defaults on error).
+    let notif_cfg = pyre_themes::config::load_notifications_config().unwrap_or_default();
+
+    // ── Background push-event task ─────────────────────────────────────────
+    // Long-polls `next_pane_event` and sends resulting Toasts into `toast_rx`.
+    // The event loop drains the channel each tick without awaiting the RPC.
+    let (toast_tx, toast_rx) = mpsc::channel::<Toast>(64);
+    {
+        let push_client_socket = socket.clone();
+        let ttl = Duration::from_millis(notif_cfg.ttl_ms);
+        tokio::spawn(async move {
+            let mut seq: u64 = 0;
+            let mut backoff = Duration::from_millis(200);
+            loop {
+                let client = match try_connect_control(&push_client_socket).await {
+                    Ok(c) => c,
+                    Err(_) => {
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(5));
+                        continue;
+                    }
+                };
+                backoff = Duration::from_millis(200);
+
+                match client
+                    .next_pane_event(tarpc::context::current(), seq, 30_000)
+                    .await
+                {
+                    Ok(Ok(events)) if !events.is_empty() => {
+                        if let Some(last) = events.last() {
+                            seq = last.seq;
+                        }
+                        for ev in &events {
+                            if let Some(toast) = pane_event_to_toast(ev, ttl) {
+                                // Silently drop if receiver is gone (TUI exiting).
+                                let _ = toast_tx.try_send(toast);
+                            }
+                        }
+                    }
+                    Ok(Ok(_)) => {
+                        // Normal long-poll timeout; loop immediately.
+                    }
+                    _ => {
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(5));
+                    }
+                }
+            }
+        });
+    }
+
+    let toast_deck = ToastDeck::new(notif_cfg.enabled, notif_cfg.ttl_ms, notif_cfg.max_visible);
+
     let mut state = initial_app_state(
         session,
         session_name,
@@ -3373,6 +3642,8 @@ async fn run_tui(
         shell,
         blocks_rx,
         theme,
+        toast_deck,
+        toast_rx,
     );
 
     // Eagerly discover all other sessions the daemon already knows about so
@@ -3505,6 +3776,16 @@ async fn run_tui(
                     slot.ribbon_cursor = None;
                 }
             }
+        }
+
+        // Drain toasts from the background push-event task (non-blocking).
+        // tick() first to drop expired entries, then absorb any new arrivals.
+        state.toast_deck.tick();
+        while let Ok(toast) = state.toast_rx.try_recv() {
+            // push() respects the enabled flag and trims to max_visible.
+            state
+                .toast_deck
+                .push(toast.title, toast.body, toast.kind);
         }
 
         // Search debounce: fire query 150 ms after last keystroke.
@@ -4151,6 +4432,17 @@ async fn run_tui(
                             });
                         }
 
+                        // Toggle toast notifications (Ctrl-B N)
+                        KeyCode::Char('N') => {
+                            state.toast_deck.enabled = !state.toast_deck.enabled;
+                            let label = if state.toast_deck.enabled {
+                                "notifications on"
+                            } else {
+                                "notifications off"
+                            };
+                            state.status_msg = Some(label.to_owned());
+                        }
+
                         // All other prefix keys consumed silently
                         _ => {}
                     }
@@ -4444,6 +4736,126 @@ async fn run_tui(
     }
 
     Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Unit tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    // ── ToastDeck::push trims to max_visible ────────────────────────────────
+
+    #[test]
+    fn deck_push_trims_to_max_visible() {
+        let mut deck = ToastDeck::new(true, 4000, 3);
+        deck.push("a".into(), "body".into(), ToastKind::Info);
+        deck.push("b".into(), "body".into(), ToastKind::Info);
+        deck.push("c".into(), "body".into(), ToastKind::Info);
+        // At capacity.
+        assert_eq!(deck.toasts.len(), 3);
+        // Push a fourth — oldest should be evicted.
+        deck.push("d".into(), "body".into(), ToastKind::Info);
+        assert_eq!(deck.toasts.len(), 3);
+        // "a" (pushed first) should have been dropped; "d" should be at back.
+        assert_eq!(deck.toasts.back().unwrap().title, "d");
+        assert_eq!(deck.toasts.front().unwrap().title, "b");
+    }
+
+    // ── ToastDeck::tick drops expired toasts ────────────────────────────────
+
+    #[test]
+    fn deck_tick_drops_expired() {
+        let mut deck = ToastDeck::new(true, 4000, 5);
+
+        // Inject a toast that was born 5 s ago with a 4 s TTL (already expired).
+        let expired = Toast {
+            title: "old".into(),
+            body: "body".into(),
+            kind: ToastKind::Warn,
+            born_at: Instant::now() - Duration::from_secs(5),
+            ttl: Duration::from_secs(4),
+        };
+        deck.toasts.push_back(expired);
+
+        // Inject a fresh toast with a 4 s TTL (not yet expired).
+        deck.push("fresh".into(), "body".into(), ToastKind::Success);
+
+        assert_eq!(deck.toasts.len(), 2);
+        deck.tick();
+        // Expired one should have been removed; fresh one remains.
+        assert_eq!(deck.toasts.len(), 1);
+        assert_eq!(deck.toasts.front().unwrap().title, "fresh");
+    }
+
+    // ── pane_event_to_toast: mapping coverage ───────────────────────────────
+
+    fn make_event(
+        kind: pyre_proto::PaneEventKind,
+        state: Option<pyre_proto::PaneStateKind>,
+    ) -> pyre_proto::PaneEvent {
+        pyre_proto::PaneEvent {
+            seq: 1,
+            pane_id: "aabbccdd-0000-0000-0000-000000000000".into(),
+            kind,
+            state,
+            agent: None,
+        }
+    }
+
+    #[test]
+    fn pane_event_to_toast_mapping() {
+        use pyre_proto::{PaneEventKind, PaneStateKind};
+
+        let ttl = Duration::from_millis(4000);
+
+        // Spawned → Info
+        let ev = make_event(PaneEventKind::Spawned, None);
+        let t = pane_event_to_toast(&ev, ttl).expect("Spawned must produce a toast");
+        assert_eq!(t.kind, ToastKind::Info);
+        assert_eq!(t.body, "Spawned");
+
+        // Closed → Info
+        let ev = make_event(PaneEventKind::Closed, None);
+        let t = pane_event_to_toast(&ev, ttl).expect("Closed must produce a toast");
+        assert_eq!(t.kind, ToastKind::Info);
+        assert_eq!(t.body, "Closed");
+
+        // StateChanged(WaitingInput) → Warn
+        let ev = make_event(
+            PaneEventKind::StateChanged,
+            Some(PaneStateKind::WaitingInput),
+        );
+        let t = pane_event_to_toast(&ev, ttl).expect("WaitingInput must produce a toast");
+        assert_eq!(t.kind, ToastKind::Warn);
+
+        // StateChanged(Done) → Success
+        let ev = make_event(PaneEventKind::StateChanged, Some(PaneStateKind::Done));
+        let t = pane_event_to_toast(&ev, ttl).expect("Done must produce a toast");
+        assert_eq!(t.kind, ToastKind::Success);
+
+        // StateChanged(Crashed) → Error
+        let ev = make_event(PaneEventKind::StateChanged, Some(PaneStateKind::Crashed));
+        let t = pane_event_to_toast(&ev, ttl).expect("Crashed must produce a toast");
+        assert_eq!(t.kind, ToastKind::Error);
+
+        // StateChanged(Idle) → suppressed (None)
+        let ev = make_event(PaneEventKind::StateChanged, Some(PaneStateKind::Idle));
+        assert!(
+            pane_event_to_toast(&ev, ttl).is_none(),
+            "Idle must be suppressed"
+        );
+
+        // StateChanged(Running) → suppressed (None)
+        let ev = make_event(PaneEventKind::StateChanged, Some(PaneStateKind::Running));
+        assert!(
+            pane_event_to_toast(&ev, ttl).is_none(),
+            "Running must be suppressed"
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
