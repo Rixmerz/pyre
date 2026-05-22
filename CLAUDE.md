@@ -5,10 +5,13 @@ on `pyre`. Read it first, then follow the links below.
 
 ## Next step
 
-**v0.2 UX sprint active.** Goal: aplastar a nivel UX a herdr. M1 themes
-landed (7ae5089, bd87faf). M5 remote attach helper landed (2f72dd1,
-ADR-0004). M2 toasts in flight. M3 mouse polish designed (see
-`.claude/notions/m3-mouse-polish.md`). M4 GPU parity pending.
+**v0.2 UX sprint complete.** M1 themes (7ae5089, bd87faf), M2 toasts
+(c1ecbc0), M3 mouse polish (1221f54), M4 GPU parity (1795fa0), M5 remote
+attach (2f72dd1, ADR-0004). pyre now matches herdr on theme breadth,
+in-TUI notifications, mouse polish, and remote attach helper; pulls ahead
+on process isolation, MCP-first, and Tantivy block-indexed search.
+
+Next: cut v0.2.0 release tag.
 
 See [ROADMAP.md](ROADMAP.md) `## v0.2` for milestone table and risks.
 v0.1.0 surface (S1..S7) remains complete and is documented below.

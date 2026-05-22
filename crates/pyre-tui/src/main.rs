@@ -5580,6 +5580,120 @@ async fn run_tui(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Entry point
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> Result<()> {
+    // Route tracing to a file so logs survive ratatui's alternate-screen mode.
+    // Fall back to stderr if the file cannot be opened.
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/pyre-tui.log");
+    match log_file {
+        Ok(f) => {
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+                )
+                .with_writer(std::sync::Mutex::new(f))
+                .init();
+        }
+        Err(_) => {
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+                )
+                .with_writer(std::io::stderr)
+                .init();
+        }
+    }
+
+    let cli = Cli::parse();
+    splash::play_splash(cli.no_splash);
+    let socket = cli.socket.unwrap_or_else(default_socket);
+    let shell = resolve_shell(cli.shell);
+
+    match cli.command {
+        None => {
+            let client = control_client(&socket).await?;
+            // Check for existing sessions first; attach to first if present.
+            // All PTY spawning is deferred into run_tui() so that it happens
+            // after the terminal enters alternate-screen and terminal.size()
+            // returns true dimensions — not an 80×24 pre-alt-screen placeholder.
+            let existing = client
+                .list_sessions(tarpc::context::current())
+                .await
+                .context("rpc transport")?
+                .map_err(|e| anyhow!("daemon list_sessions: {e}"))?;
+
+            // Iterate sessions and pick the first one that has a live pane.
+            // Stale sessions (worker evicted, zero panes) will fail first_pane;
+            // skip them rather than trying to open a pane on a dead worker.
+            let mut init = PaneInit::Spawn;
+            for sess in existing {
+                match first_pane(&client, sess.id).await {
+                    Ok(pane) => {
+                        init = PaneInit::Existing {
+                            session: sess.id,
+                            session_name: sess.name,
+                            pane,
+                        };
+                        break;
+                    }
+                    Err(_) => {
+                        // Session has no live pane — skip it.
+                        continue;
+                    }
+                }
+            }
+
+            run_tui(socket, init, client, shell).await
+        }
+        Some(Sub::Attach {
+            session: session_prefix,
+            pane: pane_prefix,
+        }) => {
+            let client = control_client(&socket).await?;
+            let sessions = client
+                .list_sessions(tarpc::context::current())
+                .await
+                .context("rpc transport")?
+                .map_err(|e| anyhow!("daemon list_sessions: {e}"))?;
+
+            let session_id = resolve_session(&client, &session_prefix).await?;
+            let session_name = sessions
+                .iter()
+                .find(|s| s.id == session_id)
+                .map(|s| s.name.clone())
+                .unwrap_or_else(|| {
+                    let short8: String = session_id.0.to_string().chars().take(8).collect();
+                    format!("session-{short8}")
+                });
+
+            let pane = match pane_prefix {
+                Some(ref prefix) => resolve_pane(&client, session_id, prefix).await?,
+                None => first_pane(&client, session_id).await?,
+            };
+            run_tui(
+                socket,
+                PaneInit::Existing {
+                    session: session_id,
+                    session_name,
+                    pane,
+                },
+                client,
+                shell,
+            )
+            .await
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Unit tests
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -5696,119 +5810,5 @@ mod tests {
             pane_event_to_toast(&ev, ttl).is_none(),
             "Running must be suppressed"
         );
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Entry point
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> Result<()> {
-    // Route tracing to a file so logs survive ratatui's alternate-screen mode.
-    // Fall back to stderr if the file cannot be opened.
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/pyre-tui.log");
-    match log_file {
-        Ok(f) => {
-            tracing_subscriber::fmt()
-                .with_env_filter(
-                    tracing_subscriber::EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-                )
-                .with_writer(std::sync::Mutex::new(f))
-                .init();
-        }
-        Err(_) => {
-            tracing_subscriber::fmt()
-                .with_env_filter(
-                    tracing_subscriber::EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-                )
-                .with_writer(std::io::stderr)
-                .init();
-        }
-    }
-
-    let cli = Cli::parse();
-    splash::play_splash(cli.no_splash);
-    let socket = cli.socket.unwrap_or_else(default_socket);
-    let shell = resolve_shell(cli.shell);
-
-    match cli.command {
-        None => {
-            let client = control_client(&socket).await?;
-            // Check for existing sessions first; attach to first if present.
-            // All PTY spawning is deferred into run_tui() so that it happens
-            // after the terminal enters alternate-screen and terminal.size()
-            // returns true dimensions — not an 80×24 pre-alt-screen placeholder.
-            let existing = client
-                .list_sessions(tarpc::context::current())
-                .await
-                .context("rpc transport")?
-                .map_err(|e| anyhow!("daemon list_sessions: {e}"))?;
-
-            // Iterate sessions and pick the first one that has a live pane.
-            // Stale sessions (worker evicted, zero panes) will fail first_pane;
-            // skip them rather than trying to open a pane on a dead worker.
-            let mut init = PaneInit::Spawn;
-            for sess in existing {
-                match first_pane(&client, sess.id).await {
-                    Ok(pane) => {
-                        init = PaneInit::Existing {
-                            session: sess.id,
-                            session_name: sess.name,
-                            pane,
-                        };
-                        break;
-                    }
-                    Err(_) => {
-                        // Session has no live pane — skip it.
-                        continue;
-                    }
-                }
-            }
-
-            run_tui(socket, init, client, shell).await
-        }
-        Some(Sub::Attach {
-            session: session_prefix,
-            pane: pane_prefix,
-        }) => {
-            let client = control_client(&socket).await?;
-            let sessions = client
-                .list_sessions(tarpc::context::current())
-                .await
-                .context("rpc transport")?
-                .map_err(|e| anyhow!("daemon list_sessions: {e}"))?;
-
-            let session_id = resolve_session(&client, &session_prefix).await?;
-            let session_name = sessions
-                .iter()
-                .find(|s| s.id == session_id)
-                .map(|s| s.name.clone())
-                .unwrap_or_else(|| {
-                    let short8: String = session_id.0.to_string().chars().take(8).collect();
-                    format!("session-{short8}")
-                });
-
-            let pane = match pane_prefix {
-                Some(ref prefix) => resolve_pane(&client, session_id, prefix).await?,
-                None => first_pane(&client, session_id).await?,
-            };
-            run_tui(
-                socket,
-                PaneInit::Existing {
-                    session: session_id,
-                    session_name,
-                    pane,
-                },
-                client,
-                shell,
-            )
-            .await
-        }
     }
 }
