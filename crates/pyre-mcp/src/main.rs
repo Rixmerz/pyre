@@ -576,6 +576,46 @@ impl Server {
                         },
                         "required": ["pane", "state"]
                     }
+                },
+                {
+                    "name": "list_sessions",
+                    "description": "List all active pyre sessions with metadata.",
+                    "inputSchema": { "type": "object", "properties": {}, "required": [] }
+                },
+                {
+                    "name": "list_panes",
+                    "description": "List panes optionally filtered by session_id.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "session_id": { "type": "string", "description": "Filter to a session (optional)." }
+                        },
+                        "required": []
+                    }
+                },
+                {
+                    "name": "session_layout",
+                    "description": "Create a session with N panes preconfigured (cwd + optional command per pane). Note: open_pane inherits cwd from the pane's shell invocation; per-pane cwd is passed via OpenPaneReq.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string", "description": "Session name." },
+                            "panes": {
+                                "type": "array",
+                                "description": "Panes to create after session spawn. First pane reuses the session's initial pane.",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": { "type": "string" },
+                                        "cwd": { "type": "string" },
+                                        "cmd": { "type": "string", "description": "Command sent via send_keys with trailing \\n." }
+                                    },
+                                    "required": []
+                                }
+                            }
+                        },
+                        "required": ["name"]
+                    }
                 }
             ]
         })
@@ -598,6 +638,9 @@ impl Server {
             "session_close" => self.tool_session_close(args).await?,
             "pane_open" => self.tool_pane_open(args).await?,
             "wait_pane_state" => self.tool_wait_pane_state(args).await?,
+            "list_sessions" => self.tool_list_sessions().await?,
+            "list_panes" => self.tool_list_panes(args).await?,
+            "session_layout" => self.tool_session_layout(args).await?,
             other => return Err(anyhow!("unknown tool: {other}")),
         };
 
@@ -874,6 +917,152 @@ impl Server {
             .map_err(|e| anyhow!("{e}"))?;
 
         Ok(format!("session {} closed", &session_id.0.to_string()[..8]))
+    }
+
+    async fn tool_list_sessions(&self) -> Result<String> {
+        let client = self.client().await?;
+        let sessions = client
+            .list_sessions(tarpc::context::current())
+            .await
+            .context("rpc")?
+            .map_err(|e| anyhow!("{e}"))?;
+
+        let out: Vec<Value> = sessions
+            .iter()
+            .map(|s| {
+                json!({
+                    "session_id": s.id.0.to_string(),
+                    "name": s.name,
+                    "pane_count": s.pane_count,
+                })
+            })
+            .collect();
+
+        Ok(serde_json::to_string_pretty(&json!({ "sessions": out }))?)
+    }
+
+    async fn tool_list_panes(&self, args: &Value) -> Result<String> {
+        let session_filter = args["session_id"].as_str().map(str::to_owned);
+
+        let client = self.client().await?;
+        let all = client
+            .list_all_panes(tarpc::context::current())
+            .await
+            .context("rpc")?
+            .map_err(|e| anyhow!("{e}"))?;
+
+        let panes: Vec<Value> = all
+            .iter()
+            .filter(|p| {
+                session_filter
+                    .as_deref()
+                    .map(|f| p.session.0.to_string().starts_with(f))
+                    .unwrap_or(true)
+            })
+            .map(|p| {
+                json!({
+                    "pane_id": p.id.0.to_string(),
+                    "session_id": p.session.0.to_string(),
+                    "agent": p.agent.label(),
+                    "state": p.state.to_string(),
+                    "seen": p.seen,
+                })
+            })
+            .collect();
+
+        Ok(serde_json::to_string_pretty(&json!({ "panes": panes }))?)
+    }
+
+    async fn tool_session_layout(&self, args: &Value) -> Result<String> {
+        let name = args["name"]
+            .as_str()
+            .ok_or_else(|| anyhow!("missing name"))?
+            .to_owned();
+
+        let pane_specs = args["panes"].as_array().cloned().unwrap_or_default();
+
+        // Derive initial cwd from the first pane spec, if any.
+        let first_cwd = pane_specs
+            .first()
+            .and_then(|p| p["cwd"].as_str())
+            .map(PathBuf::from);
+
+        let client = self.client().await?;
+
+        // 1. Spawn the session (one default pane is created by pyred).
+        let spawn_req = SpawnReq {
+            shell: std::env::var("SHELL").ok(),
+            cwd: first_cwd,
+            cols: 80,
+            rows: 24,
+            env: std::env::vars().collect(),
+            name: Some(name),
+        };
+        let spawn_resp = client
+            .spawn(tarpc::context::current(), spawn_req)
+            .await
+            .context("rpc spawn")?
+            .map_err(|e| anyhow!("{e}"))?;
+
+        let session_id = spawn_resp.session;
+        let initial_pane_id = spawn_resp.pane;
+
+        let mut result_panes: Vec<Value> = Vec::new();
+
+        // 2. Process each pane spec.
+        for (idx, spec) in pane_specs.iter().enumerate() {
+            let pane_name = spec["name"].as_str().unwrap_or("").to_owned();
+            let cwd = spec["cwd"].as_str().map(PathBuf::from);
+            let cmd = spec["cmd"].as_str().map(str::to_owned);
+
+            let pane_id = if idx == 0 {
+                // Reuse the pane already created by session_spawn.
+                initial_pane_id
+            } else {
+                // Open an additional pane in the session.
+                let req = OpenPaneReq {
+                    session: session_id,
+                    shell: std::env::var("SHELL").ok(),
+                    cwd,
+                    cols: 80,
+                    rows: 24,
+                    env: std::env::vars().collect(),
+                };
+                client
+                    .open_pane(tarpc::context::current(), req)
+                    .await
+                    .context("rpc open_pane")?
+                    .map_err(|e| anyhow!("{e}"))?
+            };
+
+            // Send optional startup command.
+            if let Some(c) = cmd {
+                let payload = format!("{c}\n").into_bytes();
+                client
+                    .send_keys(tarpc::context::current(), pane_id, payload)
+                    .await
+                    .context("rpc send_keys")?
+                    .map_err(|e| anyhow!("{e}"))?;
+            }
+
+            result_panes.push(json!({
+                "pane_id": pane_id.0.to_string(),
+                "name": pane_name,
+            }));
+        }
+
+        // When no pane specs were provided, still report the initial pane.
+        if pane_specs.is_empty() {
+            result_panes.push(json!({
+                "pane_id": initial_pane_id.0.to_string(),
+                "name": "",
+            }));
+        }
+
+        Ok(serde_json::to_string_pretty(&json!({
+            "session_id": session_id.0.to_string(),
+            "panes": result_panes,
+        }))?)
     }
 
     async fn tool_pane_open(&self, args: &Value) -> Result<String> {

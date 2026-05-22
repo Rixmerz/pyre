@@ -133,8 +133,8 @@ fn test_tools_list() {
     let tools = resp["result"]["tools"].as_array().expect("tools is array");
 
     assert!(
-        tools.len() >= 8,
-        "expected at least 8 tools, got {}",
+        tools.len() >= 11,
+        "expected at least 11 tools, got {}",
         tools.len()
     );
 
@@ -149,6 +149,9 @@ fn test_tools_list() {
         "session_close",
         "pane_open",
         "wait_pane_state",
+        "list_sessions",
+        "list_panes",
+        "session_layout",
     ] {
         assert!(
             names.contains(expected),
