@@ -42,8 +42,9 @@ use futures::SinkExt;
 use futures::StreamExt;
 use pyre_proto::{
     blocks::{BlockHit, SearchBlocksReq},
-    write_control_client, Block, InputFrame, OpenPaneReq, OutputFrame, PaneId, PidInspect,
-    PyreDaemonClient, SessionId, SpawnReq, SpawnResp, MODE_STREAM,
+    layout::{LayoutNode, Orient},
+    write_control_client, Block, InputFrame, OpenPaneReq, OpenPaneSplitReq, OutputFrame, PaneId,
+    PidInspect, PyreDaemonClient, SessionId, SpawnReq, SpawnResp, MODE_STREAM,
 };
 use pyre_themes::{Registry, Theme};
 use ratatui::backend::CrosstermBackend;
@@ -783,19 +784,6 @@ impl PaneSlot {
     }
 }
 
-/// Recursive layout tree. Indices reference `AppState::slots`.
-///
-/// HSplit and VSplit children carry a `u16` weight (percentage, summing to 100
-/// across siblings). Initial splits are equal-weight. Drag-resize updates the
-/// weights of neighboring children while clamping each to >=5.
-enum LayoutNode {
-    Leaf(usize),
-    /// Horizontal split (children stacked top-to-bottom). Weights are percentages.
-    HSplit(Vec<(LayoutNode, u16)>),
-    /// Vertical split (children side-by-side). Weights are percentages.
-    VSplit(Vec<(LayoutNode, u16)>),
-}
-
 /// A boundary between two split children — used for drag-resize hit-testing.
 #[derive(Clone)]
 struct SplitBoundary {
@@ -822,11 +810,12 @@ struct DragState {
 
 /// One tab, owning a layout tree and a cursor into the focused leaf.
 struct Tab {
+    /// Daemon-owned tiling tree. Leaves carry stable `PaneId` UUIDs (M7-D).
     root: LayoutNode,
-    /// Path of child indices from `root` down to the active `Leaf`.
-    focus_path: Vec<usize>,
-    /// When Some, renders only the leaf at that focus_path filling the body rect.
-    zoomed: Option<Vec<usize>>,
+    /// The `PaneId` of the focused pane. Stable across layout mutations.
+    focus_pane: PaneId,
+    /// When Some, renders only this pane filling the full body area (zoom).
+    zoomed: Option<PaneId>,
     /// Boundaries collected during the last render, used for drag-resize hit-test.
     boundaries: Vec<SplitBoundary>,
     /// Active drag state (set on mouse-down near a boundary).
@@ -1186,52 +1175,24 @@ impl AppState {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Layout helpers
+// Layout helpers (M7-D: PaneId-keyed, delegates to pyre_proto::layout)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Walk the tree depth-first and collect every focus_path for each leaf.
-fn leaves_in_order(node: &LayoutNode, path: &mut Vec<usize>, out: &mut Vec<Vec<usize>>) {
+/// Walk the tree DFS and collect `PaneId` for every leaf, in order.
+fn pane_leaves_in_order(node: &LayoutNode) -> Vec<PaneId> {
     match node {
-        LayoutNode::Leaf(_) => out.push(path.clone()),
-        LayoutNode::HSplit(children) | LayoutNode::VSplit(children) => {
-            for (i, (child, _weight)) in children.iter().enumerate() {
-                path.push(i);
-                leaves_in_order(child, path, out);
-                path.pop();
-            }
-        }
+        LayoutNode::Leaf(id) => vec![*id],
+        LayoutNode::HSplit(children) | LayoutNode::VSplit(children) => children
+            .iter()
+            .flat_map(|(c, _)| pane_leaves_in_order(c))
+            .collect(),
     }
 }
 
-/// Return the slot index at a given focus path.
-fn slot_at(root: &LayoutNode, path: &[usize]) -> Option<usize> {
-    let mut node = root;
-    for &idx in path {
-        match node {
-            LayoutNode::HSplit(children) | LayoutNode::VSplit(children) => {
-                node = &children.get(idx)?.0;
-            }
-            LayoutNode::Leaf(_) => return None,
-        }
-    }
-    match node {
-        LayoutNode::Leaf(slot) => Some(*slot),
-        _ => None,
-    }
-}
 
-/// Replace the node at `path` with `new_node`.
-fn replace_at(root: &mut LayoutNode, path: &[usize], new_node: LayoutNode) {
-    if path.is_empty() {
-        *root = new_node;
-        return;
-    }
-    match root {
-        LayoutNode::HSplit(children) | LayoutNode::VSplit(children) => {
-            replace_at(&mut children[path[0]].0, &path[1..], new_node);
-        }
-        LayoutNode::Leaf(_) => {}
-    }
+/// Return the slot index for `focus_pane` in `slots`.
+fn focused_slot_idx(focus_pane: PaneId, slots: &[Option<PaneSlot>]) -> Option<usize> {
+    pane_to_slot_idx(slots, focus_pane)
 }
 
 /// Mutably access the children of the split node at `path`.
@@ -1254,16 +1215,33 @@ fn children_at_mut<'a>(
     }
 }
 
+/// Look up the slot index for a `PaneId` by scanning `slots`.
+fn pane_to_slot_idx(slots: &[Option<PaneSlot>], pane_id: PaneId) -> Option<usize> {
+    slots
+        .iter()
+        .position(|s| s.as_ref().map(|sl| sl.pane_id == pane_id).unwrap_or(false))
+}
+
+/// Build a `PaneId → slot_idx` map for the current slots vec.
+fn build_pane_slot_map(slots: &[Option<PaneSlot>]) -> HashMap<PaneId, usize> {
+    slots
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| s.as_ref().map(|sl| (sl.pane_id, i)))
+        .collect()
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Mouse hit-test helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Walk the layout tree and collect (slot_index, screen_rect) for each leaf,
+/// Walk the layout tree and collect (PaneId, screen_rect) for each leaf,
 /// computing rects the same way render_layout does (without actually rendering).
-fn collect_leaf_rects(node: &LayoutNode, area: Rect, out: &mut Vec<(usize, Rect)>) {
+/// Callers convert PaneId → slot_idx via `pane_to_slot_idx`.
+fn collect_leaf_rects(node: &LayoutNode, area: Rect, out: &mut Vec<(PaneId, Rect)>) {
     match node {
-        LayoutNode::Leaf(slot_idx) => {
-            out.push((*slot_idx, area));
+        LayoutNode::Leaf(pane_id) => {
+            out.push((*pane_id, area));
         }
         LayoutNode::HSplit(children) => {
             let constraints: Vec<Constraint> = children
@@ -1792,13 +1770,19 @@ fn render_ribbon(
     );
 }
 
+/// Render a `LayoutNode` tree into `area`.
+///
+/// `focus_pane` is the currently focused `PaneId`; leaves matching it receive
+/// the focus border.  `pane_slot` maps `PaneId → slot_idx` for O(1) lookup.
+/// `current_path` tracks the tree path for drag-resize boundary records.
 #[allow(clippy::too_many_arguments)]
 fn render_layout(
     frame: &mut ratatui::Frame,
     area: Rect,
     node: &LayoutNode,
     slots: &mut Vec<Option<PaneSlot>>,
-    focus_path: &[usize],
+    focus_pane: PaneId,
+    pane_slot: &HashMap<PaneId, usize>,
     current_path: &mut Vec<usize>,
     boundaries: &mut Vec<SplitBoundary>,
     selection: Option<&Selection>,
@@ -1808,22 +1792,24 @@ fn render_layout(
     theme: &theme::LegacyTheme,
 ) {
     match node {
-        LayoutNode::Leaf(slot_idx) => {
-            if let Some(slot) = slots[*slot_idx].as_mut() {
-                let focused = current_path == focus_path;
-                let attention = pane_needs_attention(panes_meta, slot.pane_id);
-                render_pane(
-                    frame,
-                    area,
-                    slot,
-                    focused,
-                    selection,
-                    *slot_idx,
-                    pending_resizes,
-                    anim_frame,
-                    attention,
-                    theme,
-                );
+        LayoutNode::Leaf(pane_id) => {
+            if let Some(&slot_idx) = pane_slot.get(pane_id) {
+                if let Some(slot) = slots.get_mut(slot_idx).and_then(|s| s.as_mut()) {
+                    let focused = *pane_id == focus_pane;
+                    let attention = pane_needs_attention(panes_meta, slot.pane_id);
+                    render_pane(
+                        frame,
+                        area,
+                        slot,
+                        focused,
+                        selection,
+                        slot_idx,
+                        pending_resizes,
+                        anim_frame,
+                        attention,
+                        theme,
+                    );
+                }
             }
         }
         LayoutNode::HSplit(children) => {
@@ -1853,7 +1839,8 @@ fn render_layout(
                     *rect,
                     child,
                     slots,
-                    focus_path,
+                    focus_pane,
+                    pane_slot,
                     current_path,
                     boundaries,
                     selection,
@@ -1892,7 +1879,8 @@ fn render_layout(
                     *rect,
                     child,
                     slots,
-                    focus_path,
+                    focus_pane,
+                    pane_slot,
                     current_path,
                     boundaries,
                     selection,
@@ -2624,15 +2612,11 @@ fn draw_frame(
 
         // Render active tab's layout in the remaining area.
         let active_tab_idx = state.sessions[state.active_session].active_tab;
-        let focus_path = state.sessions[state.active_session].tabs[active_tab_idx]
-            .focus_path
-            .clone();
-        let zoomed = state.sessions[state.active_session].tabs[active_tab_idx]
-            .zoomed
-            .clone();
+        let focus_pane_id = state.sessions[state.active_session].tabs[active_tab_idx].focus_pane;
+        let zoomed = state.sessions[state.active_session].tabs[active_tab_idx].zoomed;
         let mut new_boundaries: Vec<SplitBoundary> = Vec::new();
 
-        // SAFETY: we only borrow root/zoomed via a raw pointer to avoid the
+        // SAFETY: we only borrow root via a raw pointer to avoid the
         // simultaneous mutable borrow of slots. render_layout only reads `root`
         // and mutates `slots` at disjoint indices; no mutation of `tabs` occurs.
         let root_ptr: *const LayoutNode =
@@ -2641,9 +2625,12 @@ fn draw_frame(
         let anim_frame = state.anim.frame();
         let panes_meta = state.sidebar_data.as_slice();
 
-        if let Some(ref zoom_path) = zoomed {
-            // Zoom mode: render only the zoomed leaf filling pane_body_area.
-            if let Some(slot_idx) = slot_at(unsafe { &*root_ptr }, zoom_path) {
+        // Build pane_slot map once per frame for O(1) lookups in render_layout.
+        let pane_slot_map = build_pane_slot_map(&state.slots);
+
+        if let Some(zoom_pane) = zoomed {
+            // Zoom mode: render only the zoomed pane filling pane_body_area.
+            if let Some(&slot_idx) = pane_slot_map.get(&zoom_pane) {
                 if let Some(slot) = state.slots[slot_idx].as_mut() {
                     let attention = pane_needs_attention(panes_meta, slot.pane_id);
                     render_pane(
@@ -2667,7 +2654,8 @@ fn draw_frame(
                 pane_body_area,
                 unsafe { &*root_ptr },
                 &mut state.slots,
-                &focus_path,
+                focus_pane_id,
+                &pane_slot_map,
                 &mut current_path,
                 &mut new_boundaries,
                 state.selection.as_ref(),
@@ -2683,7 +2671,7 @@ fn draw_frame(
         {
             let sv = &state.sessions[state.active_session];
             let tab = &sv.tabs[sv.active_tab];
-            let focused_slot = slot_at(&tab.root, &tab.focus_path);
+            let focused_slot = focused_slot_idx(tab.focus_pane, &state.slots);
             let is_zoomed = tab.zoomed.is_some();
 
             // Determine mode label and mid message.
@@ -2805,10 +2793,10 @@ fn draw_frame(
             // No blocking overlay: propagate vt100 cursor from focused pane.
             let sv = &state.sessions[state.active_session];
             let tab = &sv.tabs[sv.active_tab];
-            let focused_slot_idx = if let Some(ref zoom_path) = tab.zoomed {
-                slot_at(&tab.root, zoom_path)
+            let focused_slot_idx = if let Some(zoom_pane) = tab.zoomed {
+                focused_slot_idx(zoom_pane, &state.slots)
             } else {
-                slot_at(&tab.root, &tab.focus_path)
+                focused_slot_idx(tab.focus_pane, &state.slots)
             };
             if let Some(slot_idx) = focused_slot_idx {
                 if let Some(slot) = state.slots[slot_idx].as_ref() {
@@ -2841,95 +2829,83 @@ fn draw_frame(
 /// Cycle focus to the next leaf (DFS order), wrapping around.
 /// `slots` is passed so dead/None leaves can be skipped.
 fn focus_next(tab: &mut Tab, slots: &[Option<PaneSlot>], forward: bool) {
-    let mut all_paths: Vec<Vec<usize>> = Vec::new();
-    let mut tmp: Vec<usize> = Vec::new();
-    leaves_in_order(&tab.root, &mut tmp, &mut all_paths);
-
-    // Filter to only live (non-None) leaves.
-    let live_paths: Vec<Vec<usize>> = all_paths
+    // Collect all PaneIds in DFS order, filtering to live slots only.
+    let live_panes: Vec<PaneId> = pane_leaves_in_order(&tab.root)
         .into_iter()
-        .filter(|p| {
-            slot_at(&tab.root, p)
-                .and_then(|idx| slots.get(idx))
+        .filter(|&pid| {
+            pane_to_slot_idx(slots, pid)
+                .and_then(|i| slots.get(i))
                 .and_then(|s| s.as_ref())
                 .is_some()
         })
         .collect();
 
-    if live_paths.is_empty() {
+    if live_panes.is_empty() {
         return;
     }
 
-    let current_pos = live_paths
+    let current_pos = live_panes
         .iter()
-        .position(|p| p == &tab.focus_path)
+        .position(|&p| p == tab.focus_pane)
         .unwrap_or(0);
 
     let next_pos = if forward {
-        (current_pos + 1) % live_paths.len()
+        (current_pos + 1) % live_panes.len()
     } else {
-        (current_pos + live_paths.len() - 1) % live_paths.len()
+        (current_pos + live_panes.len() - 1) % live_panes.len()
     };
 
-    tab.focus_path = live_paths[next_pos].clone();
+    tab.focus_pane = live_panes[next_pos];
 }
 
 /// Split the active leaf. `horizontal` = true means HSplit (top/bottom).
+/// M7-D: delegates to `open_pane_split` RPC; daemon owns layout.
+/// Local layout is updated optimistically via `split_focused`; the daemon's
+/// `LayoutChanged` event will reconcile on the next broadcast poll.
 async fn split_active(state: &mut AppState, horizontal: bool) -> Result<()> {
     let (term_cols, term_rows) = term_size();
     let (cols, rows) = compute_pane_inner_size(term_cols, term_rows);
     let session_id = state.active_session_id();
-    let req = OpenPaneReq {
-        session: session_id,
-        shell: state.shell.clone(),
-        cwd: std::env::current_dir().ok(),
-        cols,
-        rows,
-        env: std::env::vars().collect(),
+
+    // Determine focused pane to split.
+    let focused_pane = {
+        let sv = state.active_session_view_mut();
+        let tab = &mut sv.tabs[sv.active_tab];
+        tab.zoomed = None; // clear zoom before splitting
+        tab.focus_pane
+    };
+
+    // Call open_pane_split — daemon spawns PTY and updates its layout tree.
+    let orient = if horizontal {
+        Orient::Horizontal
+    } else {
+        Orient::Vertical
+    };
+    let req = OpenPaneSplitReq {
+        parent_pane: focused_pane,
+        orient,
         name: None,
+        cwd: std::env::current_dir().ok(),
+        cmd: None,
     };
     let new_pane_id = state
         .control
-        .open_pane(tarpc::context::current(), req)
+        .open_pane_split(tarpc::context::current(), req)
         .await
         .context("rpc transport")?
-        .map_err(|e| anyhow!("daemon open_pane: {e}"))?;
+        .map_err(|e| anyhow!("daemon open_pane_split: {e}"))?;
 
+    // Attach the new pane stream locally.
     let slot = attach_pane(&state.socket, session_id, new_pane_id, cols, rows).await?;
-    let new_slot_idx = state.slots.len();
     state.slots.push(Some(slot));
 
+    // Optimistic local layout update: split focused leaf 50/50 in the tab tree.
     let sv = state.active_session_view_mut();
     let tab = &mut sv.tabs[sv.active_tab];
-    // Clear zoom before splitting.
-    tab.zoomed = None;
-    let old_path = tab.focus_path.clone();
+    tab.root.split_focused(&focused_pane, new_pane_id, orient);
 
-    // Find the existing leaf slot index at the current focus path.
-    let old_slot_idx = match slot_at(&tab.root, &old_path) {
-        Some(idx) => idx,
-        None => return Ok(()), // nothing to split
-    };
-
-    // Equal 50/50 weights for a two-child split.
-    let new_node = if horizontal {
-        LayoutNode::HSplit(vec![
-            (LayoutNode::Leaf(old_slot_idx), 50),
-            (LayoutNode::Leaf(new_slot_idx), 50),
-        ])
-    } else {
-        LayoutNode::VSplit(vec![
-            (LayoutNode::Leaf(old_slot_idx), 50),
-            (LayoutNode::Leaf(new_slot_idx), 50),
-        ])
-    };
-
-    replace_at(&mut tab.root, &old_path, new_node);
-
-    // New focus: append child index 1 to old path to point at the new leaf.
-    let mut new_focus = old_path;
-    new_focus.push(1);
-    tab.focus_path = new_focus;
+    // Move focus to the new pane.
+    tab.focus_pane = new_pane_id;
 
     Ok(())
 }
@@ -2957,7 +2933,6 @@ async fn open_new_tab(state: &mut AppState, label: Option<String>) -> Result<()>
         .map_err(|e| anyhow!("daemon open_pane: {e}"))?;
 
     let slot = attach_pane(&state.socket, session_id, new_pane_id, cols, rows).await?;
-    let slot_idx = state.slots.len();
     state.slots.push(Some(slot));
 
     let sv = state.active_session_view_mut();
@@ -2966,8 +2941,8 @@ async fn open_new_tab(state: &mut AppState, label: Option<String>) -> Result<()>
         .filter(|l| !l.is_empty())
         .unwrap_or_else(|| format!("tab-{tab_n}"));
     sv.tabs.push(Tab {
-        root: LayoutNode::Leaf(slot_idx),
-        focus_path: vec![],
+        root: LayoutNode::Leaf(new_pane_id),
+        focus_pane: new_pane_id,
         zoomed: None,
         boundaries: Vec::new(),
         drag: None,
@@ -2998,7 +2973,6 @@ async fn open_new_session(state: &mut AppState, name: Option<String>) -> Result<
         .map_err(|e| anyhow!("daemon spawn: {e}"))?;
 
     let slot = attach_pane(&state.socket, session, pane, cols, rows).await?;
-    let slot_idx = state.slots.len();
     state.slots.push(Some(slot));
 
     // Derive display name: use provided or fall back to session-<short8>.
@@ -3009,8 +2983,8 @@ async fn open_new_session(state: &mut AppState, name: Option<String>) -> Result<
         id: session,
         name: display_name,
         tabs: vec![Tab {
-            root: LayoutNode::Leaf(slot_idx),
-            focus_path: vec![],
+            root: LayoutNode::Leaf(pane),
+            focus_pane: pane,
             zoomed: None,
             boundaries: Vec::new(),
             drag: None,
@@ -3159,13 +3133,15 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
                 }
             }
             let sv = &state.sessions[state.active_session];
-            let mut leaf_rects: Vec<(usize, Rect)> = Vec::new();
+            let mut leaf_rects: Vec<(PaneId, Rect)> = Vec::new();
             collect_leaf_rects(&sv.tabs[sv.active_tab].root, body_area, &mut leaf_rects);
-            for (slot_idx, rect) in &leaf_rects {
+            for (pane_id, rect) in &leaf_rects {
                 if rect_contains(*rect, col, row) {
-                    focus_slot(state, *slot_idx);
-                    if let Some(slot) = state.slots[*slot_idx].as_mut() {
-                        slot.scroll_offset = (slot.scroll_offset + 3).min(slot.scrollback_capacity);
+                    if let Some(slot_idx) = pane_to_slot_idx(&state.slots, *pane_id) {
+                        focus_slot(state, slot_idx);
+                        if let Some(slot) = state.slots[slot_idx].as_mut() {
+                            slot.scroll_offset = (slot.scroll_offset + 3).min(slot.scrollback_capacity);
+                        }
                     }
                     return true;
                 }
@@ -3186,13 +3162,15 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
                 }
             }
             let sv = &state.sessions[state.active_session];
-            let mut leaf_rects: Vec<(usize, Rect)> = Vec::new();
+            let mut leaf_rects: Vec<(PaneId, Rect)> = Vec::new();
             collect_leaf_rects(&sv.tabs[sv.active_tab].root, body_area, &mut leaf_rects);
-            for (slot_idx, rect) in &leaf_rects {
+            for (pane_id, rect) in &leaf_rects {
                 if rect_contains(*rect, col, row) {
-                    focus_slot(state, *slot_idx);
-                    if let Some(slot) = state.slots[*slot_idx].as_mut() {
-                        slot.scroll_offset = slot.scroll_offset.saturating_sub(3);
+                    if let Some(slot_idx) = pane_to_slot_idx(&state.slots, *pane_id) {
+                        focus_slot(state, slot_idx);
+                        if let Some(slot) = state.slots[slot_idx].as_mut() {
+                            slot.scroll_offset = slot.scroll_offset.saturating_sub(3);
+                        }
                     }
                     return true;
                 }
@@ -3208,24 +3186,26 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
             // Find the pane under the cursor (body only).
             if row >= 2 {
                 let sv = &state.sessions[state.active_session];
-                let mut leaf_rects: Vec<(usize, Rect)> = Vec::new();
+                let mut leaf_rects: Vec<(PaneId, Rect)> = Vec::new();
                 collect_leaf_rects(&sv.tabs[sv.active_tab].root, body_area, &mut leaf_rects);
-                for (slot_idx, rect) in &leaf_rects {
+                for (pane_id, rect) in &leaf_rects {
                     if rect_contains(*rect, col, row) {
-                        focus_slot(state, *slot_idx);
-                        let max_label = MENU_ITEMS
-                            .iter()
-                            .map(|i| i.label().len())
-                            .max()
-                            .unwrap_or(10) as u16;
-                        let w = max_label + 4;
-                        let h = MENU_ITEMS.len() as u16 + 2;
-                        state.context_menu = Some(ContextMenu {
-                            rect: Rect::new(col, row, w, h),
-                            cursor: 0,
-                            target_slot: *slot_idx,
-                            item_rects: Vec::new(),
-                        });
+                        if let Some(slot_idx) = pane_to_slot_idx(&state.slots, *pane_id) {
+                            focus_slot(state, slot_idx);
+                            let max_label = MENU_ITEMS
+                                .iter()
+                                .map(|i| i.label().len())
+                                .max()
+                                .unwrap_or(10) as u16;
+                            let w = max_label + 4;
+                            let h = MENU_ITEMS.len() as u16 + 2;
+                            state.context_menu = Some(ContextMenu {
+                                rect: Rect::new(col, row, w, h),
+                                cursor: 0,
+                                target_slot: slot_idx,
+                                item_rects: Vec::new(),
+                            });
+                        }
                         return true;
                     }
                 }
@@ -3290,7 +3270,7 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
                             let slot_idx = {
                                 let sv = &state.sessions[state.active_session];
                                 let tab = &sv.tabs[*tab_idx];
-                                slot_at(&tab.root, &tab.focus_path)
+                                focused_slot_idx(tab.focus_pane, &state.slots)
                             };
                             if let Some(si) = slot_idx {
                                 close_pane_by_slot_idx(state, si);
@@ -3402,21 +3382,15 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
                         state.sidebar_focused = true;
                         // Focus the pane if it is loaded in the active tab.
                         let target_pane_id = state.sidebar_data[row_idx].id;
-                        let sv = &state.sessions[state.active_session];
-                        let tab = &sv.tabs[sv.active_tab];
-                        let mut paths: Vec<Vec<usize>> = Vec::new();
-                        let mut tmp: Vec<usize> = Vec::new();
-                        leaves_in_order(&tab.root, &mut tmp, &mut paths);
-                        let found_path = paths.into_iter().find(|p| {
-                            slot_at(&tab.root, p)
-                                .and_then(|i| state.slots[i].as_ref())
-                                .map(|s| s.pane_id == target_pane_id)
-                                .unwrap_or(false)
-                        });
-                        if let Some(path) = found_path {
+                        let pane_in_tab = {
+                            let sv = &state.sessions[state.active_session];
+                            let tab = &sv.tabs[sv.active_tab];
+                            pane_leaves_in_order(&tab.root).contains(&target_pane_id)
+                        };
+                        if pane_in_tab {
                             let sv = &mut state.sessions[state.active_session];
                             let tab = &mut sv.tabs[sv.active_tab];
-                            tab.focus_path = path;
+                            tab.focus_pane = target_pane_id;
                         }
                     }
                     return true;
@@ -3425,9 +3399,13 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
 
             // Check if clicking inside a leaf pane (ribbon chips + text selection).
             let sv = &state.sessions[state.active_session];
-            let mut leaf_rects: Vec<(usize, Rect)> = Vec::new();
+            let mut leaf_rects: Vec<(PaneId, Rect)> = Vec::new();
             collect_leaf_rects(&sv.tabs[sv.active_tab].root, body_area, &mut leaf_rects);
-            for (slot_idx, rect) in leaf_rects.clone() {
+            let leaf_rects_with_slots: Vec<(usize, Rect)> = leaf_rects
+                .iter()
+                .filter_map(|(pid, r)| pane_to_slot_idx(&state.slots, *pid).map(|i| (i, *r)))
+                .collect();
+            for (slot_idx, rect) in leaf_rects_with_slots {
                 if rect_contains(rect, col, row) {
                     focus_slot(state, slot_idx);
 
@@ -3768,33 +3746,18 @@ async fn apply_focus_request(state: &mut AppState) {
     }
 }
 
-/// Update active session's active tab focus_path to point at the given slot index.
+/// Update active session's active tab focus_pane to point at the given slot index.
 fn focus_slot(state: &mut AppState, target_slot_idx: usize) {
-    // Collect candidate paths first to avoid simultaneous borrow of sessions + slots.
-    let all_paths = {
-        let sv = &state.sessions[state.active_session];
-        let tab = &sv.tabs[sv.active_tab];
-        let mut paths: Vec<Vec<usize>> = Vec::new();
-        let mut tmp: Vec<usize> = Vec::new();
-        leaves_in_order(&tab.root, &mut tmp, &mut paths);
-        paths
+    // Find the PaneId for this slot and check it exists in the active tab.
+    let target_pane_id = match state.slots.get(target_slot_idx).and_then(|s| s.as_ref()) {
+        Some(slot) => slot.pane_id,
+        None => return,
     };
-    let chosen = {
-        let sv = &state.sessions[state.active_session];
-        let tab = &sv.tabs[sv.active_tab];
-        all_paths.into_iter().find(|path| {
-            slot_at(&tab.root, path)
-                .map(|idx| {
-                    idx == target_slot_idx
-                        && state.slots.get(idx).and_then(|s| s.as_ref()).is_some()
-                })
-                .unwrap_or(false)
-        })
-    };
-    if let Some(path) = chosen {
+    let sv = &state.sessions[state.active_session];
+    let tab = &sv.tabs[sv.active_tab];
+    if pane_leaves_in_order(&tab.root).contains(&target_pane_id) {
         let sv = &mut state.sessions[state.active_session];
-        let tab = &mut sv.tabs[sv.active_tab];
-        tab.focus_path = path;
+        sv.tabs[sv.active_tab].focus_pane = target_pane_id;
     }
 }
 
@@ -3802,86 +3765,12 @@ fn focus_slot(state: &mut AppState, target_slot_idx: usize) {
 // Pane close / layout collapse
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Remove the leaf at `leaf_path` from the layout tree, collapsing the parent
-/// split if it becomes a single child.  Returns the slot index that was removed.
-fn remove_leaf(root: &mut LayoutNode, leaf_path: &[usize]) -> Option<usize> {
-    if leaf_path.is_empty() {
-        // Root is a Leaf — replace with a sentinel; caller handles.
-        if let LayoutNode::Leaf(idx) = root {
-            return Some(*idx);
-        }
-        return None;
-    }
-
-    let parent_path = &leaf_path[..leaf_path.len() - 1];
-    let child_idx = leaf_path[leaf_path.len() - 1];
-
-    // Navigate to parent, remove child, collapse if single child remains.
-    fn remove_in(node: &mut LayoutNode, path: &[usize], child_idx: usize) -> Option<usize> {
-        if path.is_empty() {
-            let removed = match node {
-                LayoutNode::HSplit(children) | LayoutNode::VSplit(children) => {
-                    if child_idx >= children.len() {
-                        return None;
-                    }
-                    let removed_slot = match &children[child_idx].0 {
-                        LayoutNode::Leaf(idx) => *idx,
-                        _ => return None, // only remove leaves
-                    };
-                    children.remove(child_idx);
-                    // Re-normalize weights to sum to 100.
-                    let n = children.len() as u16;
-                    if let Some(each) = 100u16.checked_div(n) {
-                        let remainder = 100 - each * n;
-                        for (i, (_, w)) in children.iter_mut().enumerate() {
-                            *w = each + if i == 0 { remainder } else { 0 };
-                        }
-                    }
-                    Some(removed_slot)
-                }
-                _ => None,
-            };
-            // Collapse single-child split into its child.
-            let collapse = match node {
-                LayoutNode::HSplit(children) | LayoutNode::VSplit(children) => children.len() == 1,
-                _ => false,
-            };
-            if collapse {
-                let child = match node {
-                    LayoutNode::HSplit(children) | LayoutNode::VSplit(children) => {
-                        children.remove(0).0
-                    }
-                    _ => unreachable!(),
-                };
-                *node = child;
-            }
-            return removed;
-        }
-        match node {
-            LayoutNode::HSplit(children) | LayoutNode::VSplit(children) => {
-                if path[0] >= children.len() {
-                    return None;
-                }
-                remove_in(&mut children[path[0]].0, &path[1..], child_idx)
-            }
-            _ => None,
-        }
-    }
-
-    remove_in(root, parent_path, child_idx)
-}
-
-/// Locate the (session_idx, tab_idx, leaf_path) for a given slot index.
-fn locate_slot(state: &AppState, target: usize) -> Option<(usize, usize, Vec<usize>)> {
+/// Locate the (session_idx, tab_idx) for a given PaneId.
+fn locate_pane(state: &AppState, target_pane: PaneId) -> Option<(usize, usize)> {
     for (si, sess) in state.sessions.iter().enumerate() {
         for (ti, tab) in sess.tabs.iter().enumerate() {
-            let mut paths: Vec<Vec<usize>> = Vec::new();
-            let mut tmp: Vec<usize> = Vec::new();
-            leaves_in_order(&tab.root, &mut tmp, &mut paths);
-            for path in paths {
-                if slot_at(&tab.root, &path) == Some(target) {
-                    return Some((si, ti, path));
-                }
+            if pane_leaves_in_order(&tab.root).contains(&target_pane) {
+                return Some((si, ti));
             }
         }
     }
@@ -3890,96 +3779,44 @@ fn locate_slot(state: &AppState, target: usize) -> Option<(usize, usize, Vec<usi
 
 /// Close a pane by its slot index.
 /// Removes the leaf from the layout tree, drops the slot, cascades tab/session removal.
+/// Uses `LayoutNode::close` from pyre-proto which handles collapse logic.
 fn close_pane_by_slot_idx(state: &mut AppState, slot_idx: usize) {
-    let (sess_idx, tab_idx, focus_path) = match locate_slot(state, slot_idx) {
+    // Resolve pane_id from the slot.
+    let pane_id = match state.slots.get(slot_idx).and_then(|s| s.as_ref()) {
+        Some(slot) => slot.pane_id,
+        None => return,
+    };
+
+    let (sess_idx, tab_idx) = match locate_pane(state, pane_id) {
         Some(loc) => loc,
         None => return,
     };
 
-    // Extract the pane_id before we drop the slot so we can fire the close RPC.
-    let pane_id = state
-        .slots
-        .get(slot_idx)
-        .and_then(|s| s.as_ref())
-        .map(|s| s.pane_id);
-
     // Fire close_pane RPC fire-and-forget so the daemon evicts the pane.
-    if let Some(pid) = pane_id {
+    {
         let client = state.control.clone();
         tokio::runtime::Handle::current().spawn(async move {
-            let _ = client.close_pane(tarpc::context::current(), pid).await;
+            let _ = client.close_pane(tarpc::context::current(), pane_id).await;
         });
     }
 
-    // Special case: root itself is the only leaf (no splits).  remove_leaf
-    // returns the slot index but cannot mutate root in this case, so
-    // leaves_in_order would still find the leaf and the tab-removal branch
-    // would never fire.  Bypass remove_leaf and go straight to tab removal.
-    let root_is_leaf = focus_path.is_empty()
-        && matches!(
-            &state.sessions[sess_idx].tabs[tab_idx].root,
-            LayoutNode::Leaf(_)
-        );
-
-    if root_is_leaf {
-        if slot_idx < state.slots.len() {
-            state.slots[slot_idx] = None;
-        }
-        state.sessions[sess_idx].tabs.remove(tab_idx);
-        if state.sessions[sess_idx].tabs.is_empty() {
-            state.sessions.remove(sess_idx);
-            if state.sessions.is_empty() {
-                return;
-            }
-            state.active_session = state.active_session.min(state.sessions.len() - 1);
-        } else {
-            state.sessions[sess_idx].active_tab =
-                tab_idx.min(state.sessions[sess_idx].tabs.len() - 1);
-            let new_tab_idx = state.sessions[sess_idx].active_tab;
-            let mut paths: Vec<Vec<usize>> = Vec::new();
-            let mut t: Vec<usize> = Vec::new();
-            leaves_in_order(
-                &state.sessions[sess_idx].tabs[new_tab_idx].root,
-                &mut t,
-                &mut paths,
-            );
-            state.sessions[sess_idx].tabs[new_tab_idx].focus_path =
-                paths.into_iter().next().unwrap_or_default();
-        }
-        return;
-    }
-
-    // Remove the leaf from the layout tree.
-    let removed = remove_leaf(
-        &mut state.sessions[sess_idx].tabs[tab_idx].root,
-        &focus_path,
-    );
-    if removed.is_none() {
-        return;
-    }
+    // Use proto's LayoutNode::close which handles collapse of single-child splits.
+    let new_focus_pane = state.sessions[sess_idx].tabs[tab_idx].root.close(&pane_id);
 
     // Drop the slot.
     if slot_idx < state.slots.len() {
         state.slots[slot_idx] = None;
     }
 
-    // Check if the tab now has no leaves.
-    let mut remaining_paths: Vec<Vec<usize>> = Vec::new();
-    let mut tmp: Vec<usize> = Vec::new();
-    leaves_in_order(
-        &state.sessions[sess_idx].tabs[tab_idx].root,
-        &mut tmp,
-        &mut remaining_paths,
-    );
+    let remaining = pane_leaves_in_order(&state.sessions[sess_idx].tabs[tab_idx].root);
 
-    if remaining_paths.is_empty() {
+    if remaining.is_empty() {
         // Tab is empty — remove it.
         state.sessions[sess_idx].tabs.remove(tab_idx);
         if state.sessions[sess_idx].tabs.is_empty() {
             // Session has no tabs — remove session view.
             state.sessions.remove(sess_idx);
             if state.sessions.is_empty() {
-                // No sessions left — nothing to do; caller should exit.
                 return;
             }
             state.active_session = state.active_session.min(state.sessions.len() - 1);
@@ -3988,20 +3825,20 @@ fn close_pane_by_slot_idx(state: &mut AppState, slot_idx: usize) {
                 tab_idx.min(state.sessions[sess_idx].tabs.len() - 1);
             // Reset focus to first leaf of new active tab.
             let new_tab_idx = state.sessions[sess_idx].active_tab;
-            let mut paths: Vec<Vec<usize>> = Vec::new();
-            let mut t: Vec<usize> = Vec::new();
-            leaves_in_order(
+            if let Some(&first_pane) = pane_leaves_in_order(
                 &state.sessions[sess_idx].tabs[new_tab_idx].root,
-                &mut t,
-                &mut paths,
-            );
-            state.sessions[sess_idx].tabs[new_tab_idx].focus_path =
-                paths.into_iter().next().unwrap_or_default();
+            ).first() {
+                state.sessions[sess_idx].tabs[new_tab_idx].focus_pane = first_pane;
+            }
         }
     } else {
-        // Tab still has leaves — point focus at first remaining leaf.
-        let new_focus = remaining_paths.into_iter().next().unwrap_or_default();
-        state.sessions[sess_idx].tabs[tab_idx].focus_path = new_focus;
+        // Tab still has leaves — move focus to the suggested pane or first remaining.
+        let focus = new_focus_pane
+            .filter(|p| remaining.contains(p))
+            .or_else(|| remaining.into_iter().next());
+        if let Some(fp) = focus {
+            state.sessions[sess_idx].tabs[tab_idx].focus_pane = fp;
+        }
         state.sessions[sess_idx].tabs[tab_idx].zoomed = None;
     }
 }
@@ -4010,8 +3847,8 @@ fn close_pane_by_slot_idx(state: &mut AppState, slot_idx: usize) {
 fn close_focused_pane(state: &mut AppState) {
     let sess_idx = state.active_session;
     let tab_idx = state.sessions[sess_idx].active_tab;
-    let focus_path = state.sessions[sess_idx].tabs[tab_idx].focus_path.clone();
-    if let Some(slot_idx) = slot_at(&state.sessions[sess_idx].tabs[tab_idx].root, &focus_path) {
+    let focus_pane = state.sessions[sess_idx].tabs[tab_idx].focus_pane;
+    if let Some(slot_idx) = focused_slot_idx(focus_pane, &state.slots) {
         close_pane_by_slot_idx(state, slot_idx);
     }
 }
@@ -4034,13 +3871,14 @@ fn initial_app_state(
     toast_deck: ToastDeck,
     toast_rx: mpsc::Receiver<Toast>,
 ) -> AppState {
+    let initial_pane_id = initial_slot.pane_id;
     AppState {
         sessions: vec![SessionView {
             id: session,
             name: session_name,
             tabs: vec![Tab {
-                root: LayoutNode::Leaf(0),
-                focus_path: vec![],
+                root: LayoutNode::Leaf(initial_pane_id),
+                focus_pane: initial_pane_id,
                 zoomed: None,
                 boundaries: Vec::new(),
                 drag: None,
@@ -4317,14 +4155,14 @@ async fn run_tui(
                                 slot.recent_blocks = replay.recent;
                             }
                         }
-                        let slot_idx = state.slots.len();
+                        let eager_pane_id = p.id;
                         state.slots.push(Some(slot));
                         state.sessions.push(SessionView {
                             id: info.id,
                             name: info.name,
                             tabs: vec![Tab {
-                                root: LayoutNode::Leaf(slot_idx),
-                                focus_path: vec![],
+                                root: LayoutNode::Leaf(eager_pane_id),
+                                focus_pane: eager_pane_id,
                                 zoomed: None,
                                 boundaries: Vec::new(),
                                 drag: None,
@@ -4512,14 +4350,13 @@ async fn run_tui(
                                 };
                                 match attach_pane(&state.socket, info.id, pane_id, sc, sr).await {
                                     Ok(slot) => {
-                                        let slot_idx = state.slots.len();
                                         state.slots.push(Some(slot));
                                         state.sessions.push(SessionView {
                                             id: info.id,
                                             name: info.name.clone(),
                                             tabs: vec![Tab {
-                                                root: LayoutNode::Leaf(slot_idx),
-                                                focus_path: vec![],
+                                                root: LayoutNode::Leaf(pane_id),
+                                                focus_pane: pane_id,
                                                 zoomed: None,
                                                 boundaries: Vec::new(),
                                                 drag: None,
@@ -4555,20 +4392,7 @@ async fn run_tui(
                     // Collect all pane IDs currently tracked in this SessionView.
                     let local_pane_ids: Vec<PaneId> = {
                         let sv = &state.sessions[sv_idx];
-                        let mut ids = Vec::new();
-                        for tab in &sv.tabs {
-                            let mut tmp = Vec::new();
-                            let mut paths: Vec<Vec<usize>> = Vec::new();
-                            leaves_in_order(&tab.root, &mut tmp, &mut paths);
-                            for path in &paths {
-                                if let Some(slot_idx) = slot_at(&tab.root, path) {
-                                    if let Some(Some(slot)) = state.slots.get(slot_idx) {
-                                        ids.push(slot.pane_id);
-                                    }
-                                }
-                            }
-                        }
-                        ids
+                        sv.tabs.iter().flat_map(|tab| pane_leaves_in_order(&tab.root)).collect()
                     };
 
                     // Ask daemon which panes belong to this session.
@@ -4592,22 +4416,22 @@ async fn run_tui(
                         };
                         match attach_pane(&state.socket, info.id, pane_info.id, pc, pr).await {
                             Ok(slot) => {
-                                let slot_idx = state.slots.len();
+                                let synced_pane_id = pane_info.id;
                                 state.slots.push(Some(slot));
                                 // Add as a new tab in the existing session, mirroring
                                 // open_new_tab's plumbing (new leaf, no split).
                                 let sv = &mut state.sessions[sv_idx];
                                 let tab_n = sv.tabs.len() + 1;
                                 sv.tabs.push(Tab {
-                                    root: LayoutNode::Leaf(slot_idx),
-                                    focus_path: vec![],
+                                    root: LayoutNode::Leaf(synced_pane_id),
+                                    focus_pane: synced_pane_id,
                                     zoomed: None,
                                     boundaries: Vec::new(),
                                     drag: None,
                                 });
                                 tracing::info!(
                                     "pane-sync: attached new pane {} to session {} as tab-{}",
-                                    pane_info.id,
+                                    synced_pane_id,
                                     info.id,
                                     tab_n,
                                 );
@@ -4630,15 +4454,10 @@ async fn run_tui(
                         let sv = &state.sessions[sv_idx];
                         let mut to_drop = Vec::new();
                         for tab in &sv.tabs {
-                            let mut tmp = Vec::new();
-                            let mut paths: Vec<Vec<usize>> = Vec::new();
-                            leaves_in_order(&tab.root, &mut tmp, &mut paths);
-                            for path in &paths {
-                                if let Some(slot_idx) = slot_at(&tab.root, path) {
-                                    if let Some(Some(slot)) = state.slots.get(slot_idx) {
-                                        if !daemon_ids_for_session.contains(&slot.pane_id) {
-                                            to_drop.push(slot_idx);
-                                        }
+                            for pid in pane_leaves_in_order(&tab.root) {
+                                if !daemon_ids_for_session.contains(&pid) {
+                                    if let Some(idx) = pane_to_slot_idx(&state.slots, pid) {
+                                        to_drop.push(idx);
                                     }
                                 }
                             }
@@ -4751,21 +4570,14 @@ async fn run_tui(
                                 let hit = &state.search.results[idx];
                                 let target_pane = hit.block.pane;
                                 let target_block = hit.block.id;
-                                type JumpTarget = (usize, usize, Vec<usize>, usize);
+                                type JumpTarget = (usize, usize, PaneId, usize);
                                 let mut jump: Option<JumpTarget> = None;
                                 'search_jump: for (si, sv) in state.sessions.iter().enumerate() {
                                     for (ti, tab) in sv.tabs.iter().enumerate() {
-                                        let mut paths: Vec<Vec<usize>> = Vec::new();
-                                        let mut tmp: Vec<usize> = Vec::new();
-                                        leaves_in_order(&tab.root, &mut tmp, &mut paths);
-                                        for p in &paths {
-                                            if let Some(idx2) = slot_at(&tab.root, p) {
-                                                if state.slots[idx2]
-                                                    .as_ref()
-                                                    .map(|s| s.pane_id == target_pane)
-                                                    .unwrap_or(false)
-                                                {
-                                                    jump = Some((si, ti, p.clone(), idx2));
+                                        for pid in pane_leaves_in_order(&tab.root) {
+                                            if pid == target_pane {
+                                                if let Some(slot_idx) = pane_to_slot_idx(&state.slots, pid) {
+                                                    jump = Some((si, ti, pid, slot_idx));
                                                     if si == state.active_session {
                                                         break 'search_jump;
                                                     }
@@ -4774,10 +4586,10 @@ async fn run_tui(
                                         }
                                     }
                                 }
-                                if let Some((si, ti, path, slot_idx)) = jump {
+                                if let Some((si, ti, pane_id, slot_idx)) = jump {
                                     state.active_session = si;
                                     state.sessions[si].active_tab = ti;
-                                    state.sessions[si].tabs[ti].focus_path = path;
+                                    state.sessions[si].tabs[ti].focus_pane = pane_id;
                                     if let Some(c) = state.slots[slot_idx].as_ref().and_then(|s| {
                                         s.recent_blocks.iter().position(|b| b.id == target_block)
                                     }) {
@@ -4868,7 +4680,7 @@ async fn run_tui(
                                         if tab.zoomed.is_some() {
                                             tab.zoomed = None;
                                         } else {
-                                            tab.zoomed = Some(tab.focus_path.clone());
+                                            tab.zoomed = Some(tab.focus_pane);
                                         }
                                     }
                                     MenuItem::InspectPid => {
@@ -4902,7 +4714,7 @@ async fn run_tui(
                             // handler in the key path.
                             let sv = &state.sessions[state.active_session];
                             let tab = &sv.tabs[sv.active_tab];
-                            if let Some(slot_idx) = slot_at(&tab.root, &tab.focus_path) {
+                            if let Some(slot_idx) = focused_slot_idx(tab.focus_pane, &state.slots) {
                                 if let Some(slot) = state.slots[slot_idx].as_ref() {
                                     if let Some(cursor) = slot.ribbon_cursor {
                                         if let Some(block) = slot.recent_blocks.get(cursor) {
@@ -5116,7 +4928,7 @@ async fn run_tui(
                                         if tab.zoomed.is_some() {
                                             tab.zoomed = None;
                                         } else {
-                                            tab.zoomed = Some(tab.focus_path.clone());
+                                            tab.zoomed = Some(tab.focus_pane);
                                         }
                                     }
                                     MenuItem::InspectPid => {
@@ -5293,7 +5105,7 @@ async fn run_tui(
                         KeyCode::Char('[') => {
                             let sv = &state.sessions[state.active_session];
                             let tab = &sv.tabs[sv.active_tab];
-                            if let Some(slot_idx) = slot_at(&tab.root, &tab.focus_path) {
+                            if let Some(slot_idx) = focused_slot_idx(tab.focus_pane, &state.slots) {
                                 if let Some(slot) = state.slots[slot_idx].as_mut() {
                                     let last = slot.recent_blocks.len().saturating_sub(1);
                                     slot.ribbon_cursor = Some(last);
@@ -5305,7 +5117,7 @@ async fn run_tui(
                         KeyCode::Char(']') => {
                             let sv = &state.sessions[state.active_session];
                             let tab = &sv.tabs[sv.active_tab];
-                            if let Some(slot_idx) = slot_at(&tab.root, &tab.focus_path) {
+                            if let Some(slot_idx) = focused_slot_idx(tab.focus_pane, &state.slots) {
                                 if let Some(slot) = state.slots[slot_idx].as_mut() {
                                     slot.ribbon_cursor = None;
                                 }
@@ -5330,7 +5142,7 @@ async fn run_tui(
                             if tab.zoomed.is_some() {
                                 tab.zoomed = None;
                             } else {
-                                tab.zoomed = Some(tab.focus_path.clone());
+                                tab.zoomed = Some(tab.focus_pane);
                             }
                         }
 
@@ -5338,7 +5150,7 @@ async fn run_tui(
                         KeyCode::Char('y') => {
                             let sv = &state.sessions[state.active_session];
                             let tab = &sv.tabs[sv.active_tab];
-                            if let Some(slot_idx) = slot_at(&tab.root, &tab.focus_path) {
+                            if let Some(slot_idx) = focused_slot_idx(tab.focus_pane, &state.slots) {
                                 if let Some(slot) = state.slots[slot_idx].as_ref() {
                                     if let Some(last_block) = slot.recent_blocks.last() {
                                         let block_id = last_block.id;
@@ -5467,39 +5279,27 @@ async fn run_tui(
 
                                 // Search all sessions + tabs for a loaded pane matching
                                 // target_pane. Prefer the current session; fall back to others.
-                                // Returns (session_idx, tab_idx, focus_path, slot_idx).
-                                type JumpTarget = (usize, usize, Vec<usize>, usize);
+                                type JumpTarget = (usize, usize, PaneId, usize);
                                 let mut jump: Option<JumpTarget> = None;
                                 'outer: for (si, sv) in state.sessions.iter().enumerate() {
                                     for (ti, tab) in sv.tabs.iter().enumerate() {
-                                        let mut paths: Vec<Vec<usize>> = Vec::new();
-                                        let mut tmp: Vec<usize> = Vec::new();
-                                        leaves_in_order(&tab.root, &mut tmp, &mut paths);
-                                        for p in &paths {
-                                            if let Some(idx) = slot_at(&tab.root, p) {
-                                                if state.slots[idx]
-                                                    .as_ref()
-                                                    .map(|s| s.pane_id == target_pane)
-                                                    .unwrap_or(false)
-                                                {
-                                                    jump = Some((si, ti, p.clone(), idx));
-                                                    // If this is already the current session,
-                                                    // stop searching — no better match exists.
+                                        for pid in pane_leaves_in_order(&tab.root) {
+                                            if pid == target_pane {
+                                                if let Some(slot_idx) = pane_to_slot_idx(&state.slots, pid) {
+                                                    jump = Some((si, ti, pid, slot_idx));
                                                     if si == state.active_session {
                                                         break 'outer;
                                                     }
-                                                    // Keep scanning in case the current session
-                                                    // also has this pane (unlikely but safe).
                                                 }
                                             }
                                         }
                                     }
                                 }
 
-                                if let Some((si, ti, path, slot_idx)) = jump {
+                                if let Some((si, ti, pane_id, slot_idx)) = jump {
                                     state.active_session = si;
                                     state.sessions[si].active_tab = ti;
-                                    state.sessions[si].tabs[ti].focus_path = path;
+                                    state.sessions[si].tabs[ti].focus_pane = pane_id;
                                     let maybe_cursor =
                                         state.slots[slot_idx].as_ref().and_then(|s| {
                                             s.recent_blocks
@@ -5556,19 +5356,14 @@ async fn run_tui(
                         KeyCode::Enter => {
                             if let Some(info) = state.sidebar_data.get(state.sidebar_cursor) {
                                 let target = info.id;
-                                let sv = &mut state.sessions[state.active_session];
-                                let tab = &mut sv.tabs[sv.active_tab];
-                                let mut all_paths: Vec<Vec<usize>> = Vec::new();
-                                let mut tmp: Vec<usize> = Vec::new();
-                                leaves_in_order(&tab.root, &mut tmp, &mut all_paths);
-                                let found = all_paths.iter().find(|p| {
-                                    slot_at(&tab.root, p)
-                                        .and_then(|i| state.slots[i].as_ref())
-                                        .map(|s| s.pane_id == target)
-                                        .unwrap_or(false)
-                                });
-                                if let Some(path) = found {
-                                    tab.focus_path = path.clone();
+                                let in_tab = {
+                                    let sv = &state.sessions[state.active_session];
+                                    let tab = &sv.tabs[sv.active_tab];
+                                    pane_leaves_in_order(&tab.root).contains(&target)
+                                };
+                                if in_tab {
+                                    let sv = &mut state.sessions[state.active_session];
+                                    sv.tabs[sv.active_tab].focus_pane = target;
                                     state.sidebar_focused = false;
                                     let _ = state
                                         .control
@@ -5593,7 +5388,7 @@ async fn run_tui(
                 {
                     let sv = &state.sessions[state.active_session];
                     let tab = &sv.tabs[sv.active_tab];
-                    if let Some(slot_idx) = slot_at(&tab.root, &tab.focus_path) {
+                    if let Some(slot_idx) = focused_slot_idx(tab.focus_pane, &state.slots) {
                         if let Some(slot) = state.slots[slot_idx].as_ref() {
                             if slot.ribbon_cursor.is_some() {
                                 match code {
@@ -5663,7 +5458,7 @@ async fn run_tui(
                 if mods == KeyModifiers::NONE {
                     let sv = &state.sessions[state.active_session];
                     let tab = &sv.tabs[sv.active_tab];
-                    if let Some(slot_idx) = slot_at(&tab.root, &tab.focus_path) {
+                    if let Some(slot_idx) = focused_slot_idx(tab.focus_pane, &state.slots) {
                         let half_page = (body_area.height / 2).max(1) as usize;
                         if let Some(slot) = state.slots[slot_idx].as_mut() {
                             match code {
@@ -5687,7 +5482,7 @@ async fn run_tui(
                 if let Some(bytes) = key_to_bytes(code, mods) {
                     let sv = &state.sessions[state.active_session];
                     let tab = &sv.tabs[sv.active_tab];
-                    if let Some(slot_idx) = slot_at(&tab.root, &tab.focus_path) {
+                    if let Some(slot_idx) = focused_slot_idx(tab.focus_pane, &state.slots) {
                         if let Some(slot) = state.slots[slot_idx].as_mut() {
                             slot.scroll_offset = 0;
                             let t0 = Instant::now();
@@ -5713,7 +5508,7 @@ async fn run_tui(
                 let bytes = bytes::Bytes::from(buf);
                 let sv = &state.sessions[state.active_session];
                 let tab = &sv.tabs[sv.active_tab];
-                if let Some(slot_idx) = slot_at(&tab.root, &tab.focus_path) {
+                if let Some(slot_idx) = focused_slot_idx(tab.focus_pane, &state.slots) {
                     if let Some(slot) = state.slots[slot_idx].as_mut() {
                         slot.scroll_offset = 0;
                         let send_result = slot.input_tx.send(bytes.clone()).await;
