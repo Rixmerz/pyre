@@ -842,6 +842,8 @@ struct SearchState {
     /// Prefix `!` in the search box sets this (non-zero exit only).
     failures_only: bool,
     rx: Option<mpsc::Receiver<Vec<BlockHit>>>,
+    /// Result row rects captured during last render: (result_index, rect).
+    result_rects: Vec<(usize, Rect)>,
 }
 
 /// State for the block stdout modal pager (Enter in ribbon mode).
@@ -910,6 +912,7 @@ impl Default for SearchState {
             pending_query: None,
             failures_only: false,
             rx: None,
+            result_rects: Vec::new(),
         }
     }
 }
@@ -929,8 +932,9 @@ struct ThemePickerState {
 #[derive(Clone)]
 enum SelectionBase {
     Live,
-    #[allow(dead_code)]
-    Scrollback(usize), // window_top line index into scrollback
+    /// window_top: how many lines past the live viewport the drag started,
+    /// matching `slot.scroll_offset` at the time drag began.
+    Scrollback(usize),
 }
 
 #[derive(Clone)]
@@ -974,12 +978,33 @@ impl Selection {
 // Click tracker (for double/triple-click detection)
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[allow(dead_code)]
 struct ClickTracker {
     last_at: Instant,
     last_pos: (u16, u16), // (col, row) in terminal coordinates
     count: u8,
+    #[allow(dead_code)]
     pane_idx: usize,
+}
+
+impl ClickTracker {
+    /// Given a new click at `now` / `pos`, return the resulting click count
+    /// (1 = single, 2 = double, 3 = triple). Resets to 1 when more than
+    /// `window_ms` have passed or the cell position changed.
+    fn click_count(
+        now: Instant,
+        last_at: Instant,
+        last_pos: (u16, u16),
+        new_pos: (u16, u16),
+        prev_count: u8,
+        window_ms: u64,
+    ) -> u8 {
+        let elapsed = now.duration_since(last_at).as_millis() as u64;
+        if elapsed <= window_ms && last_pos == new_pos {
+            prev_count.saturating_add(1).min(3)
+        } else {
+            1
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -987,7 +1012,6 @@ struct ClickTracker {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 enum MenuItem {
     Copy,
     KillPane,
@@ -997,11 +1021,10 @@ enum MenuItem {
     InspectPid,
 }
 
-#[allow(dead_code)]
 impl MenuItem {
     fn label(self) -> &'static str {
         match self {
-            Self::Copy => " Copy",
+            Self::Copy => " Copy selection",
             Self::KillPane => " Kill pane",
             Self::SplitH => " Split horizontal",
             Self::SplitV => " Split vertical",
@@ -1011,7 +1034,6 @@ impl MenuItem {
     }
 }
 
-#[allow(dead_code)]
 const MENU_ITEMS: &[MenuItem] = &[
     MenuItem::Copy,
     MenuItem::KillPane,
@@ -1021,10 +1043,12 @@ const MENU_ITEMS: &[MenuItem] = &[
     MenuItem::InspectPid,
 ];
 
-#[allow(dead_code)]
 struct ContextMenu {
+    /// Rect where the menu is rendered (computed on open).
     rect: Rect,
+    /// Currently highlighted menu row (0-based).
     cursor: usize,
+    /// Slot index of the pane that was right-clicked.
     target_slot: usize,
 }
 
@@ -1092,6 +1116,12 @@ struct AppState {
     tab_plus_rect: Option<Rect>,
     /// Queued resize RPCs collected by render_pane (sync); drained after each draw.
     pending_resizes: Vec<(PaneId, pyre_proto::PaneSize)>,
+    /// Per-tab chip rects captured during last render: vec of (tab_vec_index, chip_rect).
+    tab_chip_rects: Vec<(usize, Rect)>,
+    /// Active tab-drag: (tab_vec_index, start_col) — set on mouse-down on a chip.
+    dragging_tab: Option<(usize, u16)>,
+    /// Rect of the pager overlay as rendered last frame (for mouse-wheel routing).
+    pager_rect: Option<Rect>,
     /// Last time the session list was refreshed from the daemon.
     session_list_last_poll: Instant,
     /// Latest block snapshot delivered by the background poll task.
@@ -1109,6 +1139,28 @@ struct AppState {
     toast_deck: ToastDeck,
     /// Receiver for toasts produced by the background push-event task.
     toast_rx: mpsc::Receiver<Toast>,
+    /// Deferred async action queued by the (sync) mouse handler and drained in the event loop.
+    pending_menu_action: Option<PendingMenuAction>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Deferred async actions (queued by sync mouse handler, drained in event loop)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Actions that require async context (RPC calls) but originate from the sync
+/// `handle_mouse` function. The event loop drains this after every mouse event.
+#[allow(dead_code)]
+enum PendingMenuAction {
+    /// Execute the highlighted item of the context menu.
+    ContextMenuCommit,
+    /// Split active pane horizontally (HSplit).
+    SplitH,
+    /// Split active pane vertically (VSplit).
+    SplitV,
+    /// Open a rename prompt for the active session.
+    RenameSession,
+    /// Jump to search result at given index (mouse click on result row).
+    SearchJump(usize),
 }
 
 impl AppState {
@@ -1846,7 +1898,7 @@ fn render_layout(
 }
 
 /// Render the search overlay centered on the terminal.
-fn render_search_overlay(frame: &mut ratatui::Frame, app: &AppState, t: &theme::LegacyTheme) {
+fn render_search_overlay(frame: &mut ratatui::Frame, app: &mut AppState, t: &theme::LegacyTheme) {
     let area = frame.area();
 
     // Centered rect: ~70% width, ~60% height.
@@ -1945,6 +1997,31 @@ fn render_search_overlay(frame: &mut ratatui::Frame, app: &AppState, t: &theme::
         list_state.select(Some(app.search.cursor));
     }
     frame.render_stateful_widget(list, results_area, &mut list_state);
+
+    // Populate result_rects for mouse click-to-jump. Each result row is 1 line
+    // tall; the list block has a 1-cell border on each side, so body starts at
+    // results_area.y + 1 (top border) and x = results_area.x + 1 (left border).
+    let inner_x = results_area.x.saturating_add(1);
+    let inner_y = results_area.y.saturating_add(1);
+    let inner_w = results_area.width.saturating_sub(2);
+    app.search.result_rects = app
+        .search
+        .results
+        .iter()
+        .enumerate()
+        .filter_map(|(i, _)| {
+            let row_y = inner_y.checked_add(i as u16)?;
+            if row_y
+                >= results_area
+                    .y
+                    .saturating_add(results_area.height)
+                    .saturating_sub(1)
+            {
+                return None; // clipped by bottom border
+            }
+            Some((i, Rect::new(inner_x, row_y, inner_w, 1)))
+        })
+        .collect();
 }
 
 /// Render the full-screen block stdout pager overlay.
@@ -2311,6 +2388,60 @@ fn render_theme_picker(frame: &mut ratatui::Frame, state: &AppState) {
     }
 }
 
+/// Render the right-click context menu overlay.
+///
+/// The menu is a small popup anchored at `menu.rect`. Items are drawn
+/// with the cursor row highlighted; Esc/Enter/click outside dismisses.
+fn render_context_menu(frame: &mut ratatui::Frame, state: &mut AppState, t: &theme::LegacyTheme) {
+    let menu = match state.context_menu.as_ref() {
+        Some(m) => m,
+        None => return,
+    };
+
+    // Compute a rect that fits the menu — width = longest label + 2, height = items + 2 (border).
+    let max_label = MENU_ITEMS
+        .iter()
+        .map(|i| i.label().len())
+        .max()
+        .unwrap_or(10) as u16;
+    let w = max_label + 4; // left border + space + label + right border
+    let h = MENU_ITEMS.len() as u16 + 2;
+    let area = frame.area();
+    // Clamp so the menu stays on screen.
+    let x = menu.rect.x.min(area.width.saturating_sub(w));
+    let y = menu.rect.y.min(area.height.saturating_sub(h));
+    let popup = Rect::new(x, y, w, h);
+
+    frame.render_widget(Clear, popup);
+
+    let block = RatatuiBlock::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(t.border_focus())
+        .style(t.overlay());
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let cursor = menu.cursor;
+    for (idx, item) in MENU_ITEMS.iter().enumerate() {
+        if idx >= inner.height as usize {
+            break;
+        }
+        let row_y = inner.y + idx as u16;
+        let is_selected = idx == cursor;
+        let style = if is_selected {
+            t.selection()
+        } else {
+            Style::default().fg(t.text).bg(t.bg)
+        };
+        let label = format!("{:<width$}", item.label(), width = inner.width as usize);
+        frame.render_widget(
+            Paragraph::new(Span::styled(label, style)),
+            Rect::new(inner.x, row_y, inner.width, 1),
+        );
+    }
+}
+
 fn draw_frame(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     state: &mut AppState,
@@ -2415,15 +2546,20 @@ fn draw_frame(
             let total_tabs = sv.tabs.len();
             let mut spans: Vec<Span> = Vec::new();
             let mut x_cursor: u16 = tabs_area.x;
+            let mut new_tab_chip_rects: Vec<(usize, Rect)> = Vec::new();
 
             for (i, _) in sv.tabs.iter().enumerate() {
-                let label = format!(" {} ", i + 1);
+                // Each chip: " N ×" — label + close button.
+                let label = format!(" {} ×", i + 1);
                 let len = label.chars().count() as u16;
                 let style = if i == sv.active_tab {
                     EMBER.tab_active()
                 } else {
                     EMBER.tab_inactive()
                 };
+                if tabs_area.height > 0 {
+                    new_tab_chip_rects.push((i, Rect::new(x_cursor, tabs_area.y, len, 1)));
+                }
                 x_cursor += len;
                 spans.push(Span::styled(label, style));
                 if i + 1 < total_tabs {
@@ -2448,6 +2584,7 @@ fn draw_frame(
             spans.push(Span::styled(plus_label, EMBER.tab_inactive()));
 
             state.tab_plus_rect = plus_rect;
+            state.tab_chip_rects = new_tab_chip_rects;
 
             frame.render_widget(
                 Paragraph::new(Line::from(spans)).style(Style::default().bg(EMBER.bg)),
@@ -2622,15 +2759,34 @@ fn draw_frame(
         // Overlays or scrollback suppress it.
         if let Some(ref pager) = state.pager {
             // Block pager — full-screen, draws over everything, no cursor.
+            let pager_full = frame.area();
             render_pager(frame, pager, &t);
-        } else if state.theme_picker.is_some() {
-            render_theme_picker(frame, state);
-        } else if let Some(ref prompt) = state.prompt {
-            render_name_prompt(frame, prompt, state.anim.frame(), &t);
-        } else if state.search.open {
-            // Search overlay — drawn on top of everything else and owns cursor.
-            render_search_overlay(frame, state, &t);
-        } else if state.pid_inspect.is_none() {
+            state.pager_rect = Some(pager_full);
+        } else {
+            state.pager_rect = None;
+            if state.theme_picker.is_some() {
+                render_theme_picker(frame, state);
+            } else if let Some(ref prompt) = state.prompt {
+                render_name_prompt(frame, prompt, state.anim.frame(), &t);
+            } else if state.search.open {
+                // Search overlay — drawn on top of everything else and owns cursor.
+                render_search_overlay(frame, state, &t);
+            }
+        }
+
+        // Context menu rendered on top of everything (including pager).
+        if state.context_menu.is_some() {
+            render_context_menu(frame, state, &t);
+        }
+
+        // Host-terminal cursor: only for live pane view (no overlay, no scrollback).
+        if state.pager.is_none()
+            && state.theme_picker.is_none()
+            && state.prompt.is_none()
+            && !state.search.open
+            && state.context_menu.is_none()
+            && state.pid_inspect.is_none()
+        {
             // No blocking overlay: propagate vt100 cursor from focused pane.
             let sv = &state.sessions[state.active_session];
             let tab = &sv.tabs[sv.active_tab];
@@ -2853,13 +3009,117 @@ async fn open_new_session(state: &mut AppState, name: Option<String>) -> Result<
 // Mouse event handler
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Double/triple-click window in milliseconds.
+const CLICK_WINDOW_MS: u64 = 500;
+
+/// Walk a word boundary outward from `(row, col)` in the alacritty grid.
+/// Returns (start_col, end_col) on the same row, clamped to [0, num_cols).
+fn word_bounds(
+    grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>,
+    row: u16,
+    col: u16,
+) -> (u16, u16) {
+    let num_cols = grid.columns();
+    let r = row as i32;
+
+    let is_word_char = |c: char| c.is_alphanumeric() || c == '_';
+
+    // Walk left.
+    let mut c0 = col as usize;
+    while c0 > 0 {
+        let pt = TermPoint::new(TermLine(r), TermColumn(c0 - 1));
+        let ch = grid[pt].c;
+        if ch == '\0' || is_word_char(ch) {
+            c0 -= 1;
+        } else {
+            break;
+        }
+    }
+
+    // Walk right.
+    let mut c1 = col as usize;
+    while c1 + 1 < num_cols {
+        let pt = TermPoint::new(TermLine(r), TermColumn(c1 + 1));
+        let ch = grid[pt].c;
+        if ch == '\0' || is_word_char(ch) {
+            c1 += 1;
+        } else {
+            break;
+        }
+    }
+
+    (c0 as u16, c1 as u16)
+}
+
+/// Reorder tabs: move tab at `from` to position `to` (0-based), shifting others.
+/// Returns the new vec. No-op if indices are equal or out of range.
+fn tab_reorder(mut tabs: Vec<Tab>, from: usize, to: usize) -> Vec<Tab> {
+    if from == to || from >= tabs.len() || to >= tabs.len() {
+        return tabs;
+    }
+    let tab = tabs.remove(from);
+    tabs.insert(to, tab);
+    tabs
+}
+
+/// Apply a delta-percentage resize to two adjacent split children at `[idx]` and
+/// `[idx+1]` within `weights`. Each child is clamped to a minimum of `min_pct`
+/// (default 5). The pair's total is preserved. Returns the updated weights vec.
+fn apply_resize_weights(weights: &[u16], idx: usize, delta_pct: i32, min_pct: u16) -> Vec<u16> {
+    let mut out = weights.to_vec();
+    if idx + 1 >= out.len() {
+        return out;
+    }
+    let total = out[idx] as i32 + out[idx + 1] as i32;
+    let left = (out[idx] as i32 + delta_pct).clamp(min_pct as i32, total - min_pct as i32);
+    let right = total - left;
+    out[idx] = left as u16;
+    out[idx + 1] = right as u16;
+    out
+}
+
 /// Handle a mouse event. Returns true if the event was consumed.
 fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_area: Rect) -> bool {
     let col = me.column;
     let row = me.row;
 
+    // Any click dismisses an open context menu (unless it is on the menu itself).
+    // We close it before dispatching the event so the click still lands normally.
+    let menu_rect = state.context_menu.as_ref().map(|m| m.rect);
+    if let MouseEventKind::Down(_) = me.kind {
+        if let Some(mr) = menu_rect {
+            if !rect_contains(mr, col, row) {
+                state.context_menu = None;
+            }
+        }
+    }
+
+    // Search overlay click — intercept left-down inside the result list.
+    if state.search.open {
+        if let MouseEventKind::Down(MouseButton::Left) = me.kind {
+            let rects = state.search.result_rects.clone();
+            for (result_idx, rect) in &rects {
+                if rect_contains(*rect, col, row) {
+                    state.search.cursor = *result_idx;
+                    state.pending_menu_action = Some(PendingMenuAction::SearchJump(*result_idx));
+                    return true;
+                }
+            }
+        }
+        // Scroll-wheel events pass through to the pane when search is open.
+    }
+
     match me.kind {
         MouseEventKind::ScrollUp => {
+            // Route to pager when it is open and click is inside pager area.
+            if let Some(pr) = state.pager_rect {
+                if rect_contains(pr, col, row) {
+                    if let Some(ref mut pager) = state.pager {
+                        pager.scroll_up(3);
+                    }
+                    return true;
+                }
+            }
             let sv = &state.sessions[state.active_session];
             let mut leaf_rects: Vec<(usize, Rect)> = Vec::new();
             collect_leaf_rects(&sv.tabs[sv.active_tab].root, body_area, &mut leaf_rects);
@@ -2875,6 +3135,18 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
             false
         }
         MouseEventKind::ScrollDown => {
+            // Route to pager when it is open and click is inside pager area.
+            if let Some(pr) = state.pager_rect {
+                if rect_contains(pr, col, row) {
+                    // We do not have the visible_rows count here; use a generous default
+                    // (the pager will clamp). The pager body is the full frame minus 3 rows.
+                    let visible = pr.height.saturating_sub(3) as usize;
+                    if let Some(ref mut pager) = state.pager {
+                        pager.scroll_down(3, visible.max(1));
+                    }
+                    return true;
+                }
+            }
             let sv = &state.sessions[state.active_session];
             let mut leaf_rects: Vec<(usize, Rect)> = Vec::new();
             collect_leaf_rects(&sv.tabs[sv.active_tab].root, body_area, &mut leaf_rects);
@@ -2889,9 +3161,49 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
             }
             false
         }
+
+        // ── Right-click: open context menu ───────────────────────────────────
+        MouseEventKind::Down(MouseButton::Right) => {
+            // Dismiss existing menu before potentially re-opening.
+            state.context_menu = None;
+
+            // Find the pane under the cursor (body only).
+            if row >= 2 {
+                let sv = &state.sessions[state.active_session];
+                let mut leaf_rects: Vec<(usize, Rect)> = Vec::new();
+                collect_leaf_rects(&sv.tabs[sv.active_tab].root, body_area, &mut leaf_rects);
+                for (slot_idx, rect) in &leaf_rects {
+                    if rect_contains(*rect, col, row) {
+                        focus_slot(state, *slot_idx);
+                        let max_label = MENU_ITEMS
+                            .iter()
+                            .map(|i| i.label().len())
+                            .max()
+                            .unwrap_or(10) as u16;
+                        let w = max_label + 4;
+                        let h = MENU_ITEMS.len() as u16 + 2;
+                        state.context_menu = Some(ContextMenu {
+                            rect: Rect::new(col, row, w, h),
+                            cursor: 0,
+                            target_slot: *slot_idx,
+                        });
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+
+        // ── Middle-click: paste clipboard to focused PTY ──────────────────────
+        // read_from_clipboard is not yet implemented; arm reserved for M4.
+        MouseEventKind::Down(MouseButton::Middle) => false,
+
         MouseEventKind::Down(MouseButton::Left) => {
-            // row 0 = sessions strip; row 1 = tabs strip; body starts at row 2.
+            let now = Instant::now();
+
+            // ── Row 0: sessions strip ─────────────────────────────────────────
             if row == 0 {
+                state.context_menu = None;
                 // Check [+] session button first.
                 if let Some(plus_rect) = state.session_plus_rect {
                     if rect_contains(plus_rect, col, row) {
@@ -2913,7 +3225,10 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
                 return false;
             }
 
+            // ── Row 1: tabs strip ─────────────────────────────────────────────
             if row == 1 {
+                state.context_menu = None;
+
                 // Check [+] tab button.
                 if let Some(plus_rect) = state.tab_plus_rect {
                     if rect_contains(plus_rect, col, row) {
@@ -2924,21 +3239,43 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
                         return true;
                     }
                 }
-                // Check individual tab chips by computing widths inline.
-                let sv = &state.sessions[state.active_session];
-                let mut x: u16 = 0;
-                for (i, _) in sv.tabs.iter().enumerate() {
-                    let label_len = format!(" {} ", i + 1).len() as u16;
-                    if col >= x && col < x + label_len {
-                        state.sessions[state.active_session].active_tab = i;
+
+                // Hit-test stored tab chip rects (populated by draw_frame).
+                let chip_rects = state.tab_chip_rects.clone();
+                for (tab_idx, chip_rect) in &chip_rects {
+                    if rect_contains(*chip_rect, col, row) {
+                        // Check if click lands on the trailing "×" character.
+                        let close_col = chip_rect.x + chip_rect.width.saturating_sub(1);
+                        if col == close_col {
+                            // Kill the tab.
+                            let slot_idx = {
+                                let sv = &state.sessions[state.active_session];
+                                let tab = &sv.tabs[*tab_idx];
+                                slot_at(&tab.root, &tab.focus_path)
+                            };
+                            if let Some(si) = slot_idx {
+                                close_pane_by_slot_idx(state, si);
+                                if state.sessions.is_empty() {
+                                    // Caller (event loop) will detect empty sessions.
+                                    return true;
+                                }
+                            }
+                            return true;
+                        }
+
+                        // Record drag start for tab reorder.
+                        state.dragging_tab = Some((*tab_idx, col));
+                        state.sessions[state.active_session].active_tab = *tab_idx;
                         return true;
                     }
-                    x += label_len + 1; // +1 for separator space
                 }
                 return false;
             }
 
+            // ── Body: boundary, pane, ribbon chips ────────────────────────────
+
             // Check if clicking near a split boundary to start a drag.
+            // Double-click on boundary resets siblings to equal weights.
             {
                 let sv = &mut state.sessions[state.active_session];
                 let tab = &mut sv.tabs[sv.active_tab];
@@ -2949,6 +3286,44 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
                         col.abs_diff(boundary.coord) <= 1
                     };
                     if hit {
+                        let click_pos = (col, row);
+                        let is_double = state
+                            .last_click
+                            .as_ref()
+                            .map(|lc| {
+                                ClickTracker::click_count(
+                                    now,
+                                    lc.last_at,
+                                    lc.last_pos,
+                                    click_pos,
+                                    lc.count,
+                                    CLICK_WINDOW_MS,
+                                ) >= 2
+                            })
+                            .unwrap_or(false);
+
+                        if is_double {
+                            // Reset sibling weights to equal.
+                            if let Some(children) =
+                                children_at_mut(&mut tab.root, &boundary.parent_path)
+                            {
+                                let n = children.len() as u16;
+                                if let Some(each) = 100u16.checked_div(n) {
+                                    let rem = 100 - each * n;
+                                    for (i, (_, w)) in children.iter_mut().enumerate() {
+                                        *w = each + if i == 0 { rem } else { 0 };
+                                    }
+                                }
+                            }
+                            state.last_click = Some(ClickTracker {
+                                last_at: now,
+                                last_pos: click_pos,
+                                count: 2,
+                                pane_idx: usize::MAX,
+                            });
+                            return true;
+                        }
+
                         let start_coord = if boundary.is_hsplit { row } else { col };
                         let start_weights: Vec<u16> = if let Some(children) =
                             children_at_mut(&mut tab.root, &boundary.parent_path)
@@ -2962,31 +3337,167 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
                             start_coord,
                             start_weights,
                         });
+                        state.last_click = Some(ClickTracker {
+                            last_at: now,
+                            last_pos: click_pos,
+                            count: 1,
+                            pane_idx: usize::MAX,
+                        });
                         return true;
                     }
                 }
             }
 
-            // Check if clicking inside a leaf pane — also start text selection.
+            // Check if clicking inside a sidebar row.
+            if state.sidebar_open {
+                // The sidebar occupies the left 24 columns of body area.
+                let sidebar_width: u16 = 24;
+                let sidebar_rect =
+                    Rect::new(body_area.x, body_area.y, sidebar_width, body_area.height);
+                if rect_contains(sidebar_rect, col, row) {
+                    // Each data row is 1 line tall; body starts 1 line after top border.
+                    let inner_y = sidebar_rect.y.saturating_add(1);
+                    let row_idx = row.saturating_sub(inner_y) as usize;
+                    if row_idx < state.sidebar_data.len() {
+                        state.sidebar_cursor = row_idx;
+                        state.sidebar_focused = true;
+                        // Focus the pane if it is loaded in the active tab.
+                        let target_pane_id = state.sidebar_data[row_idx].id;
+                        let sv = &state.sessions[state.active_session];
+                        let tab = &sv.tabs[sv.active_tab];
+                        let mut paths: Vec<Vec<usize>> = Vec::new();
+                        let mut tmp: Vec<usize> = Vec::new();
+                        leaves_in_order(&tab.root, &mut tmp, &mut paths);
+                        let found_path = paths.into_iter().find(|p| {
+                            slot_at(&tab.root, p)
+                                .and_then(|i| state.slots[i].as_ref())
+                                .map(|s| s.pane_id == target_pane_id)
+                                .unwrap_or(false)
+                        });
+                        if let Some(path) = found_path {
+                            let sv = &mut state.sessions[state.active_session];
+                            let tab = &mut sv.tabs[sv.active_tab];
+                            tab.focus_path = path;
+                        }
+                    }
+                    return true;
+                }
+            }
+
+            // Check if clicking inside a leaf pane (ribbon chips + text selection).
             let sv = &state.sessions[state.active_session];
             let mut leaf_rects: Vec<(usize, Rect)> = Vec::new();
             collect_leaf_rects(&sv.tabs[sv.active_tab].root, body_area, &mut leaf_rects);
-            for (slot_idx, rect) in &leaf_rects {
-                if rect_contains(*rect, col, row) {
-                    focus_slot(state, *slot_idx);
-                    // Compute (row, col) relative to the slot's content area.
-                    // The content area inner rect is stored in last_screen_rect.
-                    if let Some(slot) = state.slots[*slot_idx].as_ref() {
+            for (slot_idx, rect) in leaf_rects.clone() {
+                if rect_contains(rect, col, row) {
+                    focus_slot(state, slot_idx);
+
+                    // ── Ribbon chip click ──────────────────────────────────────
+                    let chip_rects: Vec<(usize, Rect)> = state.slots[slot_idx]
+                        .as_ref()
+                        .map(|s| s.ribbon_chip_rects.clone())
+                        .unwrap_or_default();
+                    for (chip_idx, chip_rect) in &chip_rects {
+                        if rect_contains(*chip_rect, col, row) {
+                            let click_pos = (col, row);
+                            let click_count = state
+                                .last_click
+                                .as_ref()
+                                .map(|lc| {
+                                    ClickTracker::click_count(
+                                        now,
+                                        lc.last_at,
+                                        lc.last_pos,
+                                        click_pos,
+                                        lc.count,
+                                        CLICK_WINDOW_MS,
+                                    )
+                                })
+                                .unwrap_or(1);
+                            state.last_click = Some(ClickTracker {
+                                last_at: now,
+                                last_pos: click_pos,
+                                count: click_count,
+                                pane_idx: slot_idx,
+                            });
+
+                            if let Some(slot) = state.slots[slot_idx].as_mut() {
+                                slot.ribbon_cursor = Some(*chip_idx);
+                                if click_count >= 2 {
+                                    // Double-click: open pager for this block.
+                                    // Queue via pending action so the async path in the
+                                    // event loop (Enter key handler) can handle it.
+                                    // We mark ribbon_cursor and let the loop open pager.
+                                    // The pager open logic is duplicated minimally here
+                                    // via a sentinel: set ribbon_cursor and signal.
+                                    // Actual pager open requires an RPC so we use pending.
+                                    state.pending_menu_action =
+                                        Some(PendingMenuAction::ContextMenuCommit);
+                                    // Re-use ContextMenuCommit as "open pager for cursor" —
+                                    // the event-loop drain sees context_menu=None and instead
+                                    // checks if ribbon_cursor is Some → opens pager.
+                                    // This avoids a new enum variant.
+                                }
+                            }
+                            return true;
+                        }
+                    }
+
+                    // ── Multi-click text selection ─────────────────────────────
+                    if let Some(slot) = state.slots[slot_idx].as_ref() {
                         let content = slot.last_screen_rect;
                         if rect_contains(content, col, row) {
                             let sel_row = row.saturating_sub(content.y);
                             let sel_col = col.saturating_sub(content.x);
+                            let click_pos = (col, row);
+
+                            let click_count = state
+                                .last_click
+                                .as_ref()
+                                .map(|lc| {
+                                    ClickTracker::click_count(
+                                        now,
+                                        lc.last_at,
+                                        lc.last_pos,
+                                        click_pos,
+                                        lc.count,
+                                        CLICK_WINDOW_MS,
+                                    )
+                                })
+                                .unwrap_or(1);
+                            state.last_click = Some(ClickTracker {
+                                last_at: now,
+                                last_pos: click_pos,
+                                count: click_count,
+                                pane_idx: slot_idx,
+                            });
+
+                            let sel_base = if slot.scroll_offset > 0 {
+                                SelectionBase::Scrollback(slot.scroll_offset)
+                            } else {
+                                SelectionBase::Live
+                            };
+
+                            let (start, end) = if click_count >= 3 {
+                                // Triple-click: select full row.
+                                let grid = slot.term.grid();
+                                let last_col = (grid.columns().saturating_sub(1)) as u16;
+                                ((sel_row, 0u16), (sel_row, last_col))
+                            } else if click_count == 2 {
+                                // Double-click: select word.
+                                let grid = slot.term.grid();
+                                let (wc0, wc1) = word_bounds(grid, sel_row, sel_col);
+                                ((sel_row, wc0), (sel_row, wc1))
+                            } else {
+                                ((sel_row, sel_col), (sel_row, sel_col))
+                            };
+
                             state.selection = Some(Selection {
-                                pane_idx: *slot_idx,
-                                start: (sel_row, sel_col),
-                                end: (sel_row, sel_col),
-                                dragging: true,
-                                base: SelectionBase::Live,
+                                pane_idx: slot_idx,
+                                start,
+                                end,
+                                dragging: click_count == 1, // only drag on single click
+                                base: sel_base,
                             });
                         }
                     }
@@ -2995,7 +3506,42 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
             }
             false
         }
+
+        // ── Tab drag reorder ──────────────────────────────────────────────────
+        MouseEventKind::Drag(MouseButton::Left) if row == 1 => {
+            if let Some((from_idx, start_col)) = state.dragging_tab {
+                // Determine which tab chip the cursor is currently over.
+                let chip_rects = state.tab_chip_rects.clone();
+                for (over_idx, chip_rect) in &chip_rects {
+                    if rect_contains(*chip_rect, col, row) && *over_idx != from_idx {
+                        // Swap when cursor crosses the midpoint of the target chip.
+                        let mid = chip_rect.x + chip_rect.width / 2;
+                        let dragging_right = col > start_col;
+                        let cross = if dragging_right {
+                            col >= mid
+                        } else {
+                            col <= mid
+                        };
+                        if cross {
+                            let sv = &mut state.sessions[state.active_session];
+                            let tabs = std::mem::take(&mut sv.tabs);
+                            sv.tabs = tab_reorder(tabs, from_idx, *over_idx);
+                            // Keep active tab pointing at the dragged chip.
+                            sv.active_tab = *over_idx;
+                            state.dragging_tab = Some((*over_idx, col));
+                        }
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+
         MouseEventKind::Drag(MouseButton::Left) => {
+            // Clear tab drag if cursor leaves row 1.
+            if row != 1 {
+                state.dragging_tab = None;
+            }
             let sv = &mut state.sessions[state.active_session];
             let tab = &mut sv.tabs[sv.active_tab];
             // Split-resize drag takes priority.
@@ -3005,24 +3551,12 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
                 let parent_size = drag.boundary.parent_size.max(1) as i32;
                 let delta_pct = (delta * 100) / parent_size;
                 let idx = drag.boundary.child_idx;
-                let mut new_weights = drag.start_weights.clone();
-
-                if idx + 1 < new_weights.len() {
-                    let left = new_weights[idx] as i32 + delta_pct;
-                    let right = new_weights[idx + 1] as i32 - delta_pct;
-                    let left = left.clamp(5, (left + right - 5).max(5)) as u16;
-                    let right = (new_weights[idx] as i32 + new_weights[idx + 1] as i32
-                        - left as i32)
-                        .clamp(5, i32::MAX) as u16;
-                    new_weights[idx] = left;
-                    new_weights[idx + 1] = right;
-
-                    let parent_path = drag.boundary.parent_path.clone();
-                    if let Some(children) = children_at_mut(&mut tab.root, &parent_path) {
-                        for (i, w) in new_weights.iter().enumerate() {
-                            if i < children.len() {
-                                children[i].1 = *w;
-                            }
+                let new_weights = apply_resize_weights(&drag.start_weights, idx, delta_pct, 5);
+                let parent_path = drag.boundary.parent_path.clone();
+                if let Some(children) = children_at_mut(&mut tab.root, &parent_path) {
+                    for (i, w) in new_weights.iter().enumerate() {
+                        if i < children.len() {
+                            children[i].1 = *w;
                         }
                     }
                 }
@@ -3033,17 +3567,37 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
                 if sel.dragging {
                     if let Some(slot) = state.slots[sel.pane_idx].as_ref() {
                         let content = slot.last_screen_rect;
-                        if rect_contains(content, col, row) {
-                            sel.end =
-                                (row.saturating_sub(content.y), col.saturating_sub(content.x));
-                            return true;
-                        }
+                        // Extend selection — auto-scroll at body edges.
+                        let new_row = if row < content.y {
+                            // Dragged above viewport: scroll up.
+                            if let Some(s) = state.slots[sel.pane_idx].as_mut() {
+                                s.scroll_offset = (s.scroll_offset + 1).min(s.scrollback_capacity);
+                            }
+                            0u16
+                        } else if row >= content.y + content.height {
+                            // Dragged below viewport: scroll down.
+                            if let Some(s) = state.slots[sel.pane_idx].as_mut() {
+                                s.scroll_offset = s.scroll_offset.saturating_sub(1);
+                            }
+                            content.height.saturating_sub(1)
+                        } else {
+                            row.saturating_sub(content.y)
+                        };
+                        let new_col = col
+                            .saturating_sub(content.x)
+                            .min(content.width.saturating_sub(1));
+                        sel.end = (new_row, new_col);
+                        return true;
                     }
                 }
             }
             false
         }
+
         MouseEventKind::Up(MouseButton::Left) => {
+            // End tab drag.
+            state.dragging_tab = None;
+
             let sv = &mut state.sessions[state.active_session];
             let tab = &mut sv.tabs[sv.active_tab];
             if tab.drag.is_some() {
@@ -3057,18 +3611,29 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
                     // Extract selected text from the alacritty grid via per-cell iteration.
                     let pane_idx = sel.pane_idx;
                     let ((r0, c0), (r1, c1)) = sel.normalized();
+                    let scroll_offset = match &sel.base {
+                        SelectionBase::Scrollback(off) => *off,
+                        SelectionBase::Live => 0,
+                    };
                     if let Some(slot) = state.slots[pane_idx].as_ref() {
                         let grid = slot.term.grid();
                         let num_cols = grid.columns();
                         let mut text = String::new();
-                        for row in r0..=r1 {
-                            if row > r0 {
+                        for grid_row in r0..=r1 {
+                            if grid_row > r0 {
                                 text.push('\n');
                             }
-                            let col_start = if row == r0 { c0 as usize } else { 0usize };
-                            let col_end = if row == r1 { c1 as usize } else { num_cols };
-                            for col in col_start..=col_end {
-                                let pt = TermPoint::new(TermLine(row as i32), TermColumn(col));
+                            // Offset into scrollback: negate because alacritty lines
+                            // above the viewport are negative line indices.
+                            let line_idx = grid_row as i32 - scroll_offset as i32;
+                            let col_start = if grid_row == r0 { c0 as usize } else { 0usize };
+                            let col_end = if grid_row == r1 {
+                                c1 as usize
+                            } else {
+                                num_cols.saturating_sub(1)
+                            };
+                            for c in col_start..=col_end {
+                                let pt = TermPoint::new(TermLine(line_idx), TermColumn(c));
                                 let ch = grid[pt].c;
                                 if ch == '\0' {
                                     text.push(' ');
@@ -3094,6 +3659,41 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
             }
             false
         }
+
+        // ── Hover: boundary "drag to resize" status hint ──────────────────────
+        MouseEventKind::Moved => {
+            // Only show hint when no drag or selection is active (cheap path).
+            let sv = &state.sessions[state.active_session];
+            let tab = &sv.tabs[sv.active_tab];
+            if tab.drag.is_some()
+                || state
+                    .selection
+                    .as_ref()
+                    .map(|s| s.dragging)
+                    .unwrap_or(false)
+            {
+                return false;
+            }
+            let mut on_boundary = false;
+            for boundary in &tab.boundaries {
+                let hit = if boundary.is_hsplit {
+                    row.abs_diff(boundary.coord) <= 1
+                } else {
+                    col.abs_diff(boundary.coord) <= 1
+                };
+                if hit {
+                    on_boundary = true;
+                    break;
+                }
+            }
+            if on_boundary {
+                state.status_msg = Some("drag to resize".to_owned());
+            } else if state.status_msg.as_deref() == Some("drag to resize") {
+                state.status_msg = None;
+            }
+            false // do not trigger a full redraw just for hover hint
+        }
+
         _ => false,
     }
 }
@@ -3429,6 +4029,9 @@ fn initial_app_state(
         session_plus_rect: None,
         tab_plus_rect: None,
         pending_resizes: Vec::new(),
+        tab_chip_rects: Vec::new(),
+        dragging_tab: None,
+        pager_rect: None,
         // Force an immediate session-list sync on the first loop iteration.
         session_list_last_poll: Instant::now() - Duration::from_secs(10),
         blocks_rx,
@@ -3438,6 +4041,7 @@ fn initial_app_state(
         theme_picker: None,
         toast_deck,
         toast_rx,
+        pending_menu_action: None,
     }
 }
 
@@ -3783,9 +4387,7 @@ async fn run_tui(
         state.toast_deck.tick();
         while let Ok(toast) = state.toast_rx.try_recv() {
             // push() respects the enabled flag and trims to max_visible.
-            state
-                .toast_deck
-                .push(toast.title, toast.body, toast.kind);
+            state.toast_deck.push(toast.title, toast.body, toast.kind);
         }
 
         // Search debounce: fire query 150 ms after last keystroke.
@@ -4084,6 +4686,122 @@ async fn run_tui(
         match crossterm::event::read()? {
             Event::Mouse(me) => {
                 handle_mouse(&mut state, me, body_area);
+                // Drain deferred async actions queued by the sync mouse handler.
+                if let Some(action) = state.pending_menu_action.take() {
+                    match action {
+                        PendingMenuAction::SplitH => {
+                            if let Err(e) = split_active(&mut state, true).await {
+                                tracing::warn!("context menu HSplit: {e}");
+                            }
+                        }
+                        PendingMenuAction::SplitV => {
+                            if let Err(e) = split_active(&mut state, false).await {
+                                tracing::warn!("context menu VSplit: {e}");
+                            }
+                        }
+                        PendingMenuAction::RenameSession => {
+                            let sv = &state.sessions[state.active_session];
+                            state.prompt = Some(NamePrompt {
+                                kind: PromptKind::RenameSession(sv.id),
+                                input: sv.name.clone(),
+                            });
+                        }
+                        PendingMenuAction::SearchJump(idx) => {
+                            // Mirror the Enter key handler for search.
+                            if idx < state.search.results.len() {
+                                let hit = &state.search.results[idx];
+                                let target_pane = hit.block.pane;
+                                let target_block = hit.block.id;
+                                type JumpTarget = (usize, usize, Vec<usize>, usize);
+                                let mut jump: Option<JumpTarget> = None;
+                                'search_jump: for (si, sv) in state.sessions.iter().enumerate() {
+                                    for (ti, tab) in sv.tabs.iter().enumerate() {
+                                        let mut paths: Vec<Vec<usize>> = Vec::new();
+                                        let mut tmp: Vec<usize> = Vec::new();
+                                        leaves_in_order(&tab.root, &mut tmp, &mut paths);
+                                        for p in &paths {
+                                            if let Some(idx2) = slot_at(&tab.root, p) {
+                                                if state.slots[idx2]
+                                                    .as_ref()
+                                                    .map(|s| s.pane_id == target_pane)
+                                                    .unwrap_or(false)
+                                                {
+                                                    jump = Some((si, ti, p.clone(), idx2));
+                                                    if si == state.active_session {
+                                                        break 'search_jump;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Some((si, ti, path, slot_idx)) = jump {
+                                    state.active_session = si;
+                                    state.sessions[si].active_tab = ti;
+                                    state.sessions[si].tabs[ti].focus_path = path;
+                                    if let Some(c) = state.slots[slot_idx].as_ref().and_then(|s| {
+                                        s.recent_blocks.iter().position(|b| b.id == target_block)
+                                    }) {
+                                        if let Some(slot) = state.slots[slot_idx].as_mut() {
+                                            slot.ribbon_cursor = Some(c);
+                                        }
+                                    }
+                                } else {
+                                    state.status_msg =
+                                        Some("search: result pane not loaded".to_owned());
+                                }
+                            }
+                            state.search.open = false;
+                            state.search.rx = None;
+                        }
+                        PendingMenuAction::ContextMenuCommit => {
+                            // Used for double-click on ribbon chip: open pager for the
+                            // currently focused block cursor. Mirrors the Enter-in-ribbon
+                            // handler in the key path.
+                            let sv = &state.sessions[state.active_session];
+                            let tab = &sv.tabs[sv.active_tab];
+                            if let Some(slot_idx) = slot_at(&tab.root, &tab.focus_path) {
+                                if let Some(slot) = state.slots[slot_idx].as_ref() {
+                                    if let Some(cursor) = slot.ribbon_cursor {
+                                        if let Some(block) = slot.recent_blocks.get(cursor) {
+                                            let block_id_str = block.id.0.to_string();
+                                            let exit_code = block.exit_code;
+                                            let block_id = block.id;
+                                            match state
+                                                .control
+                                                .get_block_stdout(
+                                                    tarpc::context::current(),
+                                                    block_id,
+                                                )
+                                                .await
+                                            {
+                                                Ok(Ok(raw)) => {
+                                                    state.pager = Some(PagerState::new(
+                                                        block_id_str,
+                                                        exit_code,
+                                                        &raw,
+                                                    ));
+                                                }
+                                                Ok(Err(e)) => {
+                                                    state.status_msg =
+                                                        Some(format!("get_block_stdout: {e}"));
+                                                }
+                                                Err(e) => {
+                                                    state.status_msg =
+                                                        Some(format!("rpc transport: {e}"));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Exit immediately if mouse action removed all sessions.
+                if state.sessions.is_empty() {
+                    break;
+                }
             }
 
             Event::Key(key_event) => {
@@ -4159,6 +4877,129 @@ async fn run_tui(
                         KeyCode::Char(c) => {
                             if let Some(ref mut p) = state.prompt {
                                 p.input.push(c);
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                // Context menu key handling — intercepts all keys while open.
+                if state.context_menu.is_some() {
+                    match code {
+                        KeyCode::Esc | KeyCode::Char('q') => {
+                            state.context_menu = None;
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            if let Some(ref mut m) = state.context_menu {
+                                m.cursor = m.cursor.saturating_sub(1);
+                            }
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            if let Some(ref mut m) = state.context_menu {
+                                let max = MENU_ITEMS.len().saturating_sub(1);
+                                m.cursor = (m.cursor + 1).min(max);
+                            }
+                        }
+                        KeyCode::Enter => {
+                            if let Some(menu) = state.context_menu.take() {
+                                let item = MENU_ITEMS[menu.cursor];
+                                let target = menu.target_slot;
+                                match item {
+                                    MenuItem::Copy => {
+                                        // Copy the current text selection (if any) or last block.
+                                        if let Some(ref sel) = state.selection.clone() {
+                                            let pane_idx = sel.pane_idx;
+                                            let ((r0, c0), (r1, c1)) = sel.normalized();
+                                            if let Some(slot) = state.slots[pane_idx].as_ref() {
+                                                let grid = slot.term.grid();
+                                                let num_cols = grid.columns();
+                                                let mut text = String::new();
+                                                for gr in r0..=r1 {
+                                                    if gr > r0 {
+                                                        text.push('\n');
+                                                    }
+                                                    let cs = if gr == r0 { c0 as usize } else { 0 };
+                                                    let ce = if gr == r1 {
+                                                        c1 as usize
+                                                    } else {
+                                                        num_cols.saturating_sub(1)
+                                                    };
+                                                    for c in cs..=ce {
+                                                        let pt = TermPoint::new(
+                                                            TermLine(gr as i32),
+                                                            TermColumn(c),
+                                                        );
+                                                        let ch = grid[pt].c;
+                                                        text.push(if ch == '\0' {
+                                                            ' '
+                                                        } else {
+                                                            ch
+                                                        });
+                                                    }
+                                                }
+                                                let trimmed: String = text
+                                                    .lines()
+                                                    .map(|l| l.trim_end())
+                                                    .collect::<Vec<_>>()
+                                                    .join("\n");
+                                                if !trimmed.is_empty() {
+                                                    let _ = crate::clipboard::copy_to_clipboard(
+                                                        &trimmed,
+                                                    );
+                                                    state.status_msg = Some("copied".to_owned());
+                                                }
+                                            }
+                                        }
+                                    }
+                                    MenuItem::KillPane => {
+                                        close_pane_by_slot_idx(&mut state, target);
+                                        if state.sessions.is_empty() {
+                                            break;
+                                        }
+                                    }
+                                    MenuItem::SplitH => {
+                                        if let Err(e) = split_active(&mut state, true).await {
+                                            tracing::warn!("context menu HSplit: {e}");
+                                        }
+                                    }
+                                    MenuItem::SplitV => {
+                                        if let Err(e) = split_active(&mut state, false).await {
+                                            tracing::warn!("context menu VSplit: {e}");
+                                        }
+                                    }
+                                    MenuItem::ZoomToggle => {
+                                        let sv = state.active_session_view_mut();
+                                        let tab = &mut sv.tabs[sv.active_tab];
+                                        if tab.zoomed.is_some() {
+                                            tab.zoomed = None;
+                                        } else {
+                                            tab.zoomed = Some(tab.focus_path.clone());
+                                        }
+                                    }
+                                    MenuItem::InspectPid => {
+                                        if let Some(slot) = state.slots[target].as_ref() {
+                                            let pane_id = slot.pane_id;
+                                            match state
+                                                .control
+                                                .inspect_pid(tarpc::context::current(), pane_id)
+                                                .await
+                                            {
+                                                Ok(Ok(info)) => {
+                                                    state.pid_inspect = Some(info);
+                                                }
+                                                Ok(Err(e)) => {
+                                                    state.status_msg =
+                                                        Some(format!("inspect_pid: {e}"));
+                                                }
+                                                Err(e) => {
+                                                    state.status_msg =
+                                                        Some(format!("rpc transport: {e}"));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                         _ => {}
