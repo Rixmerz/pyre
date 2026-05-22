@@ -38,6 +38,10 @@ pub enum PaneEventKind {
     StateChanged,
     /// The pane was closed (shell exited or explicit close_pane call).
     Closed,
+    /// The session's split topology changed (open_pane_split, set_pane_weight,
+    /// or close_pane collapsed a split).  Clients should re-fetch layout via
+    /// `get_session_layout`.  Added in PROTO_VERSION 4 (ADR-0005 M7-B).
+    LayoutChanged,
 }
 
 /// One entry in the daemon-side broadcast ring buffer.

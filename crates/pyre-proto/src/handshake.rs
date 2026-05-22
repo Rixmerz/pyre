@@ -9,7 +9,10 @@ use crate::MODE_CONTROL;
 /// Wire protocol version. Bump when breaking RPC or stream framing changes.
 /// v2: adds `exit_code` i64 FAST+INDEXED field to Tantivy schema.
 /// v3: adds `name: Option<String>` to `OpenPaneReq` and `PaneInfo`.
-pub const PROTO_VERSION: u32 = 3;
+/// v4: layout-aware daemon — `LayoutNode` in `pyre_proto::layout`;
+///     `open_pane_split`, `set_pane_weight`, `get_session_layout` RPCs
+///     (ADR-0005, M7-B).
+pub const PROTO_VERSION: u32 = 4;
 
 /// Client: write `MODE_CONTROL` + little-endian `PROTO_VERSION`.
 pub async fn write_control_client<W: AsyncWrite + Unpin>(w: &mut W) -> io::Result<()> {

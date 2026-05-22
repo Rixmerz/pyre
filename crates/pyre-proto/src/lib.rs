@@ -2,6 +2,7 @@
 
 pub mod blocks;
 pub mod handshake;
+pub mod layout;
 pub mod paths;
 pub mod service;
 pub mod sessions;
@@ -10,6 +11,7 @@ pub use blocks::{BlockEvent, BlockHit, ListBlocksReq, SearchBlocksReq};
 pub use handshake::{
     read_control_server, read_control_version_after_tag, write_control_client, PROTO_VERSION,
 };
+pub use layout::{Dir, LayoutNode, Orient, Rect};
 pub use paths::runtime_pyre_dir;
 pub use service::{
     AttachAck, InputFrame, OutputFrame, PaneEvent, PaneEventKind, PidInspect, PyreDaemon,

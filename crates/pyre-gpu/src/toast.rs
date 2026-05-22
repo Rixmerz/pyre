@@ -115,6 +115,9 @@ pub fn pane_event_to_toast(event: &pyre_proto::PaneEvent, ttl: Duration) -> Opti
             Some(PaneStateKind::Idle) | Some(PaneStateKind::Running) => return None,
             _ => return None,
         },
+        // Layout topology changes do not produce a toast — clients re-fetch
+        // via get_session_layout on this event.
+        PaneEventKind::LayoutChanged => return None,
     };
 
     Some(Toast {

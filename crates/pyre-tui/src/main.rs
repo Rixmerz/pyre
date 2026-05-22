@@ -194,6 +194,9 @@ fn pane_event_to_toast(event: &pyre_proto::PaneEvent, ttl: Duration) -> Option<T
                 _ => return None,
             }
         }
+        // Layout topology changes do not produce a toast — clients re-fetch
+        // via get_session_layout on this event (ADR-0005 M7-B).
+        PaneEventKind::LayoutChanged => return None,
     };
 
     Some(Toast {
