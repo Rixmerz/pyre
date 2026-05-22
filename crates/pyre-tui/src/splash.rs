@@ -7,13 +7,17 @@
 //!
 //! Skipped when stdout is not a TTY, `PYRE_NO_SPLASH=1`, or `--no-splash`.
 //!
-//! The splash color palette is overridden by the active theme's palette roles:
-//!   - Core / mid-flame  → `border_focus` (ember/accent role)
-//!   - Tip / hottest     → `cursor`       (spark/bright role)
-//!   - Edges / cool      → `warn`         (amber role, used as flame edge)
+//! The splash color palette is fully derived from the active theme:
+//!   - core_hot (heat ≥ 38, white-hot tip)  → `cursor`
+//!   - core     (heat 29..37, bright body)   → `border_focus`
+//!   - mid      (heat 20..28, mid flame)     → `warn`
+//!   - edge     (heat 10..19, outer edge)    → `accent`
+//!   - smoke    (heat 3..9,   cool tip/ash)  → `fg_dim`
+//!   - bg       (heat 0..2,   cold/black)    → `bg`
+//!   - title_fg (title text, unused here)    → `fg`
 //!
-//! Values below the "edge" threshold still render through the generic fire
-//! gradient so black/cold cells look consistent.
+//! Every heat band blends from the built-in PALETTE base toward the theme
+//! color so the transition between bands stays smooth.
 
 use std::io::{self, IsTerminal, Write};
 use std::thread;
@@ -27,16 +31,25 @@ const FRAMES_TOTAL: usize = 65;
 
 /// Theme-derived color overrides for the splash flame.
 ///
-/// Each field is `(r, g, b)`. `None` means "use the built-in fire palette
-/// entry at that heat level". All three default to `None` so the classic
+/// Every field is `(r, g, b)`.  `None` means "use the built-in fire palette
+/// entry at that heat level".  All fields default to `None` so the classic
 /// ember look is preserved when no theme config is present.
 pub struct SplashColors {
-    /// Color applied at heat levels ≥ 38 (hottest tip / white-hot).
-    pub tip: Option<(u8, u8, u8)>,
-    /// Color applied at heat levels 20..37 (bright core).
+    /// Heat ≥ 38 — white-hot tip / spark.  Maps to `cursor`.
+    pub core_hot: Option<(u8, u8, u8)>,
+    /// Heat 29..37 — bright inner body.    Maps to `border_focus`.
     pub core: Option<(u8, u8, u8)>,
-    /// Color applied at heat levels 8..19 (outer edges).
+    /// Heat 20..28 — mid-flame band.       Maps to `warn`.
+    pub mid: Option<(u8, u8, u8)>,
+    /// Heat 10..19 — outer flame edge.     Maps to `accent`.
     pub edge: Option<(u8, u8, u8)>,
+    /// Heat 3..9  — cool ash / smoke.      Maps to `fg_dim`.
+    pub smoke: Option<(u8, u8, u8)>,
+    /// Heat 0..2  — cold background fill.  Maps to `bg`.
+    pub bg: Option<(u8, u8, u8)>,
+    /// Reserved for future title-text rendering.  Maps to `fg`.
+    #[allow(dead_code)]
+    pub title_fg: Option<(u8, u8, u8)>,
 }
 
 impl SplashColors {
@@ -45,9 +58,13 @@ impl SplashColors {
             (c.0, c.1, c.2)
         }
         Self {
-            tip: Some(rgb(p.cursor)),
+            core_hot: Some(rgb(p.cursor)),
             core: Some(rgb(p.border_focus)),
-            edge: Some(rgb(p.warn)),
+            mid: Some(rgb(p.warn)),
+            edge: Some(rgb(p.accent)),
+            smoke: Some(rgb(p.fg_dim)),
+            bg: Some(rgb(p.bg)),
+            title_fg: Some(rgb(p.fg)),
         }
     }
 }
@@ -63,45 +80,82 @@ pub fn play_splash(no_splash: bool, colors: Option<SplashColors>) {
         return;
     }
     let _ = run_fire(colors.unwrap_or(SplashColors {
-        tip: None,
+        core_hot: None,
         core: None,
+        mid: None,
         edge: None,
+        smoke: None,
+        bg: None,
+        title_fg: None,
     }));
 }
 
-/// Map a heat index (0..=MAX_HEAT) to an `(r, g, b)` triplet, honoring any
-/// theme color overrides for the tip / core / edge heat bands.
+/// Linearly interpolate between `base` (palette default) and `theme` color.
+///
+/// `t` is in [0.0, 1.0]: 0.0 = pure palette base, 1.0 = pure theme color.
+#[inline]
+fn blend(base: (u8, u8, u8), theme: (u8, u8, u8), t: f32) -> (u8, u8, u8) {
+    let r = (base.0 as f32 * (1.0 - t) + theme.0 as f32 * t).round() as u8;
+    let g = (base.1 as f32 * (1.0 - t) + theme.1 as f32 * t).round() as u8;
+    let b = (base.2 as f32 * (1.0 - t) + theme.2 as f32 * t).round() as u8;
+    (r, g, b)
+}
+
+/// Map a heat index (0..=MAX_HEAT) to an `(r, g, b)` triplet, honoring all
+/// theme color overrides across every heat band.
+///
+/// Band layout (inclusive):
+///   ≥ 38         core_hot  — white-hot spark tip
+///   29 ..= 37    core      — bright inner body
+///   20 ..= 28    mid       — mid-flame band
+///   10 ..= 19    edge      — outer flame edge
+///    3 ..=  9    smoke     — cool ash / smoke
+///    0 ..=  2    bg        — cold background fill
+///
+/// Each band blends linearly from the built-in PALETTE base toward the theme
+/// color so no hard color discontinuities appear at band boundaries.
 #[inline]
 fn heat_to_rgb(heat: usize, sc: &SplashColors) -> (u8, u8, u8) {
     let idx = heat.min(MAX_HEAT as usize);
     if idx >= 38 {
-        sc.tip.unwrap_or(PALETTE[idx])
-    } else if idx >= 20 {
-        // Blend palette base toward theme core color so the gradient is smooth.
-        if let Some((tr, tg, tb)) = sc.core {
-            let base = PALETTE[idx];
-            let blend = (idx - 20) as f32 / 18.0; // 0.0 at 20, 1.0 at 38
-            let r = (base.0 as f32 * (1.0 - blend) + tr as f32 * blend).round() as u8;
-            let g = (base.1 as f32 * (1.0 - blend) + tg as f32 * blend).round() as u8;
-            let b = (base.2 as f32 * (1.0 - blend) + tb as f32 * blend).round() as u8;
-            (r, g, b)
+        // core_hot: white-hot tip.  Full substitution (no blend needed — these
+        // are already near-white in the built-in palette).
+        sc.core_hot.unwrap_or(PALETTE[idx])
+    } else if idx >= 29 {
+        // core band: blend 0→1 across indices 29..37.
+        if let Some(theme) = sc.core {
+            let t = (idx - 29) as f32 / 8.0; // 0.0 at 29, 1.0 at 37
+            blend(PALETTE[idx], theme, t)
         } else {
             PALETTE[idx]
         }
-    } else if idx >= 8 {
-        if let Some((tr, tg, tb)) = sc.edge {
-            let base = PALETTE[idx];
-            let blend = (idx - 8) as f32 / 12.0; // 0.0 at 8, 1.0 at 20
-            let r = (base.0 as f32 * (1.0 - blend) + tr as f32 * blend).round() as u8;
-            let g = (base.1 as f32 * (1.0 - blend) + tg as f32 * blend).round() as u8;
-            let b = (base.2 as f32 * (1.0 - blend) + tb as f32 * blend).round() as u8;
-            (r, g, b)
+    } else if idx >= 20 {
+        // mid band: blend 0→1 across indices 20..28.
+        if let Some(theme) = sc.mid {
+            let t = (idx - 20) as f32 / 8.0; // 0.0 at 20, 1.0 at 28
+            blend(PALETTE[idx], theme, t)
+        } else {
+            PALETTE[idx]
+        }
+    } else if idx >= 10 {
+        // edge band: blend 0→1 across indices 10..19.
+        if let Some(theme) = sc.edge {
+            let t = (idx - 10) as f32 / 9.0; // 0.0 at 10, 1.0 at 19
+            blend(PALETTE[idx], theme, t)
+        } else {
+            PALETTE[idx]
+        }
+    } else if idx >= 3 {
+        // smoke / ash: blend 0→1 across indices 3..9.
+        if let Some(theme) = sc.smoke {
+            let t = (idx - 3) as f32 / 6.0; // 0.0 at 3, 1.0 at 9
+            blend(PALETTE[idx], theme, t)
         } else {
             PALETTE[idx]
         }
     } else {
-        // Cold / black cells — always use the built-in dark entries.
-        PALETTE[idx]
+        // bg: cold fill (indices 0..2).  Full substitution toward theme bg.
+        sc.bg.unwrap_or(PALETTE[idx])
     }
 }
 
