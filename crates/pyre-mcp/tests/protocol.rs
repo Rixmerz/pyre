@@ -132,10 +132,15 @@ fn test_tools_list() {
 
     let tools = resp["result"]["tools"].as_array().expect("tools is array");
 
-    assert!(
-        tools.len() >= 11,
-        "expected at least 11 tools, got {}",
-        tools.len()
+    assert_eq!(
+        tools.len(),
+        14,
+        "expected exactly 14 tools, got {}: {:?}",
+        tools.len(),
+        tools
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect::<Vec<_>>()
     );
 
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
@@ -151,13 +156,75 @@ fn test_tools_list() {
         "wait_pane_state",
         "list_sessions",
         "list_panes",
+        "gc_stale_sessions",
         "session_layout",
+        "set_pane_weight",
+        "get_session_layout",
     ] {
         assert!(
             names.contains(expected),
             "tool '{expected}' not in list: {names:?}"
         );
     }
+
+    // Verify set_pane_weight schema shape.
+    let spw = tools
+        .iter()
+        .find(|t| t["name"] == "set_pane_weight")
+        .expect("set_pane_weight tool");
+    let spw_props = &spw["inputSchema"]["properties"];
+    assert!(
+        spw_props["pane_id"].is_object(),
+        "set_pane_weight must have pane_id property"
+    );
+    assert!(
+        spw_props["weight"].is_object(),
+        "set_pane_weight must have weight property"
+    );
+    assert_eq!(
+        spw_props["weight"]["minimum"], 0,
+        "weight minimum must be 0"
+    );
+    assert_eq!(
+        spw_props["weight"]["maximum"], 100,
+        "weight maximum must be 100"
+    );
+
+    // Verify get_session_layout schema shape.
+    let gsl = tools
+        .iter()
+        .find(|t| t["name"] == "get_session_layout")
+        .expect("get_session_layout tool");
+    let gsl_props = &gsl["inputSchema"]["properties"];
+    assert!(
+        gsl_props["session_id"].is_object(),
+        "get_session_layout must have session_id property"
+    );
+    assert_eq!(
+        gsl["inputSchema"]["required"],
+        json!(["session_id"]),
+        "get_session_layout requires session_id"
+    );
+
+    // Verify session_layout has a layout property with orient + panes.
+    let sl = tools
+        .iter()
+        .find(|t| t["name"] == "session_layout")
+        .expect("session_layout tool");
+    let sl_props = &sl["inputSchema"]["properties"];
+    assert!(
+        sl_props["layout"].is_object(),
+        "session_layout must have layout property"
+    );
+    let layout_props = &sl_props["layout"]["properties"];
+    assert!(
+        layout_props["orient"].is_object(),
+        "session_layout.layout must have orient"
+    );
+    assert!(
+        layout_props["panes"].is_object(),
+        "session_layout.layout must have panes"
+    );
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

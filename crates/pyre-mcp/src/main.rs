@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use pyre_proto::{
-    write_control_client, ListBlocksReq, OpenPaneReq, PaneStateKind, PyreDaemonClient,
-    SearchBlocksReq, SessionId, SpawnReq,
+    write_control_client, ListBlocksReq, OpenPaneReq, OpenPaneSplitReq, Orient, PaneStateKind,
+    PyreDaemonClient, SearchBlocksReq, SessionId, SpawnReq,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -601,14 +601,14 @@ impl Server {
                 },
                 {
                     "name": "session_layout",
-                    "description": "Create a session with N panes preconfigured (cwd + optional command per pane). Note: open_pane inherits cwd from the pane's shell invocation; per-pane cwd is passed via OpenPaneReq.",
+                    "description": "Create a session with panes preconfigured via a split spec. Accepts either a flat `panes` array (back-compat) or a `layout` object with `orient` and `panes`. When `layout` is provided, panes are created using open_pane_split RPC calls so the daemon tracks topology. The `orient` field (\"horizontal\"|\"vertical\") is applied uniformly: each subsequent pane is split off the previous one at that orientation. Nested specs are not yet supported — all panes are placed at the same split level.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "name": { "type": "string", "description": "Session name." },
                             "panes": {
                                 "type": "array",
-                                "description": "Panes to create after session spawn. First pane reuses the session's initial pane.",
+                                "description": "Flat pane list (back-compat). First pane reuses the session's initial pane.",
                                 "items": {
                                     "type": "object",
                                     "properties": {
@@ -618,9 +618,53 @@ impl Server {
                                     },
                                     "required": []
                                 }
+                            },
+                            "layout": {
+                                "type": "object",
+                                "description": "Split spec. When present, `panes` at root level is ignored.",
+                                "properties": {
+                                    "orient": { "type": "string", "enum": ["horizontal", "vertical"], "description": "Split orientation applied to all pane splits." },
+                                    "panes": {
+                                        "type": "array",
+                                        "description": "Ordered list of pane specs. First pane reuses the session's initial pane; each subsequent pane is created via open_pane_split.",
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "name": { "type": "string" },
+                                                "cwd": { "type": "string" },
+                                                "cmd": { "type": "string", "description": "Command sent via send_keys with trailing \\n." }
+                                            },
+                                            "required": []
+                                        }
+                                    }
+                                },
+                                "required": ["orient", "panes"]
                             }
                         },
                         "required": ["name"]
+                    }
+                },
+                {
+                    "name": "set_pane_weight",
+                    "description": "Adjust the weight of a pane within its parent split (0-100). The daemon clamps the value to [5, 95] and rebalances siblings so all weights sum to 100. Persists to SQLite and emits LayoutChanged.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "pane_id": { "type": "string", "description": "Full pane UUID or ≥8-char prefix." },
+                            "weight": { "type": "integer", "minimum": 0, "maximum": 100, "description": "Desired weight (0-100). Clamped to [5, 95] by the daemon." }
+                        },
+                        "required": ["pane_id", "weight"]
+                    }
+                },
+                {
+                    "name": "get_session_layout",
+                    "description": "Return the LayoutNode tree for a session as JSON. The tree is a recursive structure of HSplit/VSplit nodes (each child has a weight 0-100) and Leaf nodes (carrying a PaneId UUID).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "session_id": { "type": "string", "description": "Full session UUID or ≥8-char prefix." }
+                        },
+                        "required": ["session_id"]
                     }
                 }
             ]
@@ -648,6 +692,8 @@ impl Server {
             "list_panes" => self.tool_list_panes(args).await?,
             "session_layout" => self.tool_session_layout(args).await?,
             "gc_stale_sessions" => self.tool_gc_stale_sessions().await?,
+            "set_pane_weight" => self.tool_set_pane_weight(args).await?,
+            "get_session_layout" => self.tool_get_session_layout(args).await?,
             other => return Err(anyhow!("unknown tool: {other}")),
         };
 
@@ -987,6 +1033,12 @@ impl Server {
             .ok_or_else(|| anyhow!("missing name"))?
             .to_owned();
 
+        // Determine whether to use the new split-spec path or the legacy flat path.
+        if let Some(layout_spec) = args.get("layout").filter(|v| v.is_object()) {
+            return self.tool_session_layout_split(name, layout_spec).await;
+        }
+
+        // ── Legacy flat-panes path (back-compat) ──────────────────────────────
         let pane_specs = args["panes"].as_array().cloned().unwrap_or_default();
 
         // Derive initial cwd from the first pane spec, if any.
@@ -1061,6 +1113,7 @@ impl Server {
             result_panes.push(json!({
                 "pane_id": pane_id.0.to_string(),
                 "name": pane_name,
+                "path": [idx],
             }));
         }
 
@@ -1069,6 +1122,7 @@ impl Server {
             result_panes.push(json!({
                 "pane_id": initial_pane_id.0.to_string(),
                 "name": "",
+                "path": [0],
             }));
         }
 
@@ -1076,6 +1130,170 @@ impl Server {
             "session_id": session_id.0.to_string(),
             "panes": result_panes,
         }))?)
+    }
+
+    /// Inner helper for the new split-spec path in `session_layout`.
+    ///
+    /// Accepts a `layout` object:
+    /// ```json
+    /// { "orient": "horizontal" | "vertical", "panes": [ {name?, cwd?, cmd?}, ... ] }
+    /// ```
+    ///
+    /// The first pane reuses the session's initial pane.  Each subsequent
+    /// pane is created via `open_pane_split` so the daemon tracks the topology
+    /// and emits `LayoutChanged`.  All splits share the same `orient`.
+    async fn tool_session_layout_split(
+        &self,
+        session_name: String,
+        layout_spec: &Value,
+    ) -> Result<String> {
+        let orient_str = layout_spec["orient"]
+            .as_str()
+            .ok_or_else(|| anyhow!("layout.orient is required"))?;
+        let orient = match orient_str {
+            "horizontal" => Orient::Horizontal,
+            "vertical" => Orient::Vertical,
+            other => {
+                return Err(anyhow!(
+                    "unknown orient '{other}'; expected horizontal|vertical"
+                ))
+            }
+        };
+
+        let pane_specs = layout_spec["panes"]
+            .as_array()
+            .ok_or_else(|| anyhow!("layout.panes must be an array"))?
+            .clone();
+
+        if pane_specs.is_empty() {
+            return Err(anyhow!("layout.panes must contain at least one entry"));
+        }
+
+        // Derive initial cwd from the first pane spec.
+        let first_cwd = pane_specs
+            .first()
+            .and_then(|p| p["cwd"].as_str())
+            .map(PathBuf::from);
+
+        let client = self.client().await?;
+
+        // 1. Spawn the session — pyred creates the initial pane automatically.
+        let spawn_req = SpawnReq {
+            shell: std::env::var("SHELL").ok(),
+            cwd: first_cwd,
+            cols: 80,
+            rows: 24,
+            env: std::env::vars().collect(),
+            name: Some(session_name),
+        };
+        let spawn_resp = client
+            .spawn(tarpc::context::current(), spawn_req)
+            .await
+            .context("rpc spawn")?
+            .map_err(|e| anyhow!("{e}"))?;
+
+        let session_id = spawn_resp.session;
+        // The pane that `open_pane_split` will split off from.
+        let mut last_pane_id = spawn_resp.pane;
+
+        let mut result_panes: Vec<Value> = Vec::new();
+
+        // 2. Walk the spec; first entry reuses initial pane, rest use open_pane_split.
+        for (idx, spec) in pane_specs.iter().enumerate() {
+            let pane_name = spec["name"].as_str().unwrap_or("").to_owned();
+            let cwd = spec["cwd"].as_str().map(PathBuf::from);
+            let cmd = spec["cmd"].as_str().map(str::to_owned);
+
+            let pane_id = if idx == 0 {
+                // Reuse the initial pane; optionally send its command below.
+                last_pane_id
+            } else {
+                // Split the previous pane, producing a new sibling.
+                let split_req = OpenPaneSplitReq {
+                    parent_pane: last_pane_id,
+                    orient,
+                    name: if pane_name.is_empty() {
+                        None
+                    } else {
+                        Some(pane_name.clone())
+                    },
+                    cwd,
+                    cmd: None, // cmd is delivered via send_keys below
+                };
+                let new_id = client
+                    .open_pane_split(tarpc::context::current(), split_req)
+                    .await
+                    .context("rpc open_pane_split")?
+                    .map_err(|e| anyhow!("{e}"))?;
+                last_pane_id = new_id;
+                new_id
+            };
+
+            // Send optional startup command via send_keys.
+            if let Some(c) = cmd {
+                let payload = format!("{c}\n").into_bytes();
+                client
+                    .send_keys(tarpc::context::current(), pane_id, payload)
+                    .await
+                    .context("rpc send_keys")?
+                    .map_err(|e| anyhow!("{e}"))?;
+            }
+
+            result_panes.push(json!({
+                "pane_id": pane_id.0.to_string(),
+                "name": pane_name,
+                "path": [idx],
+            }));
+        }
+
+        Ok(serde_json::to_string_pretty(&json!({
+            "session_id": session_id.0.to_string(),
+            "panes": result_panes,
+        }))?)
+    }
+
+    async fn tool_set_pane_weight(&self, args: &Value) -> Result<String> {
+        let pane_prefix = args["pane_id"]
+            .as_str()
+            .ok_or_else(|| anyhow!("missing pane_id"))?;
+        let weight = args["weight"]
+            .as_u64()
+            .ok_or_else(|| anyhow!("missing weight"))?;
+
+        if weight > 100 {
+            return Err(anyhow!("weight must be 0-100"));
+        }
+
+        let client = self.client().await?;
+        let pane_id = self.resolve_pane_id(&client, pane_prefix).await?;
+
+        client
+            .set_pane_weight(tarpc::context::current(), pane_id, weight as u16)
+            .await
+            .context("rpc set_pane_weight")?
+            .map_err(|e| anyhow!("{e}"))?;
+
+        Ok(format!(
+            "pane {} weight set to {weight}",
+            &pane_id.0.to_string()[..8]
+        ))
+    }
+
+    async fn tool_get_session_layout(&self, args: &Value) -> Result<String> {
+        let session_prefix = args["session_id"]
+            .as_str()
+            .ok_or_else(|| anyhow!("missing session_id"))?;
+
+        let client = self.client().await?;
+        let session_id = self.resolve_session_id(&client, session_prefix).await?;
+
+        let layout = client
+            .get_session_layout(tarpc::context::current(), session_id)
+            .await
+            .context("rpc get_session_layout")?
+            .map_err(|e| anyhow!("{e}"))?;
+
+        Ok(serde_json::to_string_pretty(&layout)?)
     }
 
     async fn tool_gc_stale_sessions(&self) -> Result<String> {
