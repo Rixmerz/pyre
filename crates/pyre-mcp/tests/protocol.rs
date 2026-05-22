@@ -134,8 +134,8 @@ fn test_tools_list() {
 
     assert_eq!(
         tools.len(),
-        14,
-        "expected exactly 14 tools, got {}: {:?}",
+        15,
+        "expected exactly 15 tools, got {}: {:?}",
         tools.len(),
         tools
             .iter()
@@ -160,6 +160,7 @@ fn test_tools_list() {
         "session_layout",
         "set_pane_weight",
         "get_session_layout",
+        "open_pane_split",
     ] {
         assert!(
             names.contains(expected),

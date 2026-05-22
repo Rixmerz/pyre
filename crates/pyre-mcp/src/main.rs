@@ -666,6 +666,21 @@ impl Server {
                         },
                         "required": ["session_id"]
                     }
+                },
+                {
+                    "name": "open_pane_split",
+                    "description": "Split an existing pane: create a new pane next to it. orient = horizontal | vertical.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "parent_pane_id": { "type": "string", "description": "UUID prefix of the existing pane to split off." },
+                            "orient": { "type": "string", "enum": ["horizontal", "vertical"], "description": "horizontal = side-by-side, vertical = stacked." },
+                            "name": { "type": "string" },
+                            "cwd": { "type": "string" },
+                            "cmd": { "type": "string", "description": "Optional command sent via send_keys after spawn." }
+                        },
+                        "required": ["parent_pane_id", "orient"]
+                    }
                 }
             ]
         })
@@ -694,6 +709,7 @@ impl Server {
             "gc_stale_sessions" => self.tool_gc_stale_sessions().await?,
             "set_pane_weight" => self.tool_set_pane_weight(args).await?,
             "get_session_layout" => self.tool_get_session_layout(args).await?,
+            "open_pane_split" => self.tool_open_pane_split(args).await?,
             other => return Err(anyhow!("unknown tool: {other}")),
         };
 
@@ -1341,6 +1357,57 @@ impl Server {
             .map_err(|e| anyhow!("{e}"))?;
 
         Ok(format!("pane_id={}", pane_id.0))
+    }
+
+    async fn tool_open_pane_split(&self, args: &Value) -> Result<String> {
+        let parent_prefix = args["parent_pane_id"]
+            .as_str()
+            .ok_or_else(|| anyhow!("missing parent_pane_id"))?;
+        let orient_str = args["orient"]
+            .as_str()
+            .ok_or_else(|| anyhow!("missing orient"))?;
+        let orient = match orient_str {
+            "horizontal" => Orient::Horizontal,
+            "vertical" => Orient::Vertical,
+            other => {
+                return Err(anyhow!(
+                    "unknown orient '{other}'; expected horizontal|vertical"
+                ))
+            }
+        };
+        let name = args["name"].as_str().map(str::to_owned);
+        let cwd = args["cwd"].as_str().map(PathBuf::from);
+        let cmd = args["cmd"].as_str().map(str::to_owned);
+
+        let client = self.client().await?;
+        let parent_pane_id = self.resolve_pane_id(&client, parent_prefix).await?;
+
+        let req = OpenPaneSplitReq {
+            parent_pane: parent_pane_id,
+            orient,
+            name,
+            cwd,
+            cmd: None, // cmd delivered via send_keys below
+        };
+        let new_pane_id = client
+            .open_pane_split(tarpc::context::current(), req)
+            .await
+            .context("rpc open_pane_split")?
+            .map_err(|e| anyhow!("{e}"))?;
+
+        // Send optional startup command via send_keys.
+        if let Some(c) = cmd {
+            let payload = format!("{c}\n").into_bytes();
+            client
+                .send_keys(tarpc::context::current(), new_pane_id, payload)
+                .await
+                .context("rpc send_keys")?
+                .map_err(|e| anyhow!("{e}"))?;
+        }
+
+        Ok(serde_json::to_string(&serde_json::json!({
+            "pane_id": new_pane_id.0.to_string()
+        }))?)
     }
 }
 
