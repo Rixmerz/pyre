@@ -271,6 +271,38 @@ enum Sub {
         #[command(subcommand)]
         cmd: IntegrationCmd,
     },
+
+    /// Set up an SSH tunnel to attach to a remote pyred instance.
+    ///
+    /// Derives socket paths and prints (or executes) the `ssh -L` command
+    /// so a local `pyre`/`pyrec --socket <local>` can reach pyred on a
+    /// remote machine without pyred needing a TCP listener.
+    ///
+    /// Example:
+    ///   pyrec remote alice@dev.box
+    ///   pyrec remote alice@dev.box --exec
+    ///   pyrec remote alice@dev.box --remote-socket /run/user/1000/pyre.sock
+    Remote {
+        /// Remote host, e.g. alice@dev.box or dev.box
+        host: String,
+
+        /// Path to pyred's socket on the remote host.
+        /// Defaults to ~/.local/share/pyre/socket (resolved on the remote).
+        /// Override to match the remote $XDG_RUNTIME_DIR if needed.
+        #[arg(long, default_value = "~/.local/share/pyre/socket")]
+        remote_socket: String,
+
+        /// Local socket path for the tunnel endpoint.
+        /// Defaults to $XDG_RUNTIME_DIR/pyre-remote-<host>.sock or
+        /// /tmp/pyre-remote-<host>.sock when XDG_RUNTIME_DIR is unset.
+        #[arg(long)]
+        local_socket: Option<PathBuf>,
+
+        /// Fork-exec the ssh tunnel instead of printing the command.
+        /// Blocks until the tunnel dies; open another terminal to connect.
+        #[arg(long)]
+        exec: bool,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -1167,6 +1199,97 @@ async fn run_doctor(socket: PathBuf) -> Result<()> {
     Ok(())
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// Remote subcommand
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Derive the local socket path for a given remote host.
+///
+/// Priority: `--local-socket` arg → `$XDG_RUNTIME_DIR/pyre-remote-<host>.sock`
+/// → `/tmp/pyre-remote-<host>.sock`.
+fn derive_local_socket(host: &str, explicit: Option<PathBuf>) -> PathBuf {
+    if let Some(p) = explicit {
+        return p;
+    }
+    // Sanitise the host string so it is safe as a filename component.
+    let safe_host: String = host
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let filename = format!("pyre-remote-{safe_host}.sock");
+    if let Ok(rt) = std::env::var("XDG_RUNTIME_DIR") {
+        return PathBuf::from(rt).join(filename);
+    }
+    PathBuf::from("/tmp").join(filename)
+}
+
+/// Build the argument list for `ssh -L local:remote host`.
+///
+/// Returns a `Vec<String>` so it is straightforward to unit-test without
+/// spawning a process.
+fn format_ssh_args(host: &str, local_socket: &Path, remote_socket: &str) -> Vec<String> {
+    let local_str = local_socket.display().to_string();
+    // ssh -L takes `local_socket:remote_socket` as a single argument.
+    let tunnel_spec = format!("{local_str}:{remote_socket}");
+    vec!["-L".to_owned(), tunnel_spec, host.to_owned()]
+}
+
+fn run_remote(
+    host: String,
+    remote_socket: String,
+    local_socket: Option<PathBuf>,
+    exec: bool,
+) -> Result<()> {
+    let local = derive_local_socket(&host, local_socket);
+    let args = format_ssh_args(&host, &local, &remote_socket);
+
+    if exec {
+        // Verify that ssh is available before trying to exec it.
+        let ssh_check = std::process::Command::new("ssh")
+            .arg("-V")
+            .stderr(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .status();
+        if ssh_check.is_err() {
+            return Err(anyhow!(
+                "ssh binary not found on PATH; install OpenSSH and retry"
+            ));
+        }
+
+        eprintln!(
+            "Spawning SSH tunnel — open another terminal and run:\n  pyrec --socket {} <cmd>\n  pyre --socket {}\n",
+            local.display(),
+            local.display(),
+        );
+
+        let status = std::process::Command::new("ssh")
+            .args(&args)
+            .status()
+            .map_err(|e| anyhow!("failed to exec ssh: {e}"))?;
+
+        if !status.success() {
+            let code = status.code().unwrap_or(-1);
+            return Err(anyhow!("ssh exited with status {code}"));
+        }
+        Ok(())
+    } else {
+        // Print the exec-ready command.
+        let arg_str = args.join(" ");
+        println!("ssh {arg_str}");
+        println!();
+        println!("Then in another terminal:");
+        println!("  pyrec --socket {} <subcommand>", local.display());
+        println!("  pyre  --socket {}", local.display());
+        Ok(())
+    }
+}
+
 async fn run_split_window(socket: PathBuf, session_prefix: String) -> Result<()> {
     let client = control_client(&socket).await?;
     let session = resolve_session(&client, &session_prefix).await?;
@@ -1311,5 +1434,118 @@ async fn main() -> Result<()> {
         Some(Sub::Integration { cmd }) => match cmd {
             IntegrationCmd::Install { agent } => run_integration_install(&agent),
         },
+        Some(Sub::Remote {
+            host,
+            remote_socket,
+            local_socket,
+            exec,
+        }) => run_remote(host, remote_socket, local_socket, exec),
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Unit tests
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Helper — build a deterministic path without relying on env vars.
+    fn sock(p: &str) -> PathBuf {
+        PathBuf::from(p)
+    }
+
+    // ── format_ssh_args ───────────────────────────────────────────────────────
+
+    #[test]
+    fn ssh_args_basic() {
+        let local = sock("/run/user/1000/pyre-remote-dev.box.sock");
+        let args = format_ssh_args("alice@dev.box", &local, "~/.local/share/pyre/socket");
+        assert_eq!(
+            args,
+            vec![
+                "-L",
+                "/run/user/1000/pyre-remote-dev.box.sock:~/.local/share/pyre/socket",
+                "alice@dev.box",
+            ]
+        );
+    }
+
+    #[test]
+    fn ssh_args_custom_remote() {
+        let local = sock("/tmp/pyre-remote-box.sock");
+        let args = format_ssh_args("box", &local, "/run/user/500/pyre.sock");
+        assert_eq!(args[0], "-L");
+        assert_eq!(args[1], "/tmp/pyre-remote-box.sock:/run/user/500/pyre.sock");
+        assert_eq!(args[2], "box");
+    }
+
+    #[test]
+    fn ssh_args_returns_three_elements() {
+        let local = sock("/tmp/x.sock");
+        let args = format_ssh_args("h", &local, "/tmp/r.sock");
+        assert_eq!(args.len(), 3);
+    }
+
+    // ── derive_local_socket ───────────────────────────────────────────────────
+
+    #[test]
+    fn explicit_local_socket_takes_priority() {
+        let explicit = PathBuf::from("/custom/path.sock");
+        let result = derive_local_socket("any@host", Some(explicit.clone()));
+        assert_eq!(result, explicit);
+    }
+
+    #[test]
+    fn fallback_to_tmp_when_no_xdg() {
+        // Temporarily clear XDG_RUNTIME_DIR if it happens to be set.
+        let saved = std::env::var("XDG_RUNTIME_DIR").ok();
+        std::env::remove_var("XDG_RUNTIME_DIR");
+
+        let result = derive_local_socket("alice@dev.box", None);
+        // Must be under /tmp.
+        assert!(
+            result.starts_with("/tmp"),
+            "expected /tmp prefix, got {result:?}"
+        );
+        // Filename must contain the sanitised host.
+        let name = result.file_name().unwrap().to_string_lossy();
+        assert!(
+            name.contains("alice_dev.box") || name.contains("pyre-remote"),
+            "unexpected filename: {name}"
+        );
+
+        if let Some(v) = saved {
+            std::env::set_var("XDG_RUNTIME_DIR", v);
+        }
+    }
+
+    #[test]
+    fn host_sanitised_in_socket_name() {
+        let saved = std::env::var("XDG_RUNTIME_DIR").ok();
+        std::env::remove_var("XDG_RUNTIME_DIR");
+
+        let result = derive_local_socket("alice@192.168.1.1:22", None);
+        let name = result.file_name().unwrap().to_string_lossy();
+        // '@' and ':' must be replaced; alphanumerics, '-', '.' kept.
+        assert!(!name.contains('@'), "@ should be sanitised");
+        assert!(!name.contains(':'), ": should be sanitised");
+
+        if let Some(v) = saved {
+            std::env::set_var("XDG_RUNTIME_DIR", v);
+        }
+    }
+
+    #[test]
+    fn xdg_runtime_dir_used_when_set() {
+        std::env::set_var("XDG_RUNTIME_DIR", "/run/user/9999");
+        let result = derive_local_socket("dev.box", None);
+        assert!(
+            result.starts_with("/run/user/9999"),
+            "expected XDG_RUNTIME_DIR prefix, got {result:?}"
+        );
+        // Clean up.
+        std::env::remove_var("XDG_RUNTIME_DIR");
     }
 }
