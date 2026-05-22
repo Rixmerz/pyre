@@ -45,8 +45,8 @@ use futures::{SinkExt, StreamExt};
 use layout::{Dir, LayoutNode, Orient, Rect};
 use paint::Painter;
 use pyre_proto::{
-    write_control_client, InputFrame, OpenPaneReq, OutputFrame, PaneId, PaneSize, PyreDaemonClient,
-    ResizePaneReq, SessionId, SpawnReq, SpawnResp, MODE_STREAM,
+    write_control_client, InputFrame, OpenPaneSplitReq, OutputFrame, PaneEventKind, PaneId,
+    PaneSize, PyreDaemonClient, ResizePaneReq, SessionId, SpawnReq, SpawnResp, MODE_STREAM,
 };
 use softbuffer::{Context as SbContext, Surface};
 use tarpc::client;
@@ -189,8 +189,9 @@ impl Selection {
 // ─── App ──────────────────────────────────────────────────────────────────────
 
 struct App {
-    /// Tiling layout tree.
-    layout: LayoutNode,
+    /// Cached tiling layout tree.  Source of truth is the daemon; this is a
+    /// read-only mirror refreshed on `PaneEventKind::LayoutChanged`.
+    cached_layout: LayoutNode,
     /// Currently focused pane.
     focused: PaneId,
     /// Per-pane stream handles.
@@ -215,6 +216,10 @@ struct App {
     needs_redraw: bool,
     session: SessionId,
     socket: PathBuf,
+    /// Shell override from `--shell` CLI flag.  Retained for future use when
+    /// `open_pane_split` gains an optional cmd override; not consumed by the
+    /// current M7-F path which inherits shell from the parent pane.
+    #[allow(dead_code)]
     shell: Option<String>,
     modifiers: ModifiersState,
     /// When `true`, the next keypress is interpreted as a Ctrl+w sub-command.
@@ -239,6 +244,11 @@ struct App {
     toast_deck: ToastDeck,
     /// Toasts produced by the background push-event task.
     toast_rx: mpsc::UnboundedReceiver<toast::Toast>,
+
+    // ── M7-F: layout mirror ───────────────────────────────────────────────────
+    /// Receives refreshed `LayoutNode` snapshots from the push-event task
+    /// whenever a `LayoutChanged` event arrives from the daemon.
+    layout_rx: mpsc::UnboundedReceiver<LayoutNode>,
 }
 
 // ─── ApplicationHandler impl ──────────────────────────────────────────────────
@@ -274,7 +284,7 @@ impl ApplicationHandler for App {
                 self.rows = r;
                 // Resize every pane's TermView proportionally.
                 let vp = self.viewport_rect();
-                let leaves = self.layout.leaves(vp);
+                let leaves = self.cached_layout.leaves(vp);
                 for (pane_id, rect) in &leaves {
                     if let Some(tv) = self.terms.get(pane_id) {
                         let (pc, pr) = rect_to_cells(*rect);
@@ -388,6 +398,8 @@ impl ApplicationHandler for App {
             self.toast_deck.push(t.title, t.body, t.kind);
             self.needs_redraw = true;
         }
+        // Apply any daemon-pushed layout refreshes (M7-F).
+        self.drain_layout_updates();
         // Expire stale toasts; schedule redraw if any remain live.
         self.toast_deck.tick();
         if self.toast_deck.has_live() {
@@ -547,7 +559,7 @@ impl App {
     }
 
     fn move_focus(&mut self, dir: Dir) {
-        if let Some(next) = self.layout.focus_dir(&self.focused, dir) {
+        if let Some(next) = self.cached_layout.focus_dir(&self.focused, dir) {
             self.focused = next;
             self.update_title();
         }
@@ -557,7 +569,7 @@ impl App {
     fn cycle_pane(&mut self, delta: isize) {
         let vp = self.viewport_rect();
         let leaves: Vec<PaneId> = self
-            .layout
+            .cached_layout
             .leaves(vp)
             .into_iter()
             .map(|(id, _)| id)
@@ -576,55 +588,38 @@ impl App {
         self.needs_redraw = true;
     }
 
-    /// Open a new pane adjacent to `self.focused` via the daemon's `open_pane` RPC.
+    /// Open a new pane adjacent to `self.focused` by delegating to the daemon's
+    /// `open_pane_split` RPC (M7-F).  The daemon updates the layout tree,
+    /// persists it, and emits `LayoutChanged`; the push-event task will
+    /// refresh `cached_layout` when that event arrives.
     fn spawn_pane(&mut self, orient: Orient) {
-        let vp = self.viewport_rect();
         let focused = self.focused;
-        // Compute the size the new pane will get (half of focused rect).
-        let focused_rect = self.layout.rect_for(vp, &focused).unwrap_or(vp);
-        let (new_cols, new_rows) = match orient {
-            Orient::Vertical => {
-                let c = ((focused_rect.w as usize / 2) / atlas::CELL_W).max(20);
-                let r = (focused_rect.h as usize / atlas::CELL_H).max(8);
-                (c, r)
-            }
-            Orient::Horizontal => {
-                let c = (focused_rect.w as usize / atlas::CELL_W).max(20);
-                let r = ((focused_rect.h as usize / 2) / atlas::CELL_H).max(8);
-                (c, r)
-            }
-        };
-
-        let req = OpenPaneReq {
-            session: self.session,
-            shell: self.shell.clone().or_else(|| std::env::var("SHELL").ok()),
-            cwd: std::env::current_dir().ok(),
-            cols: new_cols as u16,
-            rows: new_rows as u16,
-            env: std::env::vars().collect(),
+        let req = OpenPaneSplitReq {
+            parent_pane: focused,
+            orient,
             name: None,
+            cwd: std::env::current_dir().ok(),
+            cmd: None,
         };
         let client = self.control.clone();
-        let session = self.session;
 
-        // We need the new PaneId synchronously to update the layout; use a
-        // blocking call via a one-shot channel so the event handler returns quickly.
+        // We need the new PaneId to open the stream; use an unbounded channel
+        // so the event handler returns immediately and drain_pending_panes picks
+        // it up on the next about_to_wait tick.
         let (tx, rx) = mpsc::unbounded_channel::<PaneId>();
         tokio::spawn(async move {
-            match client.open_pane(tarpc::context::current(), req).await {
+            match client.open_pane_split(tarpc::context::current(), req).await {
                 Ok(Ok(pane_id)) => {
                     let _ = tx.send(pane_id);
                 }
-                Ok(Err(e)) => tracing::error!("open_pane rpc error: {e}"),
-                Err(e) => tracing::error!("open_pane transport: {e:#}"),
+                Ok(Err(e)) => tracing::error!("open_pane_split rpc error: {e}"),
+                Err(e) => tracing::error!("open_pane_split transport: {e:#}"),
             }
-            // Keep session alive inside the async block.
-            let _ = session;
         });
 
-        // Poll for the result without blocking the event loop. Because winit
-        // event handlers cannot await, we'll pick it up in about_to_wait via a
-        // pending spawn using a thread-local queue.
+        // Queue for drain_pending_panes; orient is recorded only for the
+        // approx TermView sizing heuristic — the authoritative layout comes
+        // from the daemon via LayoutChanged.
         PENDING_PANES.with(|p| {
             p.borrow_mut().push(PendingPane {
                 rx,
@@ -652,8 +647,8 @@ impl App {
     }
 
     fn insert_pane(&mut self, pane_id: PaneId, orient: Orient, focused_id: PaneId) {
-        // Build TermView for this pane.
-        let vp = self.viewport_rect();
+        // Build TermView with an approximate size.  The authoritative layout
+        // arrives via the LayoutChanged event and will trigger a resize then.
         let approx_cols = (self.cols / 2).max(20);
         let approx_rows = (self.rows / 2).max(8);
         let tv = Arc::new(Mutex::new(TermView::new(approx_cols, approx_rows)));
@@ -663,20 +658,13 @@ impl App {
         let handle = open_stream(self.socket.clone(), self.session, pane_id);
         self.streams.insert(pane_id, handle);
 
-        // Update layout.
-        self.layout.split_focused(&focused_id, pane_id, orient);
+        // Do NOT mutate cached_layout here — the daemon owns the layout and
+        // will emit LayoutChanged, which the push-event task handles by
+        // calling get_session_layout and sending a fresh LayoutNode to
+        // layout_rx.  We apply it in about_to_wait (drain_layout_updates).
 
-        // Recompute this pane's TermView size from its new rect.
-        if let Some(rect) = self.layout.rect_for(vp, &pane_id) {
-            let (pc, pr) = rect_to_cells(rect);
-            if let Some(tv) = self.terms.get(&pane_id) {
-                if let Ok(mut tv) = tv.lock() {
-                    tv.resize(pc, pr);
-                }
-            }
-        }
-
-        // Focus the new pane.
+        // Focus the new pane immediately so the user sees the cursor move.
+        let _ = (orient, focused_id); // suppress unused-variable warnings
         self.focused = pane_id;
         self.update_title();
         self.needs_redraw = true;
@@ -693,7 +681,7 @@ impl App {
         });
 
         // Remove from layout; get new focus candidate.
-        let new_focus = self.layout.close(&self.focused);
+        let new_focus = self.cached_layout.close(&self.focused);
         // Drop stream handle (stream task stops when _cancel is dropped).
         self.streams.remove(&pane_id);
         self.terms.remove(&pane_id);
@@ -718,6 +706,32 @@ impl App {
         }
     }
 
+    /// Drain any layout snapshots pushed by the push-event task and apply the
+    /// most recent one to `cached_layout` (M7-F).  Multiple snapshots in a
+    /// single tick are coalesced — only the last one is applied.
+    fn drain_layout_updates(&mut self) {
+        let mut latest: Option<LayoutNode> = None;
+        while let Ok(node) = self.layout_rx.try_recv() {
+            latest = Some(node);
+        }
+        if let Some(node) = latest {
+            self.cached_layout = node;
+            // Resize every pane's TermView to match its new rect.
+            let vp = self.viewport_rect();
+            let leaves = self.cached_layout.leaves(vp);
+            for (pane_id, rect) in &leaves {
+                if let Some(tv) = self.terms.get(pane_id) {
+                    let (pc, pr) = rect_to_cells(*rect);
+                    if let Ok(mut tv) = tv.lock() {
+                        tv.resize(pc, pr);
+                        tv.flush_pending();
+                    }
+                }
+            }
+            self.needs_redraw = true;
+        }
+    }
+
     fn draw_frame(&mut self) {
         if self.surface.is_none() {
             return;
@@ -737,7 +751,7 @@ impl App {
         };
 
         // Paint each pane.
-        let leaves: Vec<(PaneId, Rect)> = self.layout.leaves(vp);
+        let leaves: Vec<(PaneId, Rect)> = self.cached_layout.leaves(vp);
         for (pane_id, rect) in &leaves {
             let (cell_cols, cell_rows) = rect_to_cells(*rect);
             let cells = self
@@ -829,7 +843,7 @@ impl App {
     /// Return the `PaneId` whose pixel rect contains `(px, py)`, if any.
     fn pane_at_px(&self, px: f64, py: f64) -> Option<PaneId> {
         let vp = self.viewport_rect();
-        let leaves = self.layout.leaves(vp);
+        let leaves = self.cached_layout.leaves(vp);
         for (pane_id, rect) in leaves {
             if rect.contains_pt(px as u32, py as u32) {
                 return Some(pane_id);
@@ -843,7 +857,7 @@ impl App {
     fn try_hit_boundary(&self, px: f64, py: f64) -> Option<DragResize> {
         const BORDER_HIT_PX: f64 = 6.0;
         let vp = self.viewport_rect();
-        let leaves = self.layout.leaves(vp);
+        let leaves = self.cached_layout.leaves(vp);
 
         // Check vertical boundaries (VSplit → right edge of left pane).
         for i in 0..leaves.len() {
@@ -909,7 +923,7 @@ impl App {
         let new_right = 100u16.saturating_sub(new_left);
 
         apply_weights_for_pair(
-            &mut self.layout,
+            &mut self.cached_layout,
             &drag.left_pane,
             &drag.right_pane,
             new_left,
@@ -961,7 +975,36 @@ impl App {
 
     fn handle_left_up(&mut self) {
         self.left_held = false;
-        self.drag_resize = None;
+
+        // On drag-resize release, commit the final weight to the daemon
+        // (M7-F).  The local cached_layout already reflects the snappy
+        // preview weight; the daemon will persist it, rebalance siblings, and
+        // emit LayoutChanged so the cache is reconciled.
+        if let Some(drag) = self.drag_resize.take() {
+            let (px, py) = self.cursor_pos;
+            let current = match drag.axis {
+                DragAxis::Vertical => px,
+                DragAxis::Horizontal => py,
+            };
+            // Compute the final weight for the left/top pane (same formula as
+            // apply_drag_weights, but without clamping the local tree again).
+            let delta_px = current - drag.start_px;
+            let total_px = drag.viewport_dim as f64;
+            let delta_pct = (delta_px / total_px * 100.0) as i32;
+            let final_weight = (drag.start_weight_left as i32 + delta_pct).clamp(5, 95) as u16;
+
+            let client = self.control.clone();
+            let left_pane = drag.left_pane;
+            tokio::spawn(async move {
+                if let Err(e) = client
+                    .set_pane_weight(tarpc::context::current(), left_pane, final_weight)
+                    .await
+                {
+                    tracing::warn!("set_pane_weight rpc: {e:#}");
+                }
+            });
+        }
+
         if let Some(ref mut sel) = self.selection {
             sel.dragging = false;
         }
@@ -1074,7 +1117,7 @@ impl App {
     /// the top-left of the given pane's content rect. Clamps to the pane bounds.
     fn px_to_cell_in_pane(&self, pane_id: PaneId, px: f64, py: f64) -> (usize, usize) {
         let vp = self.viewport_rect();
-        let rect = self.layout.rect_for(vp, &pane_id).unwrap_or(vp);
+        let rect = self.cached_layout.rect_for(vp, &pane_id).unwrap_or(vp);
         let rel_x = (px as u32).saturating_sub(rect.x) as usize;
         let rel_y = (py as u32).saturating_sub(rect.y) as usize;
         let col = rel_x / atlas::CELL_W;
@@ -1536,8 +1579,24 @@ async fn main() -> Result<()> {
     let (cols, rows) = (80usize, 24usize);
     let term = Arc::new(Mutex::new(TermView::new(cols, rows)));
 
-    // Build initial single-pane layout.
-    let layout = LayoutNode::Leaf(pane);
+    // Fetch the authoritative layout from the daemon (M7-F).  Fall back to a
+    // single-leaf placeholder if the RPC fails (e.g. older daemon without M7-B).
+    let layout = match client
+        .get_session_layout(tarpc::context::current(), session)
+        .await
+    {
+        Ok(Ok(node)) => node,
+        Ok(Err(e)) => {
+            tracing::warn!("get_session_layout error: {e}; falling back to single-pane layout");
+            LayoutNode::Leaf(pane)
+        }
+        Err(e) => {
+            tracing::warn!(
+                "get_session_layout transport: {e:#}; falling back to single-pane layout"
+            );
+            LayoutNode::Leaf(pane)
+        }
+    };
     let mut terms: HashMap<PaneId, Arc<Mutex<TermView>>> = HashMap::new();
     terms.insert(pane, term);
 
@@ -1545,21 +1604,24 @@ async fn main() -> Result<()> {
     let mut streams: HashMap<PaneId, StreamHandle> = HashMap::new();
     streams.insert(pane, stream_handle);
 
-    // ── Toast background task ─────────────────────────────────────────────────
-    // Mirrors the TUI's push-event task: long-polls `next_pane_event` and
-    // sends Toast structs into an unbounded channel drained each frame.
+    // ── Push-event background task ────────────────────────────────────────────
+    // Long-polls `next_pane_event` and fans events out to two channels:
+    //   toast_tx  — toast notifications (drained each frame by drain_toast)
+    //   layout_tx — refreshed LayoutNode snapshots on LayoutChanged (M7-F)
     let notif_cfg = pyre_themes::config::load_notifications_config().unwrap_or_default();
     let (toast_tx, toast_rx) = mpsc::unbounded_channel::<toast::Toast>();
+    let (layout_tx, layout_rx) = mpsc::unbounded_channel::<LayoutNode>();
     {
         let push_socket = socket.clone();
         let ttl = Duration::from_millis(notif_cfg.ttl_ms);
+        let layout_push_client = client.clone();
         tokio::spawn(async move {
             let mut seq: u64 = 0;
             let mut backoff = Duration::from_millis(200);
             loop {
                 // Each iteration needs a fresh control connection; reuse the
                 // same helper used by the main path.
-                let client = match async {
+                let poll_client = match async {
                     let mut sock = UnixStream::connect(&push_socket).await?;
                     write_control_client(&mut sock).await?;
                     let transport = tarpc::serde_transport::new(
@@ -1581,7 +1643,7 @@ async fn main() -> Result<()> {
                 };
                 backoff = Duration::from_millis(200);
 
-                match client
+                match poll_client
                     .next_pane_event(tarpc::context::current(), seq, 30_000)
                     .await
                 {
@@ -1589,9 +1651,27 @@ async fn main() -> Result<()> {
                         if let Some(last) = events.last() {
                             seq = last.seq;
                         }
+                        let mut layout_changed = false;
                         for ev in &events {
                             if let Some(t) = toast::pane_event_to_toast(ev, ttl) {
                                 let _ = toast_tx.send(t);
+                            }
+                            if ev.kind == PaneEventKind::LayoutChanged {
+                                layout_changed = true;
+                            }
+                        }
+                        // On LayoutChanged, re-fetch the authoritative layout
+                        // from the daemon and push it into layout_rx (M7-F).
+                        if layout_changed {
+                            match layout_push_client
+                                .get_session_layout(tarpc::context::current(), session)
+                                .await
+                            {
+                                Ok(Ok(node)) => {
+                                    let _ = layout_tx.send(node);
+                                }
+                                Ok(Err(e)) => tracing::warn!("get_session_layout error: {e}"),
+                                Err(e) => tracing::warn!("get_session_layout transport: {e:#}"),
                             }
                         }
                     }
@@ -1608,7 +1688,8 @@ async fn main() -> Result<()> {
     let toast_deck = ToastDeck::new(notif_cfg.enabled, notif_cfg.ttl_ms, notif_cfg.max_visible);
 
     let app = App {
-        layout,
+        cached_layout: layout,
+        layout_rx,
         focused: pane,
         streams,
         terms,
