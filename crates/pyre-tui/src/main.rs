@@ -1189,7 +1189,6 @@ fn pane_leaves_in_order(node: &LayoutNode) -> Vec<PaneId> {
     }
 }
 
-
 /// Return the slot index for `focus_pane` in `slots`.
 fn focused_slot_idx(focus_pane: PaneId, slots: &[Option<PaneSlot>]) -> Option<usize> {
     pane_to_slot_idx(slots, focus_pane)
@@ -3140,7 +3139,8 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
                     if let Some(slot_idx) = pane_to_slot_idx(&state.slots, *pane_id) {
                         focus_slot(state, slot_idx);
                         if let Some(slot) = state.slots[slot_idx].as_mut() {
-                            slot.scroll_offset = (slot.scroll_offset + 3).min(slot.scrollback_capacity);
+                            slot.scroll_offset =
+                                (slot.scroll_offset + 3).min(slot.scrollback_capacity);
                         }
                     }
                     return true;
@@ -3825,9 +3825,9 @@ fn close_pane_by_slot_idx(state: &mut AppState, slot_idx: usize) {
                 tab_idx.min(state.sessions[sess_idx].tabs.len() - 1);
             // Reset focus to first leaf of new active tab.
             let new_tab_idx = state.sessions[sess_idx].active_tab;
-            if let Some(&first_pane) = pane_leaves_in_order(
-                &state.sessions[sess_idx].tabs[new_tab_idx].root,
-            ).first() {
+            if let Some(&first_pane) =
+                pane_leaves_in_order(&state.sessions[sess_idx].tabs[new_tab_idx].root).first()
+            {
                 state.sessions[sess_idx].tabs[new_tab_idx].focus_pane = first_pane;
             }
         }
@@ -4392,7 +4392,10 @@ async fn run_tui(
                     // Collect all pane IDs currently tracked in this SessionView.
                     let local_pane_ids: Vec<PaneId> = {
                         let sv = &state.sessions[sv_idx];
-                        sv.tabs.iter().flat_map(|tab| pane_leaves_in_order(&tab.root)).collect()
+                        sv.tabs
+                            .iter()
+                            .flat_map(|tab| pane_leaves_in_order(&tab.root))
+                            .collect()
                     };
 
                     // Ask daemon which panes belong to this session.
@@ -4576,7 +4579,9 @@ async fn run_tui(
                                     for (ti, tab) in sv.tabs.iter().enumerate() {
                                         for pid in pane_leaves_in_order(&tab.root) {
                                             if pid == target_pane {
-                                                if let Some(slot_idx) = pane_to_slot_idx(&state.slots, pid) {
+                                                if let Some(slot_idx) =
+                                                    pane_to_slot_idx(&state.slots, pid)
+                                                {
                                                     jump = Some((si, ti, pid, slot_idx));
                                                     if si == state.active_session {
                                                         break 'search_jump;
@@ -5285,7 +5290,9 @@ async fn run_tui(
                                     for (ti, tab) in sv.tabs.iter().enumerate() {
                                         for pid in pane_leaves_in_order(&tab.root) {
                                             if pid == target_pane {
-                                                if let Some(slot_idx) = pane_to_slot_idx(&state.slots, pid) {
+                                                if let Some(slot_idx) =
+                                                    pane_to_slot_idx(&state.slots, pid)
+                                                {
                                                     jump = Some((si, ti, pid, slot_idx));
                                                     if si == state.active_session {
                                                         break 'outer;
