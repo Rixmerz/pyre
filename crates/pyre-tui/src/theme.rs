@@ -150,6 +150,7 @@ impl LegacyTheme {
 
 /// The Ember palette as a `LegacyTheme` for use by `fire_motion` and render
 /// code that hasn't been migrated yet.
+#[allow(dead_code)]
 pub const EMBER: LegacyTheme = LegacyTheme {
     bg: Color::Rgb(0x0d, 0x0a, 0x08),
     surface: Color::Rgb(0x1a, 0x14, 0x10),

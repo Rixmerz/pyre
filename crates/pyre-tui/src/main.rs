@@ -64,7 +64,7 @@ use std::collections::HashMap;
 use std::process::Stdio;
 use tarpc::client;
 use tarpc::tokio_serde::formats::Bincode;
-use theme::EMBER;
+// EMBER constant removed — all render paths use LegacyTheme::from_palette now.
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::process::Command as TokioCommand;
@@ -923,6 +923,8 @@ struct ThemePickerState {
     cursor: usize,
     /// Snapshot of theme names from the registry, in display order.
     names: Vec<&'static str>,
+    /// Theme that was active when the picker opened — restored on Esc/q.
+    original_theme: Theme,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1050,6 +1052,9 @@ struct ContextMenu {
     cursor: usize,
     /// Slot index of the pane that was right-clicked.
     target_slot: usize,
+    /// Per-item rects written by render_context_menu each frame so mouse-left
+    /// can hit-test individual items without recomputing the clamped popup rect.
+    item_rects: Vec<Rect>,
 }
 
 /// Per-session view: tabs and panes for one daemon session.
@@ -1153,6 +1158,8 @@ struct AppState {
 enum PendingMenuAction {
     /// Execute the highlighted item of the context menu.
     ContextMenuCommit,
+    /// Activate a specific context menu item by index (mouse-left on item row).
+    ContextMenuActivate(usize),
     /// Split active pane horizontally (HSplit).
     SplitH,
     /// Split active pane vertically (VSplit).
@@ -2303,7 +2310,8 @@ fn render_name_prompt(
 ///
 /// Layout: centered modal ~60% wide × ~70% tall.
 /// Each row shows: `[kind] display_name  ░ bg ░ fg ░ accent ░ border_focus ░ cursor ░ ok ░ warn ░ error`
-fn render_theme_picker(frame: &mut ratatui::Frame, state: &AppState) {
+/// Each swatch reflects THAT theme's own palette, not the active theme.
+fn render_theme_picker(frame: &mut ratatui::Frame, state: &AppState, t: &theme::LegacyTheme) {
     let picker = match state.theme_picker.as_ref() {
         Some(p) => p,
         None => return,
@@ -2324,12 +2332,12 @@ fn render_theme_picker(frame: &mut ratatui::Frame, state: &AppState) {
     let outer = RatatuiBlock::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Double)
-        .border_style(EMBER.border_focus())
+        .border_style(t.border_focus())
         .title(Span::styled(
             " theme picker  ↑/↓ select  Enter apply  Esc cancel ",
-            EMBER.title(EMBER.primary),
+            t.title(t.primary),
         ))
-        .style(EMBER.overlay());
+        .style(t.overlay());
     let inner = outer.inner(overlay_rect);
     frame.render_widget(outer, overlay_rect);
 
@@ -2343,34 +2351,36 @@ fn render_theme_picker(frame: &mut ratatui::Frame, state: &AppState) {
     };
 
     for (row_idx, theme_idx) in (scroll_top..).take(visible_rows).enumerate() {
-        let Some(theme) = themes.get(theme_idx) else {
+        let Some(row_theme) = themes.get(theme_idx) else {
             break;
         };
 
         let y_pos = inner.y + row_idx as u16;
         let is_selected = theme_idx == picker.cursor;
 
-        let kind_badge = match theme.kind {
+        let kind_badge = match row_theme.kind {
             pyre_themes::ThemeKind::Dark => "dark ",
             pyre_themes::ThemeKind::Light => "lite ",
         };
 
-        // Build the row with 8 swatch cells.
+        // Each swatch uses THAT theme's own palette colours so the user can
+        // see what each theme looks like before committing.
         let swatch_roles: [ratatui::style::Color; 8] = [
-            theme.palette.bg.to_ratatui(),
-            theme.palette.fg.to_ratatui(),
-            theme.palette.accent.to_ratatui(),
-            theme.palette.border_focus.to_ratatui(),
-            theme.palette.cursor.to_ratatui(),
-            theme.palette.ok.to_ratatui(),
-            theme.palette.warn.to_ratatui(),
-            theme.palette.error.to_ratatui(),
+            row_theme.palette.bg.to_ratatui(),
+            row_theme.palette.fg.to_ratatui(),
+            row_theme.palette.accent.to_ratatui(),
+            row_theme.palette.border_focus.to_ratatui(),
+            row_theme.palette.cursor.to_ratatui(),
+            row_theme.palette.ok.to_ratatui(),
+            row_theme.palette.warn.to_ratatui(),
+            row_theme.palette.error.to_ratatui(),
         ];
 
-        let row_bg = if is_selected { EMBER.primary } else { EMBER.bg };
-        let row_fg = if is_selected { EMBER.bg } else { EMBER.text };
+        // Selected row uses active theme's primary/bg; others use active bg/fg.
+        let row_bg = if is_selected { t.primary } else { t.bg };
+        let row_fg = if is_selected { t.bg } else { t.text };
 
-        let label = format!("{kind_badge}{}", theme.display_name);
+        let label = format!("{kind_badge}{}", row_theme.display_name);
         let mut spans: Vec<Span> = vec![Span::styled(
             format!(" {label:<28} "),
             Style::default().fg(row_fg).bg(row_bg),
@@ -2423,6 +2433,8 @@ fn render_context_menu(frame: &mut ratatui::Frame, state: &mut AppState, t: &the
     frame.render_widget(block, popup);
 
     let cursor = menu.cursor;
+    // Collect item rects so the mouse handler can hit-test individual rows.
+    let mut new_item_rects: Vec<Rect> = Vec::with_capacity(MENU_ITEMS.len());
     for (idx, item) in MENU_ITEMS.iter().enumerate() {
         if idx >= inner.height as usize {
             break;
@@ -2435,10 +2447,13 @@ fn render_context_menu(frame: &mut ratatui::Frame, state: &mut AppState, t: &the
             Style::default().fg(t.text).bg(t.bg)
         };
         let label = format!("{:<width$}", item.label(), width = inner.width as usize);
-        frame.render_widget(
-            Paragraph::new(Span::styled(label, style)),
-            Rect::new(inner.x, row_y, inner.width, 1),
-        );
+        let item_rect = Rect::new(inner.x, row_y, inner.width, 1);
+        frame.render_widget(Paragraph::new(Span::styled(label, style)), item_rect);
+        new_item_rects.push(item_rect);
+    }
+    // Write back so the mouse handler has fresh rects every frame.
+    if let Some(ref mut m) = state.context_menu {
+        m.item_rects = new_item_rects;
     }
 }
 
@@ -2468,10 +2483,7 @@ fn draw_frame(
         let status_area = outer[3];
 
         // Frame clear — paint entire frame with bg_style so no bleed.
-        frame.render_widget(
-            RatatuiBlock::default().style(EMBER.bg_style()),
-            frame.area(),
-        );
+        frame.render_widget(RatatuiBlock::default().style(t.bg_style()), frame.area());
 
         // ── Row 0: sessions strip ──
         {
@@ -2490,18 +2502,18 @@ fn draw_frame(
                     .is_some_and(|p| p.state == pyre_proto::PaneStateKind::WaitingInput && !p.seen);
                 let anim_f = state.anim.frame();
                 let style = if i == state.active_session {
-                    EMBER.tab_active()
+                    t.tab_active()
                 } else if needs_attention {
                     fire_motion::ember_fg_style(
                         anim_f,
                         sv.id.0.as_u128() as u32,
-                        EMBER.spark,
-                        EMBER.primary,
+                        t.spark,
+                        t.primary,
                         1.0,
                     )
-                    .bg(EMBER.bg)
+                    .bg(t.bg)
                 } else {
-                    EMBER.tab_inactive()
+                    t.tab_inactive()
                 };
                 if sessions_area.height > 0 {
                     new_session_rects.push((i, Rect::new(x_cursor, sessions_area.y, len, 1)));
@@ -2509,7 +2521,7 @@ fn draw_frame(
                 x_cursor += len;
                 spans.push(Span::styled(label, style));
                 if i + 1 < state.sessions.len() {
-                    spans.push(Span::styled(" ", Style::default().bg(EMBER.bg)));
+                    spans.push(Span::styled(" ", Style::default().bg(t.bg)));
                     x_cursor += 1;
                 }
             }
@@ -2527,15 +2539,15 @@ fn draw_frame(
                 None
             };
             if !spans.is_empty() {
-                spans.push(Span::styled(" ", Style::default().bg(EMBER.bg)));
+                spans.push(Span::styled(" ", Style::default().bg(t.bg)));
             }
-            spans.push(Span::styled(plus_label, EMBER.tab_inactive()));
+            spans.push(Span::styled(plus_label, t.tab_inactive()));
 
             state.session_strip_rects = new_session_rects;
             state.session_plus_rect = plus_rect;
 
             frame.render_widget(
-                Paragraph::new(Line::from(spans)).style(Style::default().bg(EMBER.bg)),
+                Paragraph::new(Line::from(spans)).style(Style::default().bg(t.bg)),
                 sessions_area,
             );
         }
@@ -2553,9 +2565,9 @@ fn draw_frame(
                 let label = format!(" {} ×", i + 1);
                 let len = label.chars().count() as u16;
                 let style = if i == sv.active_tab {
-                    EMBER.tab_active()
+                    t.tab_active()
                 } else {
-                    EMBER.tab_inactive()
+                    t.tab_inactive()
                 };
                 if tabs_area.height > 0 {
                     new_tab_chip_rects.push((i, Rect::new(x_cursor, tabs_area.y, len, 1)));
@@ -2563,7 +2575,7 @@ fn draw_frame(
                 x_cursor += len;
                 spans.push(Span::styled(label, style));
                 if i + 1 < total_tabs {
-                    spans.push(Span::styled(" ", Style::default().bg(EMBER.bg)));
+                    spans.push(Span::styled(" ", Style::default().bg(t.bg)));
                     x_cursor += 1;
                 }
             }
@@ -2579,15 +2591,15 @@ fn draw_frame(
                     None
                 };
             if !spans.is_empty() {
-                spans.push(Span::styled(" ", Style::default().bg(EMBER.bg)));
+                spans.push(Span::styled(" ", Style::default().bg(t.bg)));
             }
-            spans.push(Span::styled(plus_label, EMBER.tab_inactive()));
+            spans.push(Span::styled(plus_label, t.tab_inactive()));
 
             state.tab_plus_rect = plus_rect;
             state.tab_chip_rects = new_tab_chip_rects;
 
             frame.render_widget(
-                Paragraph::new(Line::from(spans)).style(Style::default().bg(EMBER.bg)),
+                Paragraph::new(Line::from(spans)).style(Style::default().bg(t.bg)),
                 tabs_area,
             );
         }
@@ -2718,34 +2730,34 @@ fn draw_frame(
             // Right: mode indicator + optional ZOOM chip
             let right_text = format!(" {mode_label} ");
 
-            let mut status_spans: Vec<Span> = vec![Span::styled(left_text, EMBER.status())];
+            let mut status_spans: Vec<Span> = vec![Span::styled(left_text, t.status())];
             if let Some(msg) = mid_msg {
                 status_spans.push(Span::styled(
                     msg,
-                    Style::default().fg(EMBER.secondary).bg(EMBER.surface),
+                    Style::default().fg(t.secondary).bg(t.surface),
                 ));
             }
             // Spacer to push mode to right — approximate with bg fill.
-            status_spans.push(Span::styled(" ", Style::default().bg(EMBER.surface)));
+            status_spans.push(Span::styled(" ", Style::default().bg(t.surface)));
             if is_zoomed {
                 status_spans.push(Span::styled(
                     " ZOOM ",
                     Style::default()
-                        .fg(EMBER.bg)
-                        .bg(EMBER.primary)
+                        .fg(t.bg)
+                        .bg(t.primary)
                         .add_modifier(Modifier::BOLD),
                 ));
             }
             status_spans.push(Span::styled(
                 right_text,
                 Style::default()
-                    .fg(EMBER.bg)
-                    .bg(EMBER.primary)
+                    .fg(t.bg)
+                    .bg(t.primary)
                     .add_modifier(Modifier::BOLD),
             ));
 
             frame.render_widget(
-                Paragraph::new(Line::from(status_spans)).style(EMBER.status()),
+                Paragraph::new(Line::from(status_spans)).style(t.status()),
                 status_area,
             );
         }
@@ -2765,7 +2777,7 @@ fn draw_frame(
         } else {
             state.pager_rect = None;
             if state.theme_picker.is_some() {
-                render_theme_picker(frame, state);
+                render_theme_picker(frame, state, &t);
             } else if let Some(ref prompt) = state.prompt {
                 render_name_prompt(frame, prompt, state.anim.frame(), &t);
             } else if state.search.open {
@@ -3094,6 +3106,27 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
         }
     }
 
+    // Context menu mouse-left: hit-test item_rects written by the last render frame.
+    // Must run before the general Left handler so the click is consumed, not passed through.
+    if let MouseEventKind::Down(MouseButton::Left) = me.kind {
+        if state.context_menu.is_some() {
+            let item_rects = state
+                .context_menu
+                .as_ref()
+                .map(|m| m.item_rects.clone())
+                .unwrap_or_default();
+            for (idx, rect) in item_rects.iter().enumerate() {
+                if rect_contains(*rect, col, row) {
+                    if let Some(ref mut m) = state.context_menu {
+                        m.cursor = idx;
+                    }
+                    state.pending_menu_action = Some(PendingMenuAction::ContextMenuActivate(idx));
+                    return true;
+                }
+            }
+        }
+    }
+
     // Search overlay click — intercept left-down inside the result list.
     if state.search.open {
         if let MouseEventKind::Down(MouseButton::Left) = me.kind {
@@ -3186,6 +3219,7 @@ fn handle_mouse(state: &mut AppState, me: crossterm::event::MouseEvent, body_are
                             rect: Rect::new(col, row, w, h),
                             cursor: 0,
                             target_slot: *slot_idx,
+                            item_rects: Vec::new(),
                         });
                         return true;
                     }
@@ -4754,6 +4788,109 @@ async fn run_tui(
                             state.search.open = false;
                             state.search.rx = None;
                         }
+                        PendingMenuAction::ContextMenuActivate(item_idx) => {
+                            // Mouse-left on a context menu item row: activate the item at
+                            // item_idx, identical logic to the KeyCode::Enter handler.
+                            if let Some(menu) = state.context_menu.take() {
+                                let idx = item_idx.min(MENU_ITEMS.len().saturating_sub(1));
+                                let item = MENU_ITEMS[idx];
+                                let target = menu.target_slot;
+                                match item {
+                                    MenuItem::Copy => {
+                                        if let Some(ref sel) = state.selection.clone() {
+                                            let pane_idx = sel.pane_idx;
+                                            let ((r0, c0), (r1, c1)) = sel.normalized();
+                                            if let Some(slot) = state.slots[pane_idx].as_ref() {
+                                                let grid = slot.term.grid();
+                                                let num_cols = grid.columns();
+                                                let mut text = String::new();
+                                                for gr in r0..=r1 {
+                                                    if gr > r0 {
+                                                        text.push('\n');
+                                                    }
+                                                    let cs = if gr == r0 { c0 as usize } else { 0 };
+                                                    let ce = if gr == r1 {
+                                                        c1 as usize
+                                                    } else {
+                                                        num_cols.saturating_sub(1)
+                                                    };
+                                                    for c in cs..=ce {
+                                                        let pt = TermPoint::new(
+                                                            TermLine(gr as i32),
+                                                            TermColumn(c),
+                                                        );
+                                                        let ch = grid[pt].c;
+                                                        text.push(if ch == '\0' {
+                                                            ' '
+                                                        } else {
+                                                            ch
+                                                        });
+                                                    }
+                                                }
+                                                let trimmed: String = text
+                                                    .lines()
+                                                    .map(|l| l.trim_end())
+                                                    .collect::<Vec<_>>()
+                                                    .join("\n");
+                                                if !trimmed.is_empty() {
+                                                    let _ = crate::clipboard::copy_to_clipboard(
+                                                        &trimmed,
+                                                    );
+                                                    state.status_msg = Some("copied".to_owned());
+                                                }
+                                            }
+                                        }
+                                    }
+                                    MenuItem::KillPane => {
+                                        close_pane_by_slot_idx(&mut state, target);
+                                        if state.sessions.is_empty() {
+                                            break;
+                                        }
+                                    }
+                                    MenuItem::SplitH => {
+                                        if let Err(e) = split_active(&mut state, true).await {
+                                            tracing::warn!("context menu mouse HSplit: {e}");
+                                        }
+                                    }
+                                    MenuItem::SplitV => {
+                                        if let Err(e) = split_active(&mut state, false).await {
+                                            tracing::warn!("context menu mouse VSplit: {e}");
+                                        }
+                                    }
+                                    MenuItem::ZoomToggle => {
+                                        let sv = state.active_session_view_mut();
+                                        let tab = &mut sv.tabs[sv.active_tab];
+                                        if tab.zoomed.is_some() {
+                                            tab.zoomed = None;
+                                        } else {
+                                            tab.zoomed = Some(tab.focus_path.clone());
+                                        }
+                                    }
+                                    MenuItem::InspectPid => {
+                                        if let Some(slot) = state.slots[target].as_ref() {
+                                            let pane_id = slot.pane_id;
+                                            match state
+                                                .control
+                                                .inspect_pid(tarpc::context::current(), pane_id)
+                                                .await
+                                            {
+                                                Ok(Ok(info)) => {
+                                                    state.pid_inspect = Some(info);
+                                                }
+                                                Ok(Err(e)) => {
+                                                    state.status_msg =
+                                                        Some(format!("inspect_pid: {e}"));
+                                                }
+                                                Err(e) => {
+                                                    state.status_msg =
+                                                        Some(format!("rpc transport: {e}"));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         PendingMenuAction::ContextMenuCommit => {
                             // Used for double-click on ribbon chip: open pager for the
                             // currently focused block cursor. Mirrors the Enter-in-ribbon
@@ -5011,17 +5148,30 @@ async fn run_tui(
                 if state.theme_picker.is_some() {
                     match code {
                         KeyCode::Esc | KeyCode::Char('q') => {
-                            state.theme_picker = None;
+                            // Restore original theme before closing.
+                            if let Some(p) = state.theme_picker.take() {
+                                state.theme = p.original_theme;
+                            }
                         }
                         KeyCode::Up | KeyCode::Char('k') => {
                             if let Some(ref mut p) = state.theme_picker {
                                 p.cursor = p.cursor.saturating_sub(1);
+                                // Live preview: apply the hovered theme immediately.
+                                let reg = Registry::builtin();
+                                if let Some(t) = reg.get(p.names[p.cursor]) {
+                                    state.theme = t.clone();
+                                }
                             }
                         }
                         KeyCode::Down | KeyCode::Char('j') => {
                             if let Some(ref mut p) = state.theme_picker {
                                 let max = p.names.len().saturating_sub(1);
                                 p.cursor = (p.cursor + 1).min(max);
+                                // Live preview: apply the hovered theme immediately.
+                                let reg = Registry::builtin();
+                                if let Some(t) = reg.get(p.names[p.cursor]) {
+                                    state.theme = t.clone();
+                                }
                             }
                         }
                         KeyCode::Enter => {
@@ -5029,6 +5179,7 @@ async fn run_tui(
                                 let name = p.names[p.cursor];
                                 let reg = Registry::builtin();
                                 if let Some(t) = reg.get(name) {
+                                    // Theme already applied via live preview; persist to config.
                                     state.theme = t.clone();
                                     if let Err(e) = pyre_themes::config::save_theme_name(name) {
                                         tracing::warn!("save theme failed: {e}");
@@ -5259,7 +5410,13 @@ async fn run_tui(
                                 .iter()
                                 .position(|&n| n == state.theme.name)
                                 .unwrap_or(0);
-                            state.theme_picker = Some(ThemePickerState { cursor, names });
+                            // Snapshot the current theme so Esc can restore it.
+                            let original_theme = state.theme.clone();
+                            state.theme_picker = Some(ThemePickerState {
+                                cursor,
+                                names,
+                                original_theme,
+                            });
                         }
 
                         // Rename active session (Ctrl-B ,  — mirrors tmux rename-session)
@@ -5613,7 +5770,20 @@ async fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
-    splash::play_splash(cli.no_splash);
+    // Load the theme config before the splash so the flame uses the user's palette.
+    // Non-fatal: falls back to built-in ember palette on any error.
+    let splash_colors = {
+        let reg = pyre_themes::Registry::builtin();
+        let name = pyre_themes::config::load_theme_name()
+            .unwrap_or(None)
+            .unwrap_or_else(|| pyre_themes::Registry::default_theme().to_owned());
+        let theme = reg
+            .get(&name)
+            .or_else(|| reg.get(pyre_themes::Registry::default_theme()))
+            .expect("ember always present");
+        splash::SplashColors::from_palette(&theme.palette)
+    };
+    splash::play_splash(cli.no_splash, Some(splash_colors));
     let socket = cli.socket.unwrap_or_else(default_socket);
     let shell = resolve_shell(cli.shell);
 
