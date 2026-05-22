@@ -11,17 +11,32 @@
 //!   Ctrl+w then x   — close focused pane
 //!   Ctrl+Tab / Ctrl+Shift+Tab — cycle panes (legacy, kept for compat)
 //!   Ctrl+/          — search overlay (scoped to focused pane by default)
+//!
+//! Mouse (M4):
+//!   Left-click pane         — focus that pane
+//!   Double-click            — select word under cursor
+//!   Triple-click            — select line under cursor
+//!   Left-drag split border  — resize split (drag-resize)
+//!   Right-click pane        — context menu (Copy/KillPane/SplitH/SplitV/ZoomToggle/InspectPid)
+//!   Scroll wheel            — scroll focused pane's scrollback
+//!
+//! Toast notifications:
+//!   Bottom-right toast cards driven by next_pane_event push events.
+//!   Toggleable via Ctrl+N.
 
 mod atlas;
 mod layout;
 mod paint;
 mod search;
 mod term;
+mod toast;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
+use alacritty_terminal::grid::Dimensions;
 use anyhow::{anyhow, Context, Result};
 use atlas::grid_dims_for_window;
 use bytes::Bytes;
@@ -37,6 +52,7 @@ use softbuffer::{Context as SbContext, Surface};
 use tarpc::client;
 use tarpc::tokio_serde::formats::Bincode;
 use term::{collect_grid, TermView};
+use toast::{ContextMenu, ToastDeck};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, watch};
@@ -46,7 +62,7 @@ use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 use tracing_subscriber::EnvFilter;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
-use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::ModifiersState;
 use winit::keyboard::{Key, NamedKey};
@@ -78,6 +94,96 @@ struct StreamHandle {
     _cancel: watch::Sender<()>,
     /// Handle kept for clean shutdown diagnostics; not awaited at runtime.
     _task: JoinHandle<()>,
+}
+
+// ─── Click tracker ────────────────────────────────────────────────────────────
+
+/// Tracks rapid successive clicks for double/triple-click detection.
+#[derive(Debug, Clone)]
+struct ClickTracker {
+    last_at: Instant,
+    last_pos: (u32, u32), // physical pixel (x, y)
+    count: u8,
+}
+
+impl ClickTracker {
+    fn new() -> Self {
+        Self {
+            last_at: Instant::now() - Duration::from_secs(10),
+            last_pos: (0, 0),
+            count: 0,
+        }
+    }
+
+    /// Record a click at `pos`. Returns the click count (1/2/3).
+    fn record(&mut self, pos: (u32, u32)) -> u8 {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_at).as_millis() as u64;
+        let count = if elapsed <= 300 && self.last_pos == pos {
+            self.count.saturating_add(1).min(3)
+        } else {
+            1
+        };
+        self.last_at = now;
+        self.last_pos = pos;
+        self.count = count;
+        count
+    }
+}
+
+// ─── Drag state (split-border resize) ────────────────────────────────────────
+
+/// Which axis a drag is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DragAxis {
+    /// Dragging a horizontal split boundary (row coord).
+    Horizontal,
+    /// Dragging a vertical split boundary (col coord).
+    Vertical,
+}
+
+/// Active drag-resize state. Set when the mouse is held near a split border.
+#[derive(Debug, Clone)]
+struct DragResize {
+    axis: DragAxis,
+    /// Pixel coordinate (x for Vertical, y for Horizontal) where the drag started.
+    start_px: f64,
+    /// Full-window pixel dimension along the drag axis (width or height).
+    viewport_dim: u32,
+    /// The two pane IDs on either side of the boundary, left/top first.
+    left_pane: PaneId,
+    right_pane: PaneId,
+    /// Starting weights of the two panes.
+    start_weight_left: u16,
+    #[allow(dead_code)] // kept for future symmetric resize clamping
+    start_weight_right: u16,
+}
+
+// ─── Selection state ──────────────────────────────────────────────────────────
+
+/// Text selection (for clipboard copy after double/triple-click or drag).
+#[derive(Debug, Clone)]
+struct Selection {
+    /// Which pane this selection belongs to.
+    pane_id: PaneId,
+    /// Start cell (col, row) in terminal grid coordinates.
+    #[allow(dead_code)] // used by future clipboard-copy path
+    start: (usize, usize),
+    /// End cell (col, row) in terminal grid coordinates (inclusive).
+    end: (usize, usize),
+    /// Whether the mouse button is still held.
+    dragging: bool,
+}
+
+impl Selection {
+    #[allow(dead_code)] // used by future clipboard-copy path
+    fn normalized(&self) -> ((usize, usize), (usize, usize)) {
+        if self.start <= self.end {
+            (self.start, self.end)
+        } else {
+            (self.end, self.start)
+        }
+    }
 }
 
 // ─── App ──────────────────────────────────────────────────────────────────────
@@ -113,6 +219,26 @@ struct App {
     modifiers: ModifiersState,
     /// When `true`, the next keypress is interpreted as a Ctrl+w sub-command.
     awaiting_window_key: bool,
+
+    // ── M4: mouse fields ──────────────────────────────────────────────────────
+    /// Last known cursor position in physical pixels.
+    cursor_pos: (f64, f64),
+    /// Left button currently held down.
+    left_held: bool,
+    /// Click-count tracker for double/triple-click detection.
+    click_tracker: ClickTracker,
+    /// Active drag-resize state (Some while dragging a split border).
+    drag_resize: Option<DragResize>,
+    /// Active text selection.
+    selection: Option<Selection>,
+    /// Right-click context menu.
+    context_menu: Option<ContextMenu>,
+
+    // ── M4: toast fields ──────────────────────────────────────────────────────
+    /// Ephemeral toast notification stack rendered bottom-right.
+    toast_deck: ToastDeck,
+    /// Toasts produced by the background push-event task.
+    toast_rx: mpsc::UnboundedReceiver<toast::Toast>,
 }
 
 // ─── ApplicationHandler impl ──────────────────────────────────────────────────
@@ -202,6 +328,43 @@ impl ApplicationHandler for App {
                 self.handle_keyboard(event, event_loop);
             }
 
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor_pos = (position.x, position.y);
+                if self.left_held {
+                    self.handle_mouse_drag();
+                }
+                self.needs_redraw = true;
+            }
+
+            WindowEvent::MouseInput { state, button, .. } => {
+                match (button, state) {
+                    (MouseButton::Left, ElementState::Pressed) => {
+                        self.handle_left_down();
+                    }
+                    (MouseButton::Left, ElementState::Released) => {
+                        self.handle_left_up();
+                    }
+                    (MouseButton::Right, ElementState::Pressed) => {
+                        self.handle_right_down(event_loop);
+                    }
+                    _ => {}
+                }
+                self.needs_redraw = true;
+            }
+
+            WindowEvent::MouseWheel { delta, .. } => {
+                // Dismiss context menu on scroll.
+                self.context_menu = None;
+                let lines = match delta {
+                    MouseScrollDelta::LineDelta(_x, y) => y,
+                    MouseScrollDelta::PixelDelta(pos) => (pos.y / 20.0) as f32,
+                };
+                if lines != 0.0 {
+                    self.handle_scroll(lines);
+                }
+                self.needs_redraw = true;
+            }
+
             _ => {}
         }
     }
@@ -218,6 +381,16 @@ impl ApplicationHandler for App {
             self.needs_redraw = true;
         }
         if self.search.tick_debounce(self.control.clone()) {
+            self.needs_redraw = true;
+        }
+        // Drain incoming toasts from the background push-event task.
+        while let Ok(t) = self.toast_rx.try_recv() {
+            self.toast_deck.push(t.title, t.body, t.kind);
+            self.needs_redraw = true;
+        }
+        // Expire stale toasts; schedule redraw if any remain live.
+        self.toast_deck.tick();
+        if self.toast_deck.has_live() {
             self.needs_redraw = true;
         }
         if self.needs_redraw {
@@ -241,8 +414,44 @@ impl App {
     }
 
     fn handle_keyboard(&mut self, event: KeyEvent, event_loop: &ActiveEventLoop) {
+        use winit::keyboard::{KeyCode, PhysicalKey};
+
         if event.state != ElementState::Pressed {
             return;
+        }
+
+        // Context menu absorbs arrow keys + Enter + Esc when open.
+        if self.context_menu.is_some() {
+            match event.physical_key {
+                PhysicalKey::Code(KeyCode::ArrowDown) | PhysicalKey::Code(KeyCode::KeyJ) => {
+                    if let Some(ref mut m) = self.context_menu {
+                        m.cursor = (m.cursor + 1).min(toast::MENU_ITEMS.len().saturating_sub(1));
+                    }
+                    self.needs_redraw = true;
+                    return;
+                }
+                PhysicalKey::Code(KeyCode::ArrowUp) | PhysicalKey::Code(KeyCode::KeyK) => {
+                    if let Some(ref mut m) = self.context_menu {
+                        m.cursor = m.cursor.saturating_sub(1);
+                    }
+                    self.needs_redraw = true;
+                    return;
+                }
+                PhysicalKey::Code(KeyCode::Enter) => {
+                    self.commit_context_menu(event_loop);
+                    self.needs_redraw = true;
+                    return;
+                }
+                PhysicalKey::Code(KeyCode::Escape) => {
+                    self.context_menu = None;
+                    self.needs_redraw = true;
+                    return;
+                }
+                _ => {
+                    // Other keys dismiss the menu.
+                    self.context_menu = None;
+                }
+            }
         }
 
         // Search overlay absorbs all keys when open.
@@ -261,6 +470,18 @@ impl App {
                 let _ = self.search.tick_debounce(self.control.clone());
                 self.needs_redraw = true;
             }
+            return;
+        }
+
+        // Ctrl+N — toggle toast notifications.
+        if self.modifiers.contains(ModifiersState::CONTROL)
+            && matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyN))
+        {
+            self.toast_deck.enabled = !self.toast_deck.enabled;
+            if !self.toast_deck.enabled {
+                self.toast_deck.toasts.clear();
+            }
+            self.needs_redraw = true;
             return;
         }
 
@@ -554,6 +775,29 @@ impl App {
             self.rows,
         );
 
+        // Paint context menu (above search overlay).
+        if let Some(ref menu) = self.context_menu {
+            let menu = menu.clone();
+            toast::paint_context_menu(
+                &menu,
+                &mut self.painter.atlas,
+                &mut buffer,
+                buf_w,
+                buf_h,
+                &self.palette,
+            );
+        }
+
+        // Paint toast deck bottom-right.
+        toast::paint_toast_deck(
+            &self.toast_deck,
+            &mut self.painter.atlas,
+            &mut buffer,
+            buf_w,
+            buf_h,
+            &self.palette,
+        );
+
         // Blit to softbuffer.
         let Some(surface) = self.surface.as_mut() else {
             return;
@@ -569,6 +813,397 @@ impl App {
             }
         }
         let _ = sb.present();
+    }
+
+    // ── M4: mouse handlers ────────────────────────────────────────────────────
+
+    /// Pixel position converted to cell (col, row) in the full grid.
+    #[allow(dead_code)]
+    fn px_to_cell(&self, px: f64, py: f64) -> (usize, usize) {
+        let col = (px as usize) / atlas::CELL_W;
+        let row = (py as usize) / atlas::CELL_H;
+        (col, row)
+    }
+
+    /// Return the `PaneId` whose pixel rect contains `(px, py)`, if any.
+    fn pane_at_px(&self, px: f64, py: f64) -> Option<PaneId> {
+        let vp = self.viewport_rect();
+        let leaves = self.layout.leaves(vp);
+        for (pane_id, rect) in leaves {
+            if rect.contains_pt(px as u32, py as u32) {
+                return Some(pane_id);
+            }
+        }
+        None
+    }
+
+    /// Detect whether `(px, py)` is within `BORDER_HIT_PX` pixels of a split
+    /// boundary. Returns the drag state if so.
+    fn try_hit_boundary(&self, px: f64, py: f64) -> Option<DragResize> {
+        const BORDER_HIT_PX: f64 = 6.0;
+        let vp = self.viewport_rect();
+        let leaves = self.layout.leaves(vp);
+
+        // Check vertical boundaries (VSplit → right edge of left pane).
+        for i in 0..leaves.len() {
+            for j in i + 1..leaves.len() {
+                let (lid, lr) = &leaves[i];
+                let (rid, rr) = &leaves[j];
+
+                // Vertical split: left pane right edge ≈ right pane left edge.
+                if lr.y == rr.y && lr.h == rr.h {
+                    let boundary_x = (lr.x + lr.w) as f64;
+                    if (px - boundary_x).abs() <= BORDER_HIT_PX
+                        && py >= lr.y as f64
+                        && py < (lr.y + lr.h) as f64
+                    {
+                        let total = lr.w + rr.w;
+                        let wl = ((lr.w as u64 * 100) / total as u64) as u16;
+                        let wr = 100u16.saturating_sub(wl);
+                        return Some(DragResize {
+                            axis: DragAxis::Vertical,
+                            start_px: px,
+                            viewport_dim: vp.w,
+                            left_pane: *lid,
+                            right_pane: *rid,
+                            start_weight_left: wl,
+                            start_weight_right: wr,
+                        });
+                    }
+                }
+
+                // Horizontal split: top pane bottom edge ≈ bottom pane top edge.
+                if lr.x == rr.x && lr.w == rr.w {
+                    let boundary_y = (lr.y + lr.h) as f64;
+                    if (py - boundary_y).abs() <= BORDER_HIT_PX
+                        && px >= lr.x as f64
+                        && px < (lr.x + lr.w) as f64
+                    {
+                        let total = lr.h + rr.h;
+                        let wt = ((lr.h as u64 * 100) / total as u64) as u16;
+                        let wb = 100u16.saturating_sub(wt);
+                        return Some(DragResize {
+                            axis: DragAxis::Horizontal,
+                            start_px: py,
+                            viewport_dim: vp.h,
+                            left_pane: *lid,
+                            right_pane: *rid,
+                            start_weight_left: wt,
+                            start_weight_right: wb,
+                        });
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Apply drag-resize weight update to the layout tree.
+    fn apply_drag_weights(&mut self, drag: &DragResize, current_px: f64) {
+        let delta_px = current_px - drag.start_px;
+        let total_px = drag.viewport_dim as f64;
+        let delta_pct = (delta_px / total_px * 100.0) as i32;
+
+        let new_left = (drag.start_weight_left as i32 + delta_pct).clamp(5, 95) as u16;
+        let new_right = 100u16.saturating_sub(new_left);
+
+        apply_weights_for_pair(
+            &mut self.layout,
+            &drag.left_pane,
+            &drag.right_pane,
+            new_left,
+            new_right,
+        );
+    }
+
+    fn handle_left_down(&mut self) {
+        let (px, py) = self.cursor_pos;
+        self.left_held = true;
+
+        // Dismiss context menu on any left-click.
+        self.context_menu = None;
+
+        // Try to hit a split boundary first.
+        if let Some(drag) = self.try_hit_boundary(px, py) {
+            self.drag_resize = Some(drag);
+            return;
+        }
+
+        // Click-to-focus pane.
+        let click_count = self.click_tracker.record((px as u32, py as u32));
+        if let Some(pane_id) = self.pane_at_px(px, py) {
+            self.focused = pane_id;
+            self.update_title();
+
+            match click_count {
+                2 => {
+                    // Double-click: select word under cursor.
+                    self.select_word_at(pane_id, px, py);
+                }
+                3 => {
+                    // Triple-click: select full line.
+                    self.select_line_at(pane_id, px, py);
+                }
+                _ => {
+                    // Single click: start a potential drag selection.
+                    let (col, row) = self.px_to_cell_in_pane(pane_id, px, py);
+                    self.selection = Some(Selection {
+                        pane_id,
+                        start: (col, row),
+                        end: (col, row),
+                        dragging: true,
+                    });
+                }
+            }
+        }
+    }
+
+    fn handle_left_up(&mut self) {
+        self.left_held = false;
+        self.drag_resize = None;
+        if let Some(ref mut sel) = self.selection {
+            sel.dragging = false;
+        }
+    }
+
+    fn handle_mouse_drag(&mut self) {
+        let (px, py) = self.cursor_pos;
+
+        // Drag-resize takes priority.
+        if let Some(drag) = self.drag_resize.clone() {
+            let current = match drag.axis {
+                DragAxis::Vertical => px,
+                DragAxis::Horizontal => py,
+            };
+            self.apply_drag_weights(&drag, current);
+            return;
+        }
+
+        // Extend text selection — resolve coords before taking the mutable borrow.
+        let extend = self.selection.as_ref().and_then(|sel| {
+            if sel.dragging {
+                Some((sel.pane_id, self.px_to_cell_in_pane(sel.pane_id, px, py)))
+            } else {
+                None
+            }
+        });
+        if let Some((_pane_id, (col, row))) = extend {
+            if let Some(ref mut sel) = self.selection {
+                sel.end = (col, row);
+            }
+        }
+    }
+
+    fn handle_right_down(&mut self, event_loop: &ActiveEventLoop) {
+        let (px, py) = self.cursor_pos;
+
+        // Dismiss any existing menu first.
+        self.context_menu = None;
+
+        if let Some(pane_id) = self.pane_at_px(px, py) {
+            self.focused = pane_id;
+            self.update_title();
+
+            let vp = self.viewport_rect();
+            let menu = ContextMenu::new(
+                px as usize,
+                py as usize,
+                pane_id,
+                vp.w as usize,
+                vp.h as usize,
+            );
+            self.context_menu = Some(menu);
+        }
+        // Suppress "unused" warning — event_loop is not needed here but kept
+        // for API symmetry with other handlers that may need it.
+        let _ = event_loop;
+    }
+
+    /// Execute the currently highlighted context menu item.
+    fn commit_context_menu(&mut self, event_loop: &ActiveEventLoop) {
+        let item = self.context_menu.as_ref().and_then(|m| m.item_at_cursor());
+        self.context_menu = None;
+
+        let Some(item) = item else { return };
+
+        use toast::MenuItem;
+        match item {
+            MenuItem::Copy => {
+                // Clipboard copy: if there is an active selection, extract and copy.
+                // Full clipboard integration is deferred until a platform clipboard
+                // crate is added; log intention for now.
+                tracing::debug!("context menu: Copy (clipboard integration deferred)");
+            }
+            MenuItem::KillPane => {
+                self.close_focused(event_loop);
+            }
+            MenuItem::SplitH => {
+                self.spawn_pane(Orient::Horizontal);
+            }
+            MenuItem::SplitV => {
+                self.spawn_pane(Orient::Vertical);
+            }
+            MenuItem::ZoomToggle => {
+                // Zoom toggle: pyre-gpu has no zoom yet (deferred post-M4).
+                tracing::debug!("context menu: ZoomToggle (deferred)");
+            }
+            MenuItem::InspectPid => {
+                // PID inspect: deferred until PidInspect overlay is ported.
+                tracing::debug!("context menu: InspectPid (deferred)");
+            }
+        }
+    }
+
+    fn handle_scroll(&mut self, lines: f32) {
+        // Route scroll into the focused pane's terminal scrollback.
+        if let Some(tv) = self.terms.get(&self.focused) {
+            if let Ok(mut tv) = tv.lock() {
+                use alacritty_terminal::grid::Scroll;
+                let delta = if lines > 0.0 {
+                    Scroll::Delta(lines.ceil() as i32)
+                } else {
+                    Scroll::Delta(lines.floor() as i32)
+                };
+                tv.term.grid_mut().scroll_display(delta);
+            }
+        }
+    }
+
+    /// Convert a physical pixel `(px, py)` to a cell `(col, row)` relative to
+    /// the top-left of the given pane's content rect. Clamps to the pane bounds.
+    fn px_to_cell_in_pane(&self, pane_id: PaneId, px: f64, py: f64) -> (usize, usize) {
+        let vp = self.viewport_rect();
+        let rect = self.layout.rect_for(vp, &pane_id).unwrap_or(vp);
+        let rel_x = (px as u32).saturating_sub(rect.x) as usize;
+        let rel_y = (py as u32).saturating_sub(rect.y) as usize;
+        let col = rel_x / atlas::CELL_W;
+        let row = rel_y / atlas::CELL_H;
+        let (max_cols, max_rows) = rect_to_cells(rect);
+        (
+            col.min(max_cols.saturating_sub(1)),
+            row.min(max_rows.saturating_sub(1)),
+        )
+    }
+
+    /// Double-click: select the word (alphanumeric run) at the given cell.
+    fn select_word_at(&mut self, pane_id: PaneId, px: f64, py: f64) {
+        let (col, row) = self.px_to_cell_in_pane(pane_id, px, py);
+        let Some(tv_arc) = self.terms.get(&pane_id) else {
+            return;
+        };
+        let Ok(tv) = tv_arc.lock() else { return };
+
+        let grid = tv.term.grid();
+        let num_cols = grid.columns();
+        let num_rows = grid.screen_lines();
+        if row >= num_rows || col >= num_cols {
+            return;
+        }
+
+        use alacritty_terminal::index::{
+            Column as TermColumn, Line as TermLine, Point as TermPoint,
+        };
+        let line = TermLine(row as i32 - grid.display_offset() as i32);
+
+        let is_word_char = |c: char| c.is_alphanumeric() || c == '_';
+
+        // Walk left.
+        let mut start_col = col;
+        loop {
+            if start_col == 0 {
+                break;
+            }
+            let c = grid[TermPoint::new(line, TermColumn(start_col - 1))].c;
+            if !is_word_char(c) {
+                break;
+            }
+            start_col -= 1;
+        }
+        // Walk right.
+        let mut end_col = col;
+        loop {
+            if end_col + 1 >= num_cols {
+                break;
+            }
+            let c = grid[TermPoint::new(line, TermColumn(end_col + 1))].c;
+            if !is_word_char(c) {
+                break;
+            }
+            end_col += 1;
+        }
+
+        self.selection = Some(Selection {
+            pane_id,
+            start: (start_col, row),
+            end: (end_col, row),
+            dragging: false,
+        });
+    }
+
+    /// Triple-click: select the full line at the given cell.
+    fn select_line_at(&mut self, pane_id: PaneId, px: f64, py: f64) {
+        let (_, row) = self.px_to_cell_in_pane(pane_id, px, py);
+        let Some(tv_arc) = self.terms.get(&pane_id) else {
+            return;
+        };
+        let Ok(tv) = tv_arc.lock() else { return };
+
+        let num_cols = tv.term.grid().columns();
+        if num_cols == 0 {
+            return;
+        }
+
+        self.selection = Some(Selection {
+            pane_id,
+            start: (0, row),
+            end: (num_cols.saturating_sub(1), row),
+            dragging: false,
+        });
+    }
+}
+
+// ─── Drag-resize weight update ────────────────────────────────────────────────
+
+/// Walk the layout tree and update the weights of the two siblings identified
+/// by `left_pane` and `right_pane` (which must be adjacent leaves inside the
+/// same split node).
+fn apply_weights_for_pair(
+    node: &mut LayoutNode,
+    left_pane: &PaneId,
+    right_pane: &PaneId,
+    new_left: u16,
+    new_right: u16,
+) -> bool {
+    match node {
+        LayoutNode::Leaf(_) => false,
+        LayoutNode::HSplit(children) | LayoutNode::VSplit(children) => {
+            // Check if this node directly contains the two panes as adjacent leaves.
+            let mut found_l = None;
+            let mut found_r = None;
+            for (i, (child, _)) in children.iter().enumerate() {
+                if let LayoutNode::Leaf(id) = child {
+                    if id == left_pane {
+                        found_l = Some(i);
+                    }
+                    if id == right_pane {
+                        found_r = Some(i);
+                    }
+                }
+            }
+            if let (Some(li), Some(ri)) = (found_l, found_r) {
+                // Update weights.
+                children[li].1 = new_left;
+                children[ri].1 = new_right;
+                return true;
+            }
+            // Recurse.
+            for (child, _) in children.iter_mut() {
+                if apply_weights_for_pair(child, left_pane, right_pane, new_left, new_right) {
+                    return true;
+                }
+            }
+            false
+        }
     }
 }
 
@@ -909,6 +1544,68 @@ async fn main() -> Result<()> {
     let mut streams: HashMap<PaneId, StreamHandle> = HashMap::new();
     streams.insert(pane, stream_handle);
 
+    // ── Toast background task ─────────────────────────────────────────────────
+    // Mirrors the TUI's push-event task: long-polls `next_pane_event` and
+    // sends Toast structs into an unbounded channel drained each frame.
+    let notif_cfg = pyre_themes::config::load_notifications_config().unwrap_or_default();
+    let (toast_tx, toast_rx) = mpsc::unbounded_channel::<toast::Toast>();
+    {
+        let push_socket = socket.clone();
+        let ttl = Duration::from_millis(notif_cfg.ttl_ms);
+        tokio::spawn(async move {
+            let mut seq: u64 = 0;
+            let mut backoff = Duration::from_millis(200);
+            loop {
+                // Each iteration needs a fresh control connection; reuse the
+                // same helper used by the main path.
+                let client = match async {
+                    let mut sock = UnixStream::connect(&push_socket).await?;
+                    write_control_client(&mut sock).await?;
+                    let transport = tarpc::serde_transport::new(
+                        tokio_util::codec::Framed::new(sock, LengthDelimitedCodec::new()),
+                        Bincode::default(),
+                    );
+                    anyhow::Ok(
+                        PyreDaemonClient::new(tarpc::client::Config::default(), transport).spawn(),
+                    )
+                }
+                .await
+                {
+                    Ok(c) => c,
+                    Err(_) => {
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(5));
+                        continue;
+                    }
+                };
+                backoff = Duration::from_millis(200);
+
+                match client
+                    .next_pane_event(tarpc::context::current(), seq, 30_000)
+                    .await
+                {
+                    Ok(Ok(events)) if !events.is_empty() => {
+                        if let Some(last) = events.last() {
+                            seq = last.seq;
+                        }
+                        for ev in &events {
+                            if let Some(t) = toast::pane_event_to_toast(ev, ttl) {
+                                let _ = toast_tx.send(t);
+                            }
+                        }
+                    }
+                    Ok(Ok(_)) => {}
+                    _ => {
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(5));
+                    }
+                }
+            }
+        });
+    }
+
+    let toast_deck = ToastDeck::new(notif_cfg.enabled, notif_cfg.ttl_ms, notif_cfg.max_visible);
+
     let app = App {
         layout,
         focused: pane,
@@ -928,6 +1625,14 @@ async fn main() -> Result<()> {
         shell: cli.shell,
         modifiers: ModifiersState::default(),
         awaiting_window_key: false,
+        cursor_pos: (0.0, 0.0),
+        left_held: false,
+        click_tracker: ClickTracker::new(),
+        drag_resize: None,
+        selection: None,
+        context_menu: None,
+        toast_deck,
+        toast_rx,
     };
 
     let event_loop = EventLoop::new().context("event loop")?;
