@@ -198,7 +198,7 @@ impl Server {
                 "resources": { "subscribe": true, "listChanged": false },
                 "tools": { "listChanged": false }
             },
-            "serverInfo": { "name": "pyre-mcp", "version": "0.1.0" }
+            "serverInfo": { "name": "pyre-mcp", "version": env!("CARGO_PKG_VERSION") }
         })
     }
 

@@ -80,7 +80,7 @@ enum DaemonMode {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "pyred", about = "Pyre daemon")]
+#[command(name = "pyred", version, about = "Pyre daemon")]
 struct Args {
     /// Process role. Defaults to `supervisor` (which may run single-process
     /// depending on `config.toml`).
