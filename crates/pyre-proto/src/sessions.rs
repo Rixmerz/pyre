@@ -104,6 +104,9 @@ pub struct PaneInfo {
     /// User has focused this pane since it entered `Done` (agent UX).
     #[serde(default = "default_seen")]
     pub seen: bool,
+    /// Optional human-readable label for the pane.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 fn default_seen() -> bool {
@@ -118,6 +121,9 @@ pub struct OpenPaneReq {
     pub cols: u16,
     pub rows: u16,
     pub env: Vec<(String, String)>,
+    /// Optional human-readable label for the pane.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
