@@ -5,12 +5,13 @@ on `pyre`. Read it first, then follow the links below.
 
 ## Next step
 
-**v0.1.0 surface complete** as of branch `feat/s5-s6-gpu-search-agent-ops`
-(commits 6e207b2..3ae7301). All of S1..S7 landed: hybrid daemon, multi-pane,
-reattach, mirror, blocks+Tantivy v2 facet, agent multiplexer, GPU tiling, push
-events, libproc, smoke walkthrough.
+**v0.2 UX sprint active.** Goal: aplastar a nivel UX a herdr. M1 themes
+landed (7ae5089, bd87faf). M5 remote attach helper landed (2f72dd1,
+ADR-0004). M2 toasts in flight. M3 mouse polish designed (see
+`.claude/notions/m3-mouse-polish.md`). M4 GPU parity pending.
 
-Next: cut v0.1.0 release tag after merge to main.
+See [ROADMAP.md](ROADMAP.md) `## v0.2` for milestone table and risks.
+v0.1.0 surface (S1..S7) remains complete and is documented below.
 
 ## Files to read first
 

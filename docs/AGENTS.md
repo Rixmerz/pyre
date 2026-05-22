@@ -130,3 +130,51 @@ for the gap and timeline (S6.2).
 Optional `hooks.toml` runs local scripts on `on_block_end` and
 `on_pane_state` (e.g. desktop notify when a pane becomes `waiting`).
 See [CONFIG.md](CONFIG.md).
+
+## Competitive positioning — pyre vs herdr
+
+herdr is the closest comparable in the agent-multiplexer niche. The
+honest picture as of v0.2 sprint:
+
+### Where pyre wins today
+
+- **Process isolation.** Hybrid supervisor (ADR-002) puts each agent
+  session in its own worker process. One claude OOM kills its worker,
+  not the multiplexer or the other agents. herdr has no published
+  process boundary between agents.
+- **MCP-first orchestration.** Any MCP client can drive pyre via
+  `session_spawn`, `pane_capture`, `wait_pane_state`, `block_search`,
+  plus `pane://` and `block://` resources. herdr ships a single
+  bundled chat UI; external agents have to screen-scrape.
+- **Block-indexed Tantivy search** with native `exit_code` facet
+  (`failures_only`) exposed across CLI, MCP, TUI overlay, and GPU
+  overlay. herdr surfaces scrollback, not a searchable command index.
+- **Two renderers, one daemon.** ratatui TUI (`pyre`) and softbuffer
+  windowed viewer (`pyre-gpu`) consume the same `pyre-proto` stream.
+  ADR-003 forbids forking the daemon to chase GPU.
+- **Versioned wire protocol.** `PROTO_VERSION=2` handshake rejects
+  mismatched clients at connect time; upgrade path is explicit.
+
+### Where herdr still leads (closing in v0.2)
+
+- **Themes maturity** — herdr ships polished palettes out of the box.
+  pyre's `pyre-themes` registry now ships 18 built-in palettes
+  selectable via `Ctrl-B T` (M1 of the v0.2 UX sprint, landed).
+- **Mouse polish** — herdr's mouse handling (drag-to-resize splits,
+  right-click context, hover affordances) is more refined. M3 of the
+  v0.2 UX sprint is designed (see `.claude/notions/m3-mouse-polish.md`)
+  but not yet implemented.
+- **Remote attach** — herdr advertises remote attach in marketing.
+  pyre v0.1 was local-only; M5 of the v0.2 UX sprint shipped
+  `pyrec remote` as an `ssh -L` UDS-tunnel helper per ADR-0004 — same
+  Unix Domain Socket protocol, SSH owns auth and transport, zero
+  daemon changes.
+- **Desktop notifications** — herdr surfaces toasts via the host OS.
+  pyre's v0.1 deck is in-TUI only; M2 of the v0.2 sprint (in flight)
+  wires `notify-send` / D-Bus on Linux and `osascript` on macOS.
+
+### Roadmap parity
+
+The v0.2 UX sprint (M1..M5) is explicitly framed as "close UX parity
+with herdr while keeping pyre's architectural advantages." See
+[ROADMAP.md](../ROADMAP.md) for milestone status.

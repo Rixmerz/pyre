@@ -107,6 +107,67 @@ See [docs/AGENTS.md](AGENTS.md) and
 
 ---
 
+## UI — themes and notifications
+
+`pyre-tui` and `pyre-gpu` read user-facing UI knobs from
+`$XDG_CONFIG_HOME/pyre/config.toml` (default
+`~/.config/pyre/config.toml`).
+
+### `[ui]`
+
+```toml
+[ui]
+theme = "catppuccin-mocha"   # default: "ember"
+```
+
+`theme` is the machine-readable name from the `pyre-themes` registry.
+Valid values (18 built-in palettes):
+
+| Name | Variant |
+|------|---------|
+| `catppuccin-mocha` | dark |
+| `catppuccin-latte` | light |
+| `tokyo-night` | dark |
+| `tokyo-night-light` | light |
+| `gruvbox-dark` | dark |
+| `gruvbox-light` | light |
+| `one-dark` | dark |
+| `one-light` | light |
+| `solarized-dark` | dark |
+| `solarized-light` | light |
+| `kanagawa` | dark |
+| `rose-pine` | dark |
+| `rose-pine-dawn` | light |
+| `vesper` | dark |
+| `nord` | dark |
+| `dracula` | dark |
+| `terminal` | follows terminal palette |
+| `ember` | dark (pyre default) |
+
+Unknown names fall back to `ember`. In `pyre-tui`, `Ctrl-B T` opens
+a live picker that mutates the active theme and rewrites this key on
+disk. `pyre-gpu` reads the key at startup; live switch is TUI-only
+for now.
+
+### `[ui.notifications]`
+
+In-TUI toast deck for pane lifecycle events (`Spawned`, `Closed`,
+`WaitingInput`, `Done`, `Crashed`). `Idle` and `Running` transitions
+are suppressed.
+
+```toml
+[ui.notifications]
+enabled     = true   # master toggle; matches Ctrl-B N initial state
+ttl_ms      = 4000   # per-toast lifetime in milliseconds
+max_visible = 5      # cap on simultaneous toasts; oldest evicted first
+```
+
+`Ctrl-B N` flips `enabled` at runtime. M2 of the v0.2 UX sprint
+extends this with desktop bridges (`notify-send` / D-Bus on Linux,
+`osascript` on macOS) and per-kind routing — in flight, not landed.
+
+---
+
 ## Future configuration knobs (planned)
 
 The following knobs are not yet wired to `config.toml`. Ring buffer capacity is
@@ -115,7 +176,7 @@ in `hooks.toml` or `pyre.toml` in a later sprint.
 
 - `[ringbuf]` — `lines_per_pane = 10000` scrollback depth.
 - `[search]` — `index_path`, `writer_heap_mb = 64`.
-- `[tui]` — theme name (`ember` | `dracula` | `custom`), font family, font size.
+- `[tui]` — font family, font size (theme lives under `[ui]`, above).
 - `[mcp]` — bind address for the MCP UDS, list of allowed tool names.
 - `[lua]` — path to `init.lua`, sandbox memory limit.
 - `[clipboard]` — prefer `wl-copy` vs `xclip`; custom copy command.

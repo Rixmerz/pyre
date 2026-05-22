@@ -15,7 +15,7 @@ Daemon-owned terminal multiplexer with block-level history, full-text search, an
 - **Full-text search** — Tantivy indexes all block output; `pyrec search <query>` returns ranked hits with snippets in milliseconds.
 - **Agent state monitoring** — a dedicated state tracker classifies each pane as idle, running, waiting for input, or error; exposed via the MCP server.
 - **MCP server (`pyre-mcp`)** — seven tools: `session_spawn`, `session_close`, `pane_open`, `pane_send_keys`, `pane_capture`, `pane_set_state`, `block_search`. Sessions, panes, and blocks are also exposed as MCP resources.
-- **Mouse-first TUI (Ember theme)** — ratatui + crossterm, Ember palette (amber on near-black), mouse click-to-focus, scroll wheel.
+- **Mouse-first TUI** — ratatui + crossterm, mouse click-to-focus, scroll wheel. Ships with 18 built-in palettes via the `pyre-themes` registry; switch live with `Ctrl-B T`.
 - **Pyre fire motion** — startup splash and in-TUI accents use a shared procedural fire engine (`fire_motion.rs`): no animation libraries, no sprite packs. Blocked agents pulse like embers on the same palette as the launch animation.
 - **tmux-compatible CLI** — `pyrec` accepts `list-sessions`, `new-session`, `kill-session`, `send-keys`, `split-window`, and more.
 - **Clipboard integration** — `pyrec capture-pane --copy` copies output to the system clipboard via `wl-copy` (Wayland) or `xclip` (X11).
@@ -107,6 +107,8 @@ Prefix: `Ctrl-B`
 | `Ctrl-B y` | Copy last block stdout to clipboard |
 | `Ctrl-B s` | Toggle sidebar |
 | `Ctrl-B S` | New session |
+| `Ctrl-B T` | Open theme picker overlay (live switch across 18 palettes) |
+| `Ctrl-B N` | Toggle toast notifications on/off |
 | `PgUp` / `PgDn` | Scroll in scrollback mode |
 | Mouse click | Focus pane under cursor |
 | Mouse wheel | Scroll output |
@@ -156,6 +158,63 @@ pyrec search "cargo error"
 # Kill a session
 pyrec kill-session <session-id>
 ```
+
+## Themes
+
+`pyre-tui` and `pyre-gpu` consume the shared `pyre-themes` registry. 18 built-in
+palettes ship today:
+
+`catppuccin-mocha`, `catppuccin-latte`, `tokyo-night`, `tokyo-night-light`,
+`gruvbox-dark`, `gruvbox-light`, `one-dark`, `one-light`, `solarized-dark`,
+`solarized-light`, `kanagawa`, `rose-pine`, `rose-pine-dawn`, `vesper`, `nord`,
+`dracula`, `terminal`, `ember`.
+
+- Open the live picker with `Ctrl-B T` in `pyre` — `↑`/`↓` (or `j`/`k`) navigate,
+  `Enter` applies and persists, `Esc` cancels.
+- Set the startup default in `$XDG_CONFIG_HOME/pyre/config.toml`:
+
+  ```toml
+  [ui]
+  theme = "catppuccin-mocha"
+  ```
+
+- `pyre-gpu` reads the same `[ui] theme` key on startup; live switch lands in
+  a later commit (restart required for now).
+
+See [docs/CONFIG.md](docs/CONFIG.md) for the full `[ui]` schema.
+
+## Notifications
+
+Pane lifecycle events (spawn, close, state change to `WaitingInput` / `Done` /
+`Crashed`) surface as toast cards rendered bottom-right of the TUI. Idle and
+running transitions are suppressed to avoid spam.
+
+- Toggle on/off at runtime with `Ctrl-B N`.
+- Configure defaults under `[ui.notifications]` in `config.toml` (see
+  [docs/CONFIG.md](docs/CONFIG.md)).
+
+M2 of the v0.2 UX sprint is in flight: desktop bridge (`notify-send` / D-Bus
+on Linux, `osascript` on macOS) and per-kind routing rules are pending. Today
+the toast deck is in-TUI only.
+
+## Remote attach (M5, pending)
+
+`pyred` binds a Unix Domain Socket and does not listen on TCP. For laptop ↔
+remote-server attach, `pyrec remote <host>` derives the local + remote socket
+paths and prints (or with `--exec` runs) an `ssh -L` tunnel command. The
+local `pyre --socket <path>` then attaches as if pyred were local — zero
+daemon changes, SSH owns auth + transport.
+
+```sh
+pyrec remote alice@dev.box                     # prints the ssh -L command
+pyrec remote alice@dev.box --exec              # runs the tunnel in foreground
+pyrec remote alice@dev.box --remote-socket /run/user/1000/pyre.sock
+```
+
+The wire-format decision (SSH tunnel for v0.2, native TLS for v0.3) is recorded
+in [docs/adr/0004-remote-attach.md](docs/adr/0004-remote-attach.md) (Proposed).
+Implementation polish (auto-detection of `XDG_RUNTIME_DIR` on the remote,
+keepalive defaults, reconnect) is pending.
 
 ## Architecture
 

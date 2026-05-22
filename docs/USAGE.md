@@ -152,6 +152,8 @@ pyrec display-message "hello from script"
 | `Ctrl-B ]` | Exit scroll mode |
 | `Ctrl-B d` | Detach (leave daemon running, exit TUI) |
 | `Ctrl-B ?` | Show key binding help overlay |
+| `Ctrl-B T` | Open theme picker overlay (live switch, persists to config) |
+| `Ctrl-B N` | Toggle toast notifications on/off |
 
 ### Scroll mode
 
@@ -252,4 +254,97 @@ pyre-gpu --session <prefix> --pane <prefix>
 ### pyre shows garbled characters
 
 Ensure your terminal emulator is set to UTF-8 and that `$TERM` is `xterm-256color`
-or `tmux-256color`. `pyre` requires true-color support for the Ember palette.
+or `tmux-256color`. `pyre` requires true-color support for the palettes.
+
+---
+
+## Themes
+
+`pyre-tui` and `pyre-gpu` consume the `pyre-themes` registry. 18 built-in
+palettes: `catppuccin-mocha`, `catppuccin-latte`, `tokyo-night`,
+`tokyo-night-light`, `gruvbox-dark`, `gruvbox-light`, `one-dark`, `one-light`,
+`solarized-dark`, `solarized-light`, `kanagawa`, `rose-pine`, `rose-pine-dawn`,
+`vesper`, `nord`, `dracula`, `terminal`, `ember`.
+
+### Live picker
+
+`Ctrl-B T` opens the theme picker overlay inside `pyre`.
+
+| Key | Action |
+|-----|--------|
+| `↑` / `↓` (or `j` / `k`) | Move cursor across palette list |
+| `Enter` | Apply selection + persist to `config.toml` |
+| `Esc` | Close without changing the active theme |
+
+### Config
+
+Default theme is read from `$XDG_CONFIG_HOME/pyre/config.toml`:
+
+```toml
+[ui]
+theme = "catppuccin-mocha"
+```
+
+`pyre-gpu` reads the same key at startup; live switch from the picker is
+TUI-only today — `pyre-gpu` requires restart to pick up a change.
+
+Schema reference: [CONFIG.md](CONFIG.md).
+
+---
+
+## Notifications
+
+Pane lifecycle events render as toast cards bottom-right of the TUI. The
+deck suppresses high-frequency transitions (`Idle`, `Running`) — only
+`Spawned`, `Closed`, `WaitingInput`, `Done`, and `Crashed` push toasts.
+
+### Bindings
+
+| Binding | Action |
+|---------|--------|
+| `Ctrl-B N` | Toggle the deck on / off |
+
+### Config
+
+```toml
+[ui.notifications]
+enabled     = true   # master toggle (matches Ctrl-B N initial state)
+ttl_ms      = 4000   # per-toast lifetime
+max_visible = 5      # cap on simultaneous toasts; oldest evicted first
+```
+
+Status: in-TUI deck is live. **M2 of the v0.2 UX sprint** wires desktop
+bridges (`notify-send` / D-Bus on Linux, `osascript` on macOS) and per-kind
+routing — in flight, not landed.
+
+---
+
+## Remote attach (M5, pending)
+
+`pyred` binds a Unix Domain Socket only — no TCP listener. To attach a local
+`pyre` / `pyrec` to a remote `pyred`, tunnel the socket over SSH.
+
+### `pyrec remote`
+
+```sh
+pyrec remote <host>                              # prints the ssh -L command
+pyrec remote <host> --exec                       # forks ssh in foreground
+pyrec remote <host> --remote-socket <path>       # override remote pyred socket
+pyrec remote <host> --local-socket <path>        # override local tunnel endpoint
+```
+
+Defaults:
+- Remote socket: `~/.local/share/pyre/socket` (resolved on remote).
+- Local socket: `$XDG_RUNTIME_DIR/pyre-remote-<host>.sock` (falls back to
+  `/tmp/pyre-remote-<host>.sock`).
+
+Once the tunnel is up, point `pyre` at the local endpoint:
+
+```sh
+pyre --socket $XDG_RUNTIME_DIR/pyre-remote-<host>.sock
+```
+
+Auth, encryption, and discovery are SSH's job. v0.3 may add native TLS; the
+trade-off is recorded in [docs/adr/0004-remote-attach.md](adr/0004-remote-attach.md)
+(Proposed). Polish on auto-detected `XDG_RUNTIME_DIR`, keepalives, and
+reconnect is pending.

@@ -1,5 +1,36 @@
 # pyre — Roadmap
 
+## v0.2 — UX parity-plus with herdr
+
+Goal: close the UX gap with herdr while preserving pyre's architectural
+advantages (process isolation, MCP-first orchestration, blocks + Tantivy,
+two renderers on one daemon). Each milestone ships an honest mix of
+"landed", "in flight", or "designed".
+
+| Milestone | Scope | Status | Commits / Artifacts |
+|-----------|-------|--------|---------------------|
+| **M1 — Theme system** | `pyre-themes` registry with 18 built-in palettes (catppuccin × 2, tokyo-night × 2, gruvbox × 2, one × 2, solarized × 2, kanagawa, rose-pine × 2, vesper, nord, dracula, terminal, ember). `Ctrl-B T` live picker overlay in `pyre-tui` that persists to `config.toml`. `[ui] theme` schema in `config.toml`, consumed by both renderers. | ✅ landed | `7ae5089`, `bd87faf` |
+| **M2 — Toast notifications** | In-TUI deck for pane lifecycle (`Spawned`, `Closed`, `WaitingInput`, `Done`, `Crashed`). `Ctrl-B N` toggle. `[ui.notifications]` schema. Desktop bridge (`notify-send` / D-Bus on Linux, `osascript` on macOS) and per-kind routing rules. | 🚧 in flight | TUI deck + toggle + schema in current branch; desktop bridge pending. |
+| **M3 — Mouse polish** | Drag-to-resize splits, right-click pane context menu, hover affordances on block ribbon, mouse-driven scroll-back regions matching herdr's polish. | 📐 designed | `.claude/notions/m3-mouse-polish.md` (design only; no impl). |
+| **M4 — TUI ↔ GPU parity** | Theme live-switch in `pyre-gpu` (today: restart required), toast deck mirror, ribbon parity for block navigation. | ⏳ pending | None yet. |
+| **M5 — Remote attach helper** | `pyrec remote <host>` derives SSH `-L` tunnel for `pyred.sock`; local `pyre --socket <path>` then attaches over a UDS at the local end of the tunnel. SSH owns auth + transport; daemon unchanged. v0.3 may add native TLS. | ✅ landed | ADR-0004 (Proposed), impl `2f72dd1`. |
+
+Risks specific to v0.2:
+
+- **M2 desktop bridge** — `notify-send` is widely available on Linux but
+  not universal (Wayland headless, minimal WMs). Need a graceful no-op
+  fallback, not a panic.
+- **M3 scope** — mouse polish is easy to over-invest. The notion locks
+  scope to drag-resize + context + hover; everything else defers.
+- **M4 GPU theme live-switch** — `pyre-gpu` recreates its glyph atlas
+  on theme change. Must avoid flicker; design pending.
+- **M5 reconnect/keepalive** — `pyrec remote` today emits a one-shot
+  command. Auto-reconnect on SSH drop and `XDG_RUNTIME_DIR`
+  auto-detection on the remote side are explicit follow-ups in
+  ADR-0004.
+
+---
+
 ## v0.1.0 ready
 
 All sprints S1..S7 have landed. Branch `feat/s5-s6-gpu-search-agent-ops`
