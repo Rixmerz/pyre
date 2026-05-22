@@ -4517,8 +4517,7 @@ async fn run_tui(
                                 let (tc, tr) = term_size();
                                 compute_pane_inner_size(tc, tr)
                             };
-                            match attach_pane(&state.socket, info.id, pane_info.id, pc, pr).await
-                            {
+                            match attach_pane(&state.socket, info.id, pane_info.id, pc, pr).await {
                                 Ok(slot) => {
                                     state.slots.push(Some(slot));
                                     tracing::info!(

@@ -242,6 +242,15 @@ impl Store {
         Ok(out)
     }
 
+    /// Return the persisted name for a session, or `None` if the row is missing.
+    pub async fn get_session_name(&self, id: SessionId) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT name FROM sessions WHERE id = ?1")
+            .bind(id.0.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.and_then(|r| r.try_get::<Option<String>, _>("name").unwrap_or(None)))
+    }
+
     /// Return all session IDs that have a row in the `sessions` table.
     pub async fn list_session_ids(&self) -> Result<Vec<SessionId>> {
         let rows = sqlx::query("SELECT id FROM sessions ORDER BY created_at ASC")

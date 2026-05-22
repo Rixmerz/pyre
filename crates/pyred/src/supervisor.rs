@@ -688,9 +688,17 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
                 Ok(u) => SessionId(u),
                 Err(_) => continue,
             };
+            // Look up the human-readable name persisted in the supervisor store.
+            // Fall back to the UUID string only when the row is absent (e.g.
+            // after a DB reset), so that names set via SpawnReq or rename_session
+            // are always surfaced to clients instead of the raw UUID.
+            let name = match self.store.get_session_name(sid).await {
+                Ok(Some(n)) if !n.is_empty() => n,
+                _ => session_id_str.clone(),
+            };
             sessions.push(SessionInfo {
                 id: sid,
-                name: session_id_str.clone(),
+                name,
                 pane_count,
                 created_at: Utc::now(),
                 last_active_at: Utc::now(),
