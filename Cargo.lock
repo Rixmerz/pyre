@@ -3128,6 +3128,7 @@ dependencies = [
  "futures",
  "libc",
  "pyre-proto",
+ "pyre-themes",
  "softbuffer",
  "tarpc",
  "tokio",

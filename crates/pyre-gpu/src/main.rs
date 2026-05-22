@@ -93,6 +93,8 @@ struct App {
     terms: HashMap<PaneId, Arc<Mutex<TermView>>>,
     /// Glyph cache — shared across all panes.
     painter: Painter,
+    /// Active theme palette used for all colour decisions.
+    palette: pyre_themes::Palette,
     /// Control-plane RPC client.
     control: PyreDaemonClient,
     /// Tantivy search overlay.
@@ -505,6 +507,13 @@ impl App {
         let buf_h = vp.h as usize;
         let mut buffer = vec![0u32; buf_w * buf_h];
 
+        // Derive palette-sourced colours once per frame.
+        let bg_fill = self.palette.bg.to_rgba8();
+        let border_colors = paint::BorderColors {
+            focused: self.palette.border_focus.to_rgba8(),
+            unfocused: self.palette.border.to_rgba8(),
+        };
+
         // Paint each pane.
         let leaves: Vec<(PaneId, Rect)> = self.layout.leaves(vp);
         for (pane_id, rect) in &leaves {
@@ -515,7 +524,7 @@ impl App {
                 .and_then(|tv| {
                     tv.lock()
                         .ok()
-                        .map(|tv| collect_grid(&tv, cell_cols, cell_rows))
+                        .map(|tv| collect_grid(&tv, cell_cols, cell_rows, &self.palette))
                 })
                 .unwrap_or_default();
             self.painter.paint_pane_at(
@@ -526,12 +535,13 @@ impl App {
                 &cells,
                 cell_cols,
                 cell_rows,
+                bg_fill,
             );
 
             // Draw border (S6.2-6).
             let focused = *pane_id == self.focused;
             self.painter
-                .paint_border(&mut buffer, buf_w, buf_h, *rect, focused);
+                .paint_border(&mut buffer, buf_w, buf_h, *rect, focused, &border_colors);
         }
 
         // Paint search overlay on top.
@@ -846,6 +856,22 @@ async fn main() -> Result<()> {
     let socket = cli.socket.unwrap_or_else(default_socket);
     let painter = Painter::from_system().context("init painter")?;
 
+    // Load active theme from config; fall back to built-in default.
+    let registry = pyre_themes::Registry::builtin();
+    let theme_name = pyre_themes::config::load_theme_name()
+        .unwrap_or(None)
+        .unwrap_or_else(|| pyre_themes::Registry::default_theme().to_string());
+    let palette = registry
+        .get(&theme_name)
+        .map(|t| t.palette.clone())
+        .unwrap_or_else(|| {
+            registry
+                .get(pyre_themes::Registry::default_theme())
+                .expect("ember is always present")
+                .palette
+                .clone()
+        });
+
     let client = control_client(&socket).await?;
     let (session, pane) = if let Some(ref sess_prefix) = cli.session {
         let session = resolve_session(&client, sess_prefix).await?;
@@ -889,6 +915,7 @@ async fn main() -> Result<()> {
         streams,
         terms,
         painter,
+        palette,
         control: client,
         search: search::SearchUi::default(),
         window: None,

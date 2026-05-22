@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 pyre-proto = { path = "../pyre-proto" }
+pyre-themes = { path = "../pyre-themes" }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }

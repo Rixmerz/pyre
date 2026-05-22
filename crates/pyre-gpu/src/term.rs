@@ -113,51 +113,94 @@ pub struct CellRgb {
     pub bold: bool,
 }
 
-pub fn ansi_to_rgb(color: AnsiColor) -> [u8; 3] {
+/// Resolve an ANSI [`AnsiColor`] to `[r, g, b]`.
+///
+/// The 16 named colours (indices 0-15) are drawn from `palette.ansi` so they
+/// match the active theme.  256-colour cube (16-231) and greyscale ramp
+/// (232-255) paths are computed arithmetically and are not theme-driven, as
+/// they represent explicit colour requests from the application.  Truecolor
+/// (`Spec`) passes through verbatim.
+pub fn ansi_to_rgb(color: AnsiColor, palette: &pyre_themes::Palette) -> [u8; 3] {
     match color {
-        AnsiColor::Named(NamedColor::Black) => [0x1a, 0x1a, 0x1a],
-        AnsiColor::Named(NamedColor::Red) => [0xff, 0x55, 0x55],
-        AnsiColor::Named(NamedColor::Green) => [0x50, 0xfa, 0x7b],
-        AnsiColor::Named(NamedColor::Yellow) => [0xff, 0xd7, 0x00],
-        AnsiColor::Named(NamedColor::Blue) => [0x6b, 0x9e, 0xff],
-        AnsiColor::Named(NamedColor::Magenta) => [0xff, 0x79, 0xc6],
-        AnsiColor::Named(NamedColor::Cyan) => [0x8b, 0xe9, 0xfd],
-        AnsiColor::Named(NamedColor::White) => [0xf8, 0xf8, 0xf2],
-        AnsiColor::Named(NamedColor::BrightBlack) => [0x62, 0x62, 0x62],
-        AnsiColor::Named(NamedColor::BrightRed) => [0xff, 0x6e, 0x6e],
-        AnsiColor::Named(NamedColor::BrightGreen) => [0x69, 0xff, 0x94],
-        AnsiColor::Named(NamedColor::BrightYellow) => [0xff, 0xff, 0xa5],
-        AnsiColor::Named(NamedColor::BrightBlue) => [0x9c, 0xbd, 0xff],
-        AnsiColor::Named(NamedColor::BrightMagenta) => [0xff, 0x92, 0xdf],
-        AnsiColor::Named(NamedColor::BrightCyan) => [0xa4, 0xff, 0xff],
-        AnsiColor::Named(NamedColor::BrightWhite) => [0xff, 0xff, 0xff],
+        AnsiColor::Named(named) => {
+            let idx: usize = match named {
+                NamedColor::Black => 0,
+                NamedColor::Red => 1,
+                NamedColor::Green => 2,
+                NamedColor::Yellow => 3,
+                NamedColor::Blue => 4,
+                NamedColor::Magenta => 5,
+                NamedColor::Cyan => 6,
+                NamedColor::White => 7,
+                NamedColor::BrightBlack => 8,
+                NamedColor::BrightRed => 9,
+                NamedColor::BrightGreen => 10,
+                NamedColor::BrightYellow => 11,
+                NamedColor::BrightBlue => 12,
+                NamedColor::BrightMagenta => 13,
+                NamedColor::BrightCyan => 14,
+                NamedColor::BrightWhite => 15,
+                // Non-ANSI named colours (cursor, foreground, background, etc.)
+                // fall back to the palette fg/bg as appropriate.
+                NamedColor::Foreground => {
+                    let c = palette.fg;
+                    return [c.0, c.1, c.2];
+                }
+                NamedColor::Background => {
+                    let c = palette.bg;
+                    return [c.0, c.1, c.2];
+                }
+                _ => {
+                    let c = palette.fg;
+                    return [c.0, c.1, c.2];
+                }
+            };
+            let c = palette.ansi[idx];
+            [c.0, c.1, c.2]
+        }
         AnsiColor::Spec(rgb) => [rgb.r, rgb.g, rgb.b],
         AnsiColor::Indexed(i) => {
-            // xterm 256-color cube approximation for indices 16..231
-            if (16..=231).contains(&i) {
+            // Re-map indices 0-15 through the palette ANSI table.
+            if i < 16 {
+                let c = palette.ansi[i as usize];
+                [c.0, c.1, c.2]
+            } else if (16..=231).contains(&i) {
+                // xterm 256-colour cube approximation.
                 let i = i - 16;
                 let r = (i / 36) * 51;
                 let g = ((i / 6) % 6) * 51;
                 let b = (i % 6) * 51;
                 [r, g, b]
             } else if (232..=255).contains(&i) {
+                // Greyscale ramp.
                 let v = 8 + (i - 232) * 10;
                 [v, v, v]
             } else {
-                [0xc8, 0xc8, 0xc8]
+                let c = palette.fg;
+                [c.0, c.1, c.2]
             }
         }
-        _ => [0xc8, 0xc8, 0xc8],
     }
 }
 
-pub fn collect_grid(view: &TermView, cols: usize, rows: usize) -> Vec<CellRgb> {
+pub fn collect_grid(
+    view: &TermView,
+    cols: usize,
+    rows: usize,
+    palette: &pyre_themes::Palette,
+) -> Vec<CellRgb> {
     let grid = view.term.grid();
     let num_rows = grid.screen_lines();
     let num_cols = grid.columns();
     let mut cells = Vec::with_capacity(cols * rows);
-    let default_bg = [0x0d, 0x0d, 0x0d];
-    let default_fg = [0xc8, 0xc8, 0xc8];
+    let default_bg = {
+        let c = palette.bg;
+        [c.0, c.1, c.2]
+    };
+    let default_fg = {
+        let c = palette.fg;
+        [c.0, c.1, c.2]
+    };
 
     for row in 0..rows {
         let display_line = TermLine(row as i32 - grid.display_offset() as i32);
@@ -167,8 +210,8 @@ pub fn collect_grid(view: &TermView, cols: usize, rows: usize) -> Vec<CellRgb> {
                 let ch = if cell.c == '\0' { ' ' } else { cell.c };
                 (
                     ch,
-                    ansi_to_rgb(cell.fg),
-                    ansi_to_rgb(cell.bg),
+                    ansi_to_rgb(cell.fg, palette),
+                    ansi_to_rgb(cell.bg, palette),
                     cell.flags.contains(CellFlags::BOLD),
                 )
             } else {

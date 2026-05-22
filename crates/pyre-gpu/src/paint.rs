@@ -4,10 +4,13 @@ use crate::atlas::{GlyphAtlas, CELL_H, CELL_W};
 use crate::layout::Rect;
 use crate::term::CellRgb;
 
-/// Ember orange (#ff7f3f) used for the focused pane border.
-const BORDER_FOCUSED: u32 = 0xff7f3f;
-/// Dim grey (#3a3a3a) used for unfocused pane borders.
-const BORDER_UNFOCUSED: u32 = 0x3a3a3a;
+/// Theme-derived colours used when drawing pane borders.
+pub struct BorderColors {
+    /// Colour for the focused pane border (`[r, g, b, a]`).
+    pub focused: [u8; 4],
+    /// Colour for unfocused pane borders (`[r, g, b, a]`).
+    pub unfocused: [u8; 4],
+}
 
 pub struct Painter {
     pub(crate) atlas: GlyphAtlas,
@@ -40,6 +43,7 @@ impl Painter {
     /// `buf_w` / `buf_h` are the full framebuffer dimensions in pixels.
     /// `rect` is expressed in pixels. `cells` are indexed row-major by
     /// `(col, row)` where `col ∈ [0, cell_cols)` and `row ∈ [0, cell_rows)`.
+    /// `bg_fill` is `[r, g, b, a]` used to clear any rows not covered by cells.
     pub fn paint_pane_at(
         &mut self,
         buffer: &mut [u32],
@@ -49,6 +53,7 @@ impl Painter {
         cells: &[CellRgb],
         cell_cols: usize,
         cell_rows: usize,
+        bg_fill: [u8; 4],
     ) {
         for (idx, cell) in cells.iter().enumerate() {
             let col = idx % cell_cols;
@@ -72,6 +77,8 @@ impl Painter {
         let painted_h = cell_rows * CELL_H;
         let rect_h = rect.h as usize;
         if painted_h < rect_h {
+            let [r, g, b, _a] = bg_fill;
+            let fill_pixel = u32::from_be_bytes([0, r, g, b]);
             let y_start = rect.y as usize + painted_h;
             for y in y_start..rect.y as usize + rect_h {
                 if y >= buf_h {
@@ -81,13 +88,16 @@ impl Painter {
                     if x >= buf_w {
                         break;
                     }
-                    buffer[y * buf_w + x] = 0x0d0d0d;
+                    buffer[y * buf_w + x] = fill_pixel;
                 }
             }
         }
     }
 
-    /// Draw a 1-pixel border around `rect`. `focused` selects the color.
+    /// Draw a 1-pixel border around `rect`.
+    ///
+    /// `colors` carries the focused/unfocused RGBA values sourced from the
+    /// active theme palette.  `focused` selects which colour is applied.
     pub fn paint_border(
         &self,
         buffer: &mut [u32],
@@ -95,12 +105,14 @@ impl Painter {
         buf_h: usize,
         rect: Rect,
         focused: bool,
+        colors: &BorderColors,
     ) {
-        let color = if focused {
-            BORDER_FOCUSED
+        let [r, g, b, _a] = if focused {
+            colors.focused
         } else {
-            BORDER_UNFOCUSED
+            colors.unfocused
         };
+        let color = u32::from_be_bytes([0, r, g, b]);
         let x0 = rect.x as usize;
         let y0 = rect.y as usize;
         let x1 = (rect.x + rect.w).saturating_sub(1) as usize;
