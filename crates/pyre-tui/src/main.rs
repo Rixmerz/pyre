@@ -1079,6 +1079,9 @@ struct AppState {
     active_session: usize,
     /// All attached pane slots (shared across all sessions). None = closed/removed.
     slots: Vec<Option<PaneSlot>>,
+    /// Set to `true` when the active session's active tab has no live pane slots.
+    /// Triggers a "Session ended" overlay and accepts q/Esc/Ctrl-C to quit.
+    session_lost: bool,
     control: PyreDaemonClient,
     socket: PathBuf,
     shell: Option<String>,
@@ -2447,6 +2450,73 @@ fn render_context_menu(frame: &mut ratatui::Frame, state: &mut AppState, t: &the
     }
 }
 
+/// Render a centered "Session ended" overlay.
+///
+/// Drawn when `state.session_lost == true` — all pane slots for the active
+/// session's active tab are None (daemon evicted the session). Covers the
+/// entire frame so the blank pane area is not visible.
+fn render_session_lost_overlay(frame: &mut ratatui::Frame, t: &theme::LegacyTheme) {
+    let area = frame.area();
+    // Clear the whole frame first.
+    frame.render_widget(RatatuiBlock::default().style(t.bg_style()), area);
+
+    let w: u16 = 52;
+    let h: u16 = 5;
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let overlay_rect = Rect::new(x, y, w.min(area.width), h.min(area.height));
+
+    frame.render_widget(Clear, overlay_rect);
+
+    let block = RatatuiBlock::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(t.text_dim))
+        .title(Span::styled(
+            " session ended ",
+            Style::default().fg(t.text_dim),
+        ))
+        .style(t.bg_style());
+    let inner = block.inner(overlay_rect);
+    frame.render_widget(block, overlay_rect);
+
+    let splits = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .split(inner);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            "All panes closed.",
+            Style::default().fg(t.text_dim),
+        )]))
+        .style(t.bg_style()),
+        splits[0],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Press ", Style::default().fg(t.text_dim)),
+            Span::styled(
+                "q",
+                Style::default().fg(t.primary).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" / ", Style::default().fg(t.text_dim)),
+            Span::styled(
+                "Esc",
+                Style::default().fg(t.primary).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" / ", Style::default().fg(t.text_dim)),
+            Span::styled(
+                "Ctrl-C",
+                Style::default().fg(t.primary).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" to quit.", Style::default().fg(t.text_dim)),
+        ]))
+        .style(t.bg_style()),
+        splits[1],
+    );
+}
+
 fn draw_frame(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     state: &mut AppState,
@@ -2455,6 +2525,13 @@ fn draw_frame(
     terminal.draw(|frame| {
         let area = frame.area();
         let t = theme::LegacyTheme::from_palette(&state.theme.palette);
+
+        // Short-circuit: when session_lost is active, render only the overlay.
+        if state.session_lost {
+            frame.render_widget(RatatuiBlock::default().style(t.bg_style()), area);
+            render_session_lost_overlay(frame, &t);
+            return;
+        }
 
         // Four rows: sessions strip (1) + tabs strip (1) + body (min 0) + status bar (1)
         let outer = Layout::default()
@@ -3919,6 +3996,7 @@ fn initial_app_state(
         toast_deck,
         toast_rx,
         pending_menu_action: None,
+        session_lost: false,
     }
 }
 
@@ -4496,6 +4574,41 @@ async fn run_tui(
             break;
         }
 
+        // Session-lost detection: check whether the active session's active tab
+        // has any live (Some) pane slot. If all slots are None the daemon evicted
+        // all panes from this session (e.g. last pane closed via close_pane RPC).
+        // Auto-switch to the next available session when one exists; otherwise
+        // set session_lost so the overlay is shown.
+        {
+            let si = state.active_session;
+            let ti = state.sessions[si].active_tab;
+            let all_dead = pane_leaves_in_order(&state.sessions[si].tabs[ti].root)
+                .iter()
+                .all(|pid| pane_to_slot_idx(&state.slots, *pid).is_none());
+
+            if all_dead && !state.session_lost {
+                // Try to find another session that still has at least one live slot.
+                let alt = (0..state.sessions.len()).find(|&other_si| {
+                    if other_si == si {
+                        return false;
+                    }
+                    let other_ti = state.sessions[other_si].active_tab;
+                    pane_leaves_in_order(&state.sessions[other_si].tabs[other_ti].root)
+                        .iter()
+                        .any(|pid| pane_to_slot_idx(&state.slots, *pid).is_some())
+                });
+                if let Some(next_si) = alt {
+                    state.active_session = next_si;
+                    state.session_lost = false;
+                } else {
+                    state.session_lost = true;
+                }
+            } else if !all_dead {
+                // Panes came back (e.g. new session opened) — clear the overlay.
+                state.session_lost = false;
+            }
+        }
+
         state.anim.tick();
         // Draw — pass state as mut so render_pane can store last_screen_rect.
         draw_frame(&mut terminal, &mut state, prefix_active)?;
@@ -4766,6 +4879,18 @@ async fn run_tui(
             Event::Key(key_event) => {
                 let code = key_event.code;
                 let mods = key_event.modifiers;
+
+                // Session-lost overlay intercepts all keys when active.
+                // q / Esc / Ctrl-C all exit the TUI cleanly.
+                if state.session_lost {
+                    match (code, mods) {
+                        (KeyCode::Char('q'), _)
+                        | (KeyCode::Esc, _)
+                        | (KeyCode::Char('c'), KeyModifiers::CONTROL) => break,
+                        _ => {}
+                    }
+                    continue;
+                }
 
                 // Name-prompt intercepts all keys when open.
                 if state.prompt.is_some() {
