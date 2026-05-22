@@ -1124,6 +1124,9 @@ struct AppState {
     pager_rect: Option<Rect>,
     /// Last time the session list was refreshed from the daemon.
     session_list_last_poll: Instant,
+    /// Last time the active session's layout was resynced from the daemon.
+    /// Acts as a safety-net periodic refresh of the tab's LayoutNode tree.
+    layout_resync_last_poll: Instant,
     /// Latest block snapshot delivered by the background poll task.
     /// Key = PaneId, value = blocks for that pane (up to 20, newest last).
     blocks_rx: watch::Receiver<HashMap<PaneId, Vec<Block>>>,
@@ -3988,6 +3991,8 @@ fn initial_app_state(
         pager_rect: None,
         // Force an immediate session-list sync on the first loop iteration.
         session_list_last_poll: Instant::now() - Duration::from_secs(10),
+        // Force an immediate layout resync on the first loop iteration.
+        layout_resync_last_poll: Instant::now() - Duration::from_secs(10),
         blocks_rx,
         anim: AnimClock::new(),
         pager: None,
@@ -4487,42 +4492,98 @@ async fn run_tui(
                     };
 
                     // Attach panes the daemon knows about but TUI does not.
-                    for pane_info in &daemon_panes {
-                        if local_pane_ids.contains(&pane_info.id) {
-                            continue;
-                        }
-                        let (pc, pr) = {
-                            let (tc, tr) = term_size();
-                            compute_pane_inner_size(tc, tr)
-                        };
-                        match attach_pane(&state.socket, info.id, pane_info.id, pc, pr).await {
-                            Ok(slot) => {
-                                let synced_pane_id = pane_info.id;
-                                state.slots.push(Some(slot));
-                                // Add as a new tab in the existing session, mirroring
-                                // open_new_tab's plumbing (new leaf, no split).
-                                let sv = &mut state.sessions[sv_idx];
-                                let tab_n = sv.tabs.len() + 1;
-                                sv.tabs.push(Tab {
-                                    root: LayoutNode::Leaf(synced_pane_id),
-                                    focus_pane: synced_pane_id,
-                                    zoomed: None,
-                                    boundaries: Vec::new(),
-                                    drag: None,
-                                });
-                                tracing::info!(
-                                    "pane-sync: attached new pane {} to session {} as tab-{}",
-                                    synced_pane_id,
-                                    info.id,
-                                    tab_n,
-                                );
+                    // Determine whether any new panes need to be attached.
+                    let new_panes: Vec<_> = daemon_panes
+                        .iter()
+                        .filter(|p| !local_pane_ids.contains(&p.id))
+                        .collect();
+
+                    if !new_panes.is_empty() {
+                        // Fetch the authoritative layout from the daemon FIRST.
+                        // The daemon is the single source of truth for the split
+                        // tree; creating a new Tab here would be wrong when the
+                        // pane was added via open_pane_split (it belongs inside
+                        // the existing tab's split, not as a separate tab).
+                        let fresh_layout = state
+                            .control
+                            .get_session_layout(tarpc::context::current(), info.id)
+                            .await
+                            .ok()
+                            .and_then(|r| r.ok());
+
+                        // Attach a slot for each new pane (I/O streams).
+                        for pane_info in &new_panes {
+                            let (pc, pr) = {
+                                let (tc, tr) = term_size();
+                                compute_pane_inner_size(tc, tr)
+                            };
+                            match attach_pane(&state.socket, info.id, pane_info.id, pc, pr).await
+                            {
+                                Ok(slot) => {
+                                    state.slots.push(Some(slot));
+                                    tracing::info!(
+                                        "pane-sync: attached slot for pane {} in session {}",
+                                        pane_info.id,
+                                        info.id,
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "pane-sync: attach_pane for pane {} in session {} \
+                                         failed: {e}",
+                                        pane_info.id,
+                                        info.id,
+                                    );
+                                }
                             }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "pane-sync: attach_pane for pane {} in session {} failed: {e}",
-                                    pane_info.id,
-                                    info.id,
-                                );
+                        }
+
+                        // Reconcile the layout tree: if the daemon returned a
+                        // fresh layout, apply it to the active tab so splits are
+                        // reflected correctly. If get_session_layout failed, fall
+                        // back to inserting a new tab per new pane (old behaviour)
+                        // so we don't silently lose panes.
+                        let sv = &mut state.sessions[sv_idx];
+                        if let Some(layout) = fresh_layout {
+                            // Replace the active tab's root with the daemon layout.
+                            // Focus stays on whatever pane was focused before (or
+                            // falls back to the first leaf in the new tree).
+                            let at = sv.active_tab;
+                            let old_focus = sv.tabs[at].focus_pane;
+                            let new_leaves = pane_leaves_in_order(&layout);
+                            let focus = if new_leaves.contains(&old_focus) {
+                                old_focus
+                            } else {
+                                new_leaves.into_iter().next().unwrap_or(old_focus)
+                            };
+                            sv.tabs[at].root = layout;
+                            sv.tabs[at].focus_pane = focus;
+                            tracing::info!(
+                                "pane-sync: applied daemon layout to active tab of session {}",
+                                info.id,
+                            );
+                        } else {
+                            // Fallback: add each new pane as a separate tab.
+                            // This preserves the previous behaviour when the RPC
+                            // fails, at the cost of incorrect tab/split mapping.
+                            for pane_info in &new_panes {
+                                // Only add a tab if the slot was successfully attached.
+                                if pane_to_slot_idx(&state.slots, pane_info.id).is_some() {
+                                    let tab_n = sv.tabs.len() + 1;
+                                    sv.tabs.push(Tab {
+                                        root: LayoutNode::Leaf(pane_info.id),
+                                        focus_pane: pane_info.id,
+                                        zoomed: None,
+                                        boundaries: Vec::new(),
+                                        drag: None,
+                                    });
+                                    tracing::warn!(
+                                        "pane-sync: fallback — new pane {} added as tab-{} \
+                                         (get_session_layout failed)",
+                                        pane_info.id,
+                                        tab_n,
+                                    );
+                                }
                             }
                         }
                     }
@@ -4572,6 +4633,71 @@ async fn run_tui(
         // Guard: exit immediately if every session was removed by any code path.
         if state.sessions.is_empty() {
             break;
+        }
+
+        // Periodic layout resync — safety net for missed LayoutChanged events.
+        // Every 5 s, re-fetch the daemon's authoritative LayoutNode for the
+        // active session and reconcile the active tab's root tree. This catches
+        // any splits that arrived while the TUI was not polling (e.g. rapid MCP
+        // calls) without waiting for the next 1 s session-sync cycle.
+        if state.layout_resync_last_poll.elapsed() >= Duration::from_secs(5) {
+            state.layout_resync_last_poll = Instant::now();
+            let active_session_id = state.sessions[state.active_session].id;
+            if let Ok(Ok(fresh_layout)) = state
+                .control
+                .get_session_layout(tarpc::context::current(), active_session_id)
+                .await
+            {
+                let si = state.active_session;
+                let at = state.sessions[si].active_tab;
+                let daemon_leaves = pane_leaves_in_order(&fresh_layout);
+                // Attach slots for any pane in the daemon layout we don't know yet.
+                let mut new_ids: Vec<PaneId> = Vec::new();
+                for &pid in &daemon_leaves {
+                    if pane_to_slot_idx(&state.slots, pid).is_none() {
+                        new_ids.push(pid);
+                    }
+                }
+                for pid in new_ids {
+                    let (pc, pr) = {
+                        let (tc, tr) = term_size();
+                        compute_pane_inner_size(tc, tr)
+                    };
+                    match attach_pane(&state.socket, active_session_id, pid, pc, pr).await {
+                        Ok(slot) => {
+                            state.slots.push(Some(slot));
+                            tracing::info!(
+                                "layout-resync: attached missing slot for pane {} in session {}",
+                                pid,
+                                active_session_id,
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "layout-resync: attach_pane for pane {} failed: {e}",
+                                pid,
+                            );
+                        }
+                    }
+                }
+                // Replace the active tab's root only if the tree changed.
+                let old_leaves = pane_leaves_in_order(&state.sessions[si].tabs[at].root);
+                let new_leaves = pane_leaves_in_order(&fresh_layout);
+                if old_leaves != new_leaves {
+                    let old_focus = state.sessions[si].tabs[at].focus_pane;
+                    let focus = if new_leaves.contains(&old_focus) {
+                        old_focus
+                    } else {
+                        new_leaves.into_iter().next().unwrap_or(old_focus)
+                    };
+                    state.sessions[si].tabs[at].root = fresh_layout;
+                    state.sessions[si].tabs[at].focus_pane = focus;
+                    tracing::info!(
+                        "layout-resync: updated tab layout for session {}",
+                        active_session_id,
+                    );
+                }
+            }
         }
 
         // Session-lost detection: check whether the active session's active tab
