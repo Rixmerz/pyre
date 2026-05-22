@@ -359,23 +359,29 @@ impl SessionRegistry {
         *pane.closed_at.lock().await = Some(Utc::now());
         session.panes.lock().await.remove(&pane_id);
 
-        // Collapse the layout tree. Persist → emit (ADR-0005 write-before-broadcast
-        // invariant) so reattach after the event sees the updated layout.
-        let layout_changed = {
+        // Collapse the layout tree. Drop the layout lock before the async
+        // SQLite write — same pattern as open_pane / open_pane_split — so we
+        // never hold an async mutex guard across an .await point (which would
+        // stall any concurrent caller that also needs session.layout).
+        //
+        // ADR-0005 write-before-broadcast invariant is preserved: we
+        // persist first, emit LayoutChanged only after the block exits.
+        let (layout_changed, persist_json) = {
             let mut layout = session.layout.lock().await;
             if let Some(ref mut tree) = *layout {
                 tree.close(&pane_id);
-                if let Some(s) = store {
-                    let json = serde_json::to_string(tree).unwrap_or_default();
-                    if let Err(e) = s.upsert_session_layout(session.id, &json).await {
-                        tracing::warn!("upsert_session_layout on close {}: {e:#}", session.id);
-                    }
-                }
-                true
+                let json = serde_json::to_string(tree).unwrap_or_default();
+                (true, Some(json))
             } else {
-                false
+                (false, None)
             }
         };
+        // layout lock is now released — safe to await the SQLite write.
+        if let (Some(s), Some(json)) = (store, persist_json) {
+            if let Err(e) = s.upsert_session_layout(session.id, &json).await {
+                tracing::warn!("upsert_session_layout on close {}: {e:#}", session.id);
+            }
+        }
         if layout_changed {
             self.emit_event(pane_id, PaneEventKind::LayoutChanged, None, None);
         }
