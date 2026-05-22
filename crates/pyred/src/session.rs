@@ -789,4 +789,36 @@ mod tests {
         assert!(leaves[0].1.w >= 750, "pane_a should be ~800px wide");
         assert!(leaves[1].1.w <= 250, "pane_b should be ~200px wide");
     }
+
+    /// Ghost-leaf prune: closing a dead pane from a VSplit via `LayoutNode::close`
+    /// removes only the dead leaf and collapses the split correctly.
+    /// This is the same operation performed by the lazy reconcile in
+    /// `get_session_layout` (supervisor) and `close_pane` (single-mode).
+    #[tokio::test]
+    async fn ghost_leaf_prune_collapses_dead_pane() {
+        let live = PaneId::new();
+        let dead = PaneId::new();
+
+        let mut tree = LayoutNode::VSplit(vec![
+            (LayoutNode::Leaf(live), 50),
+            (LayoutNode::Leaf(dead), 50),
+        ]);
+
+        // Simulate what the lazy reconcile does: close the dead leaf.
+        tree.close(&dead);
+
+        // The tree must collapse back to a single Leaf for the live pane.
+        assert!(
+            matches!(tree, LayoutNode::Leaf(id) if id == live),
+            "pruning the dead leaf should collapse to Leaf(live)"
+        );
+
+        // After pruning, all_leaves must contain exactly the live pane.
+        let remaining = tree.all_leaves();
+        assert_eq!(remaining, vec![live], "only the live pane should remain");
+        assert!(
+            !remaining.contains(&dead),
+            "dead pane must not appear in all_leaves after prune"
+        );
+    }
 }

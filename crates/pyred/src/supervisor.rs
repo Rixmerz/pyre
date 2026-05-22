@@ -341,6 +341,20 @@ impl WorkerRegistry {
             .count()
     }
 
+    /// Return all live PaneIds currently tracked for `session_id`.
+    /// Dead slots (marked via `pane_closed`) are excluded automatically because
+    /// `remove_pane_slot` erases them from `pane_to_slot`.
+    pub async fn live_pane_ids(&self, session_id: &str) -> Vec<PaneId> {
+        self.panes
+            .read()
+            .await
+            .pane_to_slot
+            .iter()
+            .filter(|(_, (sid, _))| sid.as_str() == session_id)
+            .map(|(uuid, _)| PaneId(*uuid))
+            .collect()
+    }
+
     /// Look up the session_id for a given worker PID; used by SIGCHLD handler.
     pub async fn session_for_pid(&self, pid: u32) -> Option<String> {
         self.inner
@@ -1281,15 +1295,106 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
         session_id: SessionId,
     ) -> Result<layout::LayoutNode, PyreError> {
         let id_str = session_id.0.to_string();
-        let ls = self.layout_store.lock().await;
-        if let Some(tree) = ls.get(&id_str) {
-            return Ok(tree.clone());
+
+        // ── Step 1: obtain the layout tree ──────────────────────────────────
+        // Prefer the in-memory store.  If absent (daemon restart / first call
+        // after reattach), try to load the persisted JSON from SQLite.
+        let tree_opt = {
+            let ls = self.layout_store.lock().await;
+            ls.get(&id_str).cloned()
+        };
+
+        let mut tree = if let Some(t) = tree_opt {
+            t
+        } else {
+            // Try to restore from the database.
+            match self.store.get_session_layout_json(session_id).await {
+                Ok(Some(json)) => match serde_json::from_str::<LayoutNode>(&json) {
+                    Ok(t) => {
+                        // Warm the in-memory store so subsequent calls are free.
+                        self.layout_store
+                            .lock()
+                            .await
+                            .insert(id_str.clone(), t.clone());
+                        t
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            session_id = id_str,
+                            "get_session_layout: could not deserialize persisted layout: {e:#}"
+                        );
+                        // Fall through to single-leaf fallback below.
+                        return self.layout_single_leaf_fallback(session_id, &id_str).await;
+                    }
+                },
+                _ => {
+                    // No persisted layout — build from first live pane.
+                    return self.layout_single_leaf_fallback(session_id, &id_str).await;
+                }
+            }
+        };
+
+        // ── Step 2: lazy ghost-leaf reconcile ────────────────────────────────
+        // Remove any Leaf whose PaneId is no longer in the live pane set.
+        // This guards against panes that died via pane_closed before their
+        // layout entry was pruned (race window at startup or after restart).
+        let live: std::collections::HashSet<PaneId> = self
+            .registry
+            .live_pane_ids(&id_str)
+            .await
+            .into_iter()
+            .collect();
+
+        // Only reconcile when the registry has at least one live pane.  If
+        // the registry is empty we cannot distinguish "all panes closed" from
+        // "we haven't registered panes yet after restart" — leave the tree
+        // intact in that case so we don't wipe a valid persisted layout.
+        if !live.is_empty() {
+            let all_leaves = tree.all_leaves();
+            let ghost_ids: Vec<PaneId> = all_leaves
+                .into_iter()
+                .filter(|id| !live.contains(id))
+                .collect();
+
+            if !ghost_ids.is_empty() {
+                tracing::warn!(
+                    session_id = id_str,
+                    ghosts = ghost_ids.len(),
+                    "get_session_layout: pruning ghost leaves"
+                );
+                for ghost in &ghost_ids {
+                    tree.close(ghost);
+                }
+                // Persist the cleaned tree and update in-memory store.
+                let json = serde_json::to_string(&tree).unwrap_or_default();
+                self.layout_store
+                    .lock()
+                    .await
+                    .insert(id_str.clone(), tree.clone());
+                if let Err(e) = self.store.upsert_session_layout(session_id, &json).await {
+                    tracing::warn!(
+                        session_id = id_str,
+                        "get_session_layout: upsert after ghost prune failed: {e:#}"
+                    );
+                }
+            }
         }
-        drop(ls);
-        // Fall back to a single-leaf built from the first pane the worker reports.
+
+        Ok(tree)
+    }
+}
+
+impl SupervisorImpl {
+    /// Build a single-Leaf layout from the first pane the worker reports.
+    /// Used as the last-resort fallback in `get_session_layout`.
+    async fn layout_single_leaf_fallback(
+        &self,
+        session_id: SessionId,
+        id_str: &str,
+    ) -> Result<layout::LayoutNode, PyreError> {
         let client = self
             .registry
-            .get_ctrl_client(&id_str)
+            .get_ctrl_client(id_str)
             .await
             .ok_or(PyreError::NoSuchSession(session_id))?;
         let slots = client
@@ -1299,7 +1404,7 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
             .map_err(|e| PyreError::Io(e.to_string()))?;
         let first_slot = slots.into_iter().next();
         if let Some(slot) = first_slot {
-            if let Some(pane_uuid) = self.registry.get_or_alloc_pane_by_slot(&id_str, slot).await {
+            if let Some(pane_uuid) = self.registry.get_or_alloc_pane_by_slot(id_str, slot).await {
                 return Ok(LayoutNode::Leaf(PaneId(pane_uuid)));
             }
         }
@@ -1317,6 +1422,9 @@ struct SupervisorWorkerImpl {
     event_tx: mpsc::Sender<BlockEvent>,
     pending_registrations: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
     pane_event_bus: Arc<PaneEventBus>,
+    /// Shared with `SupervisorImpl` so `pane_closed` can prune ghost leaves.
+    layout_store: Arc<Mutex<HashMap<String, LayoutNode>>>,
+    store: Arc<crate::store::Store>,
 }
 
 impl SupervisorWorker for SupervisorWorkerImpl {
@@ -1375,7 +1483,8 @@ impl SupervisorWorker for SupervisorWorkerImpl {
         slot_idx: u32,
     ) -> Result<(), RpcError> {
         tracing::info!(session_id, slot_idx, "worker reports pane closed");
-        // Resolve PaneId before removing the slot so we can emit the event.
+        // Resolve PaneId before removing the slot so we can prune the layout
+        // and emit the event with a stable identity.
         let pane_uuid = self
             .registry
             .get_or_alloc_pane_by_slot(&session_id, slot_idx)
@@ -1392,9 +1501,38 @@ impl SupervisorWorker for SupervisorWorkerImpl {
             );
             self.registry.remove(&session_id).await;
         }
+
+        // Prune the dead pane from the supervisor's layout tree so that
+        // get_session_layout never returns ghost leaves.  This mirrors what
+        // SupervisorImpl::close_pane does for the RPC-initiated close path;
+        // here we handle the case where the pane exits on its own (e.g. the
+        // shell finishes, or Ctrl-B x inside the worker).
         if let Some(uuid) = pane_uuid {
+            let pane_id = PaneId(uuid);
+            let persist: Option<(SessionId, String)> = {
+                let mut ls = self.layout_store.lock().await;
+                if let Some(tree) = ls.get_mut(&session_id) {
+                    tree.close(&pane_id);
+                    let json = serde_json::to_string(tree).unwrap_or_default();
+                    uuid::Uuid::parse_str(&session_id)
+                        .ok()
+                        .map(|u| (SessionId(u), json))
+                } else {
+                    None
+                }
+            };
+            if let Some((sid, json)) = persist {
+                if let Err(e) = self.store.upsert_session_layout(sid, &json).await {
+                    tracing::warn!(
+                        session_id,
+                        "pane_closed: upsert_session_layout failed: {e:#}"
+                    );
+                }
+                self.pane_event_bus
+                    .emit(pane_id, PaneEventKind::LayoutChanged, None);
+            }
             self.pane_event_bus
-                .emit(PaneId(uuid), PaneEventKind::Closed, None);
+                .emit(pane_id, PaneEventKind::Closed, None);
         }
         Ok(())
     }
@@ -1837,6 +1975,8 @@ pub async fn run(
         let sw_event_tx = event_tx.clone();
         let sw_pending = pending_registrations.clone();
         let sw_pane_event_bus = pane_event_bus.clone();
+        let sw_layout_store = layout_store.clone();
+        let sw_store = store.clone();
         tokio::spawn(async move {
             loop {
                 match sw_listener.accept().await {
@@ -1846,6 +1986,8 @@ pub async fn run(
                             event_tx: sw_event_tx.clone(),
                             pending_registrations: sw_pending.clone(),
                             pane_event_bus: sw_pane_event_bus.clone(),
+                            layout_store: sw_layout_store.clone(),
+                            store: sw_store.clone(),
                         };
                         let transport = tarpc::serde_transport::new(
                             Framed::new(sock, LengthDelimitedCodec::new()),

@@ -86,6 +86,16 @@ impl Store {
         Ok(())
     }
 
+    /// Return the raw JSON layout string for a single session, or `None` if the
+    /// session has no persisted layout.
+    pub async fn get_session_layout_json(&self, id: SessionId) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT layout FROM sessions WHERE id = ?1")
+            .bind(id.0.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.and_then(|r| r.try_get::<Option<String>, _>("layout").unwrap_or(None)))
+    }
+
     /// Return `(SessionId, layout_json)` for all sessions that have a layout column.
     #[allow(dead_code)]
     pub async fn list_session_layouts(&self) -> Result<Vec<(SessionId, Option<String>)>> {

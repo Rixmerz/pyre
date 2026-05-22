@@ -187,7 +187,7 @@ impl LayoutNode {
 
     // ── Private helpers ───────────────────────────────────────────────────────
 
-    fn all_leaves(&self) -> Vec<PaneId> {
+    pub fn all_leaves(&self) -> Vec<PaneId> {
         match self {
             LayoutNode::Leaf(id) => vec![*id],
             LayoutNode::HSplit(children) | LayoutNode::VSplit(children) => {
