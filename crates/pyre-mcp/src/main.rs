@@ -556,6 +556,7 @@ impl Server {
                         "type": "object",
                         "properties": {
                             "session": { "type": "string", "description": "Session id or ≥8-char prefix" },
+                            "name": { "type": "string", "description": "Optional human-readable label for the pane" },
                             "cols": { "type": "integer", "default": 80 },
                             "rows": { "type": "integer", "default": 24 },
                             "cwd": { "type": "string", "description": "Working directory (optional)" },
@@ -592,6 +593,11 @@ impl Server {
                         },
                         "required": []
                     }
+                },
+                {
+                    "name": "gc_stale_sessions",
+                    "description": "Evict sessions that have no live panes. Returns the list of evicted session UUIDs.",
+                    "inputSchema": { "type": "object", "properties": {}, "required": [] }
                 },
                 {
                     "name": "session_layout",
@@ -641,6 +647,7 @@ impl Server {
             "list_sessions" => self.tool_list_sessions().await?,
             "list_panes" => self.tool_list_panes(args).await?,
             "session_layout" => self.tool_session_layout(args).await?,
+            "gc_stale_sessions" => self.tool_gc_stale_sessions().await?,
             other => return Err(anyhow!("unknown tool: {other}")),
         };
 
@@ -963,6 +970,7 @@ impl Server {
                 json!({
                     "pane_id": p.id.0.to_string(),
                     "session_id": p.session.0.to_string(),
+                    "name": p.name,
                     "agent": p.agent.label(),
                     "state": p.state.to_string(),
                     "seen": p.seen,
@@ -1027,6 +1035,11 @@ impl Server {
                     cols: 80,
                     rows: 24,
                     env: std::env::vars().collect(),
+                    name: if pane_name.is_empty() {
+                        None
+                    } else {
+                        Some(pane_name.clone())
+                    },
                 };
                 client
                     .open_pane(tarpc::context::current(), req)
@@ -1065,6 +1078,19 @@ impl Server {
         }))?)
     }
 
+    async fn tool_gc_stale_sessions(&self) -> Result<String> {
+        let client = self.client().await?;
+        let evicted = client
+            .gc_stale_sessions(tarpc::context::current())
+            .await
+            .context("rpc")?
+            .map_err(|e| anyhow!("{e}"))?;
+        let count = evicted.len();
+        Ok(serde_json::to_string_pretty(
+            &json!({ "evicted_count": count, "evicted": evicted }),
+        )?)
+    }
+
     async fn tool_pane_open(&self, args: &Value) -> Result<String> {
         let session_prefix = args["session"]
             .as_str()
@@ -1080,6 +1106,7 @@ impl Server {
         let client = self.client().await?;
         let session_id = self.resolve_session_id(&client, session_prefix).await?;
 
+        let pane_name = args["name"].as_str().map(str::to_owned);
         let req = OpenPaneReq {
             session: session_id,
             shell,
@@ -1087,6 +1114,7 @@ impl Server {
             cols,
             rows,
             env: std::env::vars().collect(),
+            name: pane_name,
         };
         let pane_id = client
             .open_pane(tarpc::context::current(), req)

@@ -490,6 +490,7 @@ impl WorkerState {
             root_pid,
             agent,
             seen,
+            name: None,
         })
     }
 

@@ -8,7 +8,8 @@ use crate::MODE_CONTROL;
 
 /// Wire protocol version. Bump when breaking RPC or stream framing changes.
 /// v2: adds `exit_code` i64 FAST+INDEXED field to Tantivy schema.
-pub const PROTO_VERSION: u32 = 2;
+/// v3: adds `name: Option<String>` to `OpenPaneReq` and `PaneInfo`.
+pub const PROTO_VERSION: u32 = 3;
 
 /// Client: write `MODE_CONTROL` + little-endian `PROTO_VERSION`.
 pub async fn write_control_client<W: AsyncWrite + Unpin>(w: &mut W) -> io::Result<()> {

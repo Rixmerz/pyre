@@ -602,6 +602,7 @@ impl App {
             cols: new_cols as u16,
             rows: new_rows as u16,
             env: std::env::vars().collect(),
+            name: None,
         };
         let client = self.control.clone();
         let session = self.session;

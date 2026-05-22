@@ -188,6 +188,12 @@ pub trait PyreDaemon {
     /// The daemon keeps a ring buffer of the last 256 events so a client that
     /// was briefly disconnected can still catch up without missing events.
     async fn next_pane_event(after_seq: u64, timeout_ms: u32) -> Result<Vec<PaneEvent>, PyreError>;
+    /// Evict all sessions that have zero live panes.
+    ///
+    /// Returns the UUIDs (as strings) of every session that was removed.
+    /// This cleans up zombie sessions accumulated from pre-6046eea daemon
+    /// restarts where `close_pane` eviction was not yet wired.
+    async fn gc_stale_sessions() -> Result<Vec<String>, PyreError>;
 }
 
 /// Process metadata returned by `inspect_pid`.

@@ -687,6 +687,7 @@ async fn run_new_pane(
         cols,
         rows,
         env: std::env::vars().collect(),
+        name: None,
     };
     let pane_id = client
         .open_pane(tarpc::context::current(), req)
@@ -1301,6 +1302,7 @@ async fn run_split_window(socket: PathBuf, session_prefix: String) -> Result<()>
         cols,
         rows,
         env: std::env::vars().collect(),
+        name: None,
     };
     let pane_id = client
         .open_pane(tarpc::context::current(), req)

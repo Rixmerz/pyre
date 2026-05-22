@@ -2883,6 +2883,7 @@ async fn split_active(state: &mut AppState, horizontal: bool) -> Result<()> {
         cols,
         rows,
         env: std::env::vars().collect(),
+        name: None,
     };
     let new_pane_id = state
         .control
@@ -2943,6 +2944,7 @@ async fn open_new_tab(state: &mut AppState, label: Option<String>) -> Result<()>
         cols,
         rows,
         env: std::env::vars().collect(),
+        name: None,
     };
     let new_pane_id = state
         .control

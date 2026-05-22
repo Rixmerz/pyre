@@ -28,6 +28,8 @@ use crate::store::Store;
 pub struct PaneState {
     pub id: PaneId,
     pub session: SessionId,
+    /// Optional human-readable label assigned at pane creation time.
+    pub name: Option<String>,
     pub cols: u16,
     pub rows: u16,
     pub shell: String,
@@ -62,6 +64,7 @@ impl PaneState {
     pub(crate) fn new(
         id: PaneId,
         session: SessionId,
+        name: Option<String>,
         cols: u16,
         rows: u16,
         shell: String,
@@ -79,6 +82,7 @@ impl PaneState {
         Self {
             id,
             session,
+            name,
             cols,
             rows,
             shell,
@@ -261,6 +265,7 @@ impl SessionRegistry {
         };
 
         // Convert OpenPaneReq to the SpawnReq shape spawn_pty expects.
+        let pane_name = req.name.clone();
         let spawn_req = SpawnReq {
             cols: req.cols,
             rows: req.rows,
@@ -270,7 +275,20 @@ impl SessionRegistry {
             name: None,
         };
 
-        let raw = spawn_pty(spawn_req, session_id, store, block_index, Arc::clone(self)).await?;
+        // Read the session name so spawn_pty can re-persist it correctly
+        // (instead of overwriting with empty string).
+        let session_name_str = session.name.read().await.clone();
+
+        let raw = spawn_pty(
+            spawn_req,
+            session_id,
+            pane_name,
+            Some(&session_name_str),
+            store,
+            block_index,
+            Arc::clone(self),
+        )
+        .await?;
         let pane = Arc::new(raw);
 
         session.panes.lock().await.insert(pane.id, pane.clone());
@@ -504,5 +522,6 @@ fn pane_info_from_state(p: &Arc<PaneState>) -> PaneInfo {
         root_pid,
         agent,
         seen,
+        name: p.name.clone(),
     }
 }

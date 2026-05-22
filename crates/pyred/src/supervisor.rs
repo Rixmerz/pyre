@@ -1104,6 +1104,41 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
 
         Ok(collected)
     }
+
+    async fn gc_stale_sessions(self, _ctx: context::Context) -> Result<Vec<String>, PyreError> {
+        // Build the list of zero-pane sessions first (avoids holding the registry
+        // read-lock while sending RPCs).
+        let stale: Vec<String> = {
+            let handles = self.registry.inner.read().await;
+            let mut out = Vec::new();
+            for (session_id_str, handle) in handles.iter() {
+                let pane_count = match handle.ctrl_client.list_panes(context::current()).await {
+                    Ok(Ok(slots)) => slots.len(),
+                    _ => continue, // can't determine — skip
+                };
+                if pane_count == 0 {
+                    out.push(session_id_str.clone());
+                }
+            }
+            out
+        };
+
+        let mut evicted = Vec::new();
+        for id in stale {
+            if let Some(handle) = self.registry.remove(&id).await {
+                match handle
+                    .ctrl_client
+                    .shutdown(context::current(), 5)
+                    .await
+                {
+                    Ok(_) => evicted.push(id),
+                    Err(e) => tracing::warn!("gc_stale_sessions: shutdown {id}: {e}"),
+                }
+            }
+        }
+        tracing::info!("gc_stale_sessions: evicted {} session(s)", evicted.len());
+        Ok(evicted)
+    }
 }
 
 // ---------------------------------------------------------------------------

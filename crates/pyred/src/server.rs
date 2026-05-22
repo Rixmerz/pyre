@@ -36,6 +36,7 @@ impl pyre_proto::service::PyreDaemon for DaemonImpl {
             cols: req.cols,
             rows: req.rows,
             env: req.env,
+            name: None,
         };
         let pane = self
             .registry
@@ -448,6 +449,22 @@ impl pyre_proto::service::PyreDaemon for DaemonImpl {
             .lock()
             .map_err(|_| PyreError::Io("focus_queue lock poisoned".into()))?
             .pop_front())
+    }
+
+    async fn gc_stale_sessions(self, _ctx: context::Context) -> Result<Vec<String>, PyreError> {
+        let sessions = self.registry.list_sessions().await;
+        let mut evicted = Vec::new();
+        for s in sessions {
+            if s.pane_count == 0 {
+                // kill_session removes from the in-memory registry.
+                match self.registry.kill_session(s.id).await {
+                    Ok(()) => evicted.push(s.id.0.to_string()),
+                    Err(e) => tracing::warn!("gc_stale_sessions: skip {}: {e:#}", s.id),
+                }
+            }
+        }
+        tracing::info!("gc_stale_sessions: evicted {} session(s)", evicted.len());
+        Ok(evicted)
     }
 
     async fn next_pane_event(

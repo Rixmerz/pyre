@@ -22,10 +22,15 @@ const IN_CHANNEL_CAP: usize = 256;
 
 /// Spawn a PTY for the given session. The caller is responsible for inserting
 /// the returned `PaneState` into `SessionState::panes`.
+///
+/// `pane_name` is the optional human-readable label for the new pane (distinct
+/// from `req.name` which labels the session).
 #[cfg(unix)]
 pub async fn spawn_pty(
     req: SpawnReq,
     session_id: SessionId,
+    pane_name: Option<String>,
+    session_name: Option<&str>,
     store: Arc<crate::store::Store>,
     block_index: Arc<crate::index::BlockIndex>,
     registry: Arc<SessionRegistry>,
@@ -133,7 +138,11 @@ pub async fn spawn_pty(
         .context("spawn pty writer thread")?;
 
     // Persist session and pane rows before returning.
-    store.upsert_session(session_id, "").await?;
+    // Use the caller-supplied session_name so we don't overwrite the name that
+    // new_session() already persisted.  Fall back to "" only when unknown.
+    store
+        .upsert_session(session_id, session_name.unwrap_or(""))
+        .await?;
     store
         .upsert_pane(
             pane_id,
@@ -342,6 +351,7 @@ pub async fn spawn_pty(
     Ok(PaneState::new(
         pane_id,
         session_id,
+        pane_name,
         req.cols,
         req.rows,
         shell,
@@ -362,7 +372,11 @@ pub async fn spawn_pty(
 pub async fn spawn_pty(
     _req: SpawnReq,
     _session_id: SessionId,
+    _pane_name: Option<String>,
+    _session_name: Option<&str>,
     _store: Arc<crate::store::Store>,
+    _block_index: Arc<crate::index::BlockIndex>,
+    _registry: Arc<SessionRegistry>,
 ) -> Result<PaneState> {
     anyhow::bail!("pyred PTY only supported on unix in S1")
 }
