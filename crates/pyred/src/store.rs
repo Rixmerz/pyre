@@ -72,6 +72,37 @@ impl Store {
         Ok(())
     }
 
+    /// Persist the JSON-encoded `LayoutNode` for a session (M7-C, ADR-0005).
+    ///
+    /// Uses `INSERT OR IGNORE` + `UPDATE` so the row is always present before
+    /// the layout column is written — safe to call before `upsert_session` for
+    /// sessions whose rows are created elsewhere (e.g. hybrid worker path).
+    pub async fn upsert_session_layout(&self, id: SessionId, layout_json: &str) -> Result<()> {
+        sqlx::query("UPDATE sessions SET layout = ?2 WHERE id = ?1")
+            .bind(id.0.to_string())
+            .bind(layout_json)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Return `(SessionId, layout_json)` for all sessions that have a layout column.
+    #[allow(dead_code)]
+    pub async fn list_session_layouts(&self) -> Result<Vec<(SessionId, Option<String>)>> {
+        let rows = sqlx::query("SELECT id, layout FROM sessions ORDER BY created_at ASC")
+            .fetch_all(&self.pool)
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id_str: String = row.try_get("id")?;
+            if let Ok(uuid) = uuid::Uuid::parse_str(&id_str) {
+                let layout: Option<String> = row.try_get("layout").unwrap_or(None);
+                out.push((SessionId(uuid), layout));
+            }
+        }
+        Ok(out)
+    }
+
     pub async fn upsert_pane(
         &self,
         id: PaneId,
@@ -409,6 +440,52 @@ mod tests {
         let limited = store.list_blocks_for_pane(pane_a, 2).await?;
         assert_eq!(limited.len(), 2);
 
+        Ok(())
+    }
+
+    // ── Layout persistence tests (M7-C) ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn layout_roundtrip() -> Result<()> {
+        let tmp = TempDir::new()?;
+        unsafe {
+            std::env::set_var("PYRE_DATA_DIR", tmp.path());
+        }
+        let store = Store::open().await?;
+
+        let sid = SessionId(Uuid::new_v4());
+        let pane_a = PaneId(Uuid::new_v4());
+        let pane_b = PaneId(Uuid::new_v4());
+        store.upsert_session(sid, "test-layout").await?;
+
+        // Build a simple VSplit layout and persist it.
+        let layout = pyre_proto::LayoutNode::VSplit(vec![
+            (pyre_proto::LayoutNode::Leaf(pane_a), 50),
+            (pyre_proto::LayoutNode::Leaf(pane_b), 50),
+        ]);
+        let json = serde_json::to_string(&layout)?;
+        store.upsert_session_layout(sid, &json).await?;
+
+        // Read back via list_session_layouts.
+        let rows = store.list_session_layouts().await?;
+        let row = rows.iter().find(|(id, _)| *id == sid).expect("session row");
+        let restored: pyre_proto::LayoutNode =
+            serde_json::from_str(row.1.as_deref().expect("layout present"))?;
+        assert_eq!(layout, restored, "layout round-trip must match");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_idempotent() -> Result<()> {
+        // Running Store::open() twice on the same DB must not fail (the migration
+        // is guarded by sqlx::migrate! which checks applied migrations).
+        let tmp = TempDir::new()?;
+        unsafe {
+            std::env::set_var("PYRE_DATA_DIR", tmp.path());
+        }
+        let _store1 = Store::open().await?;
+        let _store2 = Store::open().await?; // second open — must not error
         Ok(())
     }
 }

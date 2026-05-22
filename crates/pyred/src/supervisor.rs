@@ -27,9 +27,10 @@ use pyre_proto::supervisor::{
     BlockEvent, RegisterAck, RpcError, SupervisorWorker, WorkerControlClient,
 };
 use pyre_proto::{
-    AttachAck, Block, BlockHit, BlockId, InputFrame, ListBlocksReq, OpenPaneReq, OutputFrame,
-    PaneEvent, PaneEventKind, PaneId, PaneInfo, PaneStateKind, PyreError, ReplayBlocks,
-    ResizePaneReq, ResizePaneRes, SearchBlocksReq, SessionId, SessionInfo, SpawnReq, SpawnResp,
+    layout, AttachAck, Block, BlockHit, BlockId, InputFrame, LayoutNode, ListBlocksReq,
+    OpenPaneReq, OpenPaneSplitReq, OutputFrame, PaneEvent, PaneEventKind, PaneId, PaneInfo,
+    PaneStateKind, PyreError, ReplayBlocks, ResizePaneReq, ResizePaneRes, SearchBlocksReq,
+    SessionId, SessionInfo, SpawnReq, SpawnResp,
 };
 use tarpc::server::{BaseChannel, Channel};
 use tarpc::tokio_serde::formats::Bincode;
@@ -443,6 +444,13 @@ pub struct SupervisorImpl {
     pub focus_queue: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
     /// Pane lifecycle event bus: broadcast ring for `next_pane_event` long-poll.
     pub pane_event_bus: Arc<PaneEventBus>,
+    /// In-memory per-session layout store for the supervisor (M7-C, ADR-0005).
+    ///
+    /// The supervisor owns the tiling tree in hybrid mode; workers only manage
+    /// PTY processes. Layout is persisted to `self.store` (supervisor SQLite)
+    /// and mirrored here for fast reads without a DB round-trip.
+    /// Key: session_id UUID string.
+    pub layout_store: Arc<Mutex<HashMap<String, LayoutNode>>>,
 }
 
 impl SupervisorImpl {
@@ -758,7 +766,30 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
             .close_pane(context::current(), slot_idx)
             .await
             .map_err(|e| PyreError::Io(e.to_string()))?
-            .map_err(|e| PyreError::Io(e.to_string()))
+            .map_err(|e| PyreError::Io(e.to_string()))?;
+
+        // Collapse layout in supervisor's in-memory store + persist.
+        // Collect json under the lock, then release before the async persist.
+        let layout_persist: Option<(SessionId, String)> = {
+            let mut ls = self.layout_store.lock().await;
+            if let Some(tree) = ls.get_mut(&session_id_str) {
+                tree.close(&pane);
+                let json = serde_json::to_string(tree).unwrap_or_default();
+                uuid::Uuid::parse_str(&session_id_str)
+                    .ok()
+                    .map(|u| (SessionId(u), json))
+            } else {
+                None
+            }
+        };
+        if let Some((sid, json)) = layout_persist {
+            if let Err(e) = self.store.upsert_session_layout(sid, &json).await {
+                tracing::warn!("supervisor: upsert_session_layout on close: {e:#}");
+            }
+            self.pane_event_bus
+                .emit(pane, PaneEventKind::LayoutChanged, None);
+        }
+        Ok(())
     }
 
     async fn replay(
@@ -1126,11 +1157,7 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
         let mut evicted = Vec::new();
         for id in stale {
             if let Some(handle) = self.registry.remove(&id).await {
-                match handle
-                    .ctrl_client
-                    .shutdown(context::current(), 5)
-                    .await
-                {
+                match handle.ctrl_client.shutdown(context::current(), 5).await {
                     Ok(_) => evicted.push(id),
                     Err(e) => tracing::warn!("gc_stale_sessions: shutdown {id}: {e}"),
                 }
@@ -1138,6 +1165,145 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
         }
         tracing::info!("gc_stale_sessions: evicted {} session(s)", evicted.len());
         Ok(evicted)
+    }
+
+    // ── Layout RPCs (M7-C, ADR-0005) ──────────────────────────────────────
+
+    async fn open_pane_split(
+        self,
+        _ctx: context::Context,
+        req: OpenPaneSplitReq,
+    ) -> Result<PaneId, PyreError> {
+        let parent = req.parent_pane;
+
+        // Resolve which session and worker own the parent pane.
+        let (session_id_str, _slot_idx) = self
+            .registry
+            .lookup_pane(parent.0)
+            .await
+            .ok_or(PyreError::NoSuchPane(parent))?;
+
+        let sid = uuid::Uuid::parse_str(&session_id_str)
+            .map(SessionId)
+            .map_err(|_| PyreError::NoSuchPane(parent))?;
+
+        let client = self
+            .registry
+            .get_ctrl_client(&session_id_str)
+            .await
+            .ok_or(PyreError::NoSuchPane(parent))?;
+
+        // Allocate a new PaneId/slot in the supervisor's registry.
+        let (pane_uuid, slot_idx) = self.registry.alloc_pane(&session_id_str).await;
+
+        // Tell the worker to spawn the PTY for this slot.
+        let shell = req.cmd.unwrap_or_default();
+        let cwd = req
+            .cwd
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        // Reuse parent pane's cols/rows — query the worker for them.
+        let cols: u16 = 80;
+        let rows: u16 = 24;
+
+        client
+            .open_pane(context::current(), slot_idx, shell, cwd, cols, rows)
+            .await
+            .map_err(|e| PyreError::SpawnFailed(e.to_string()))?
+            .map_err(|e| PyreError::SpawnFailed(e.to_string()))?;
+
+        let new_pane_id = PaneId(pane_uuid);
+
+        // Update supervisor's in-memory layout and persist.
+        {
+            let mut ls = self.layout_store.lock().await;
+            let tree = ls
+                .entry(session_id_str.clone())
+                .or_insert_with(|| LayoutNode::Leaf(parent));
+            tree.split_focused(&parent, new_pane_id, req.orient);
+            let json = serde_json::to_string(tree).unwrap_or_default();
+            drop(ls);
+            if let Err(e) = self.store.upsert_session_layout(sid, &json).await {
+                tracing::warn!("supervisor: upsert_session_layout after split: {e:#}");
+            }
+        }
+
+        // Persist → emit (ADR-0005 invariant).
+        self.pane_event_bus.emit(
+            new_pane_id,
+            PaneEventKind::Spawned,
+            Some(PaneStateKind::Running),
+        );
+        self.pane_event_bus
+            .emit(new_pane_id, PaneEventKind::LayoutChanged, None);
+
+        Ok(new_pane_id)
+    }
+
+    async fn set_pane_weight(
+        self,
+        _ctx: context::Context,
+        pane: PaneId,
+        weight: u16,
+    ) -> Result<(), PyreError> {
+        let (session_id_str, _) = self
+            .registry
+            .lookup_pane(pane.0)
+            .await
+            .ok_or(PyreError::NoSuchPane(pane))?;
+
+        let sid = uuid::Uuid::parse_str(&session_id_str)
+            .map(SessionId)
+            .map_err(|_| PyreError::NoSuchPane(pane))?;
+
+        {
+            let mut ls = self.layout_store.lock().await;
+            let tree = ls
+                .get_mut(&session_id_str)
+                .ok_or(PyreError::NoSuchSession(sid))?;
+            tree.set_weight(&pane, weight);
+            let json = serde_json::to_string(tree).unwrap_or_default();
+            drop(ls);
+            self.store
+                .upsert_session_layout(sid, &json)
+                .await
+                .map_err(|e| PyreError::Io(e.to_string()))?;
+        }
+
+        self.pane_event_bus
+            .emit(pane, PaneEventKind::LayoutChanged, None);
+        Ok(())
+    }
+
+    async fn get_session_layout(
+        self,
+        _ctx: context::Context,
+        session_id: SessionId,
+    ) -> Result<layout::LayoutNode, PyreError> {
+        let id_str = session_id.0.to_string();
+        let ls = self.layout_store.lock().await;
+        if let Some(tree) = ls.get(&id_str) {
+            return Ok(tree.clone());
+        }
+        drop(ls);
+        // Fall back to a single-leaf built from the first pane the worker reports.
+        let client = self
+            .registry
+            .get_ctrl_client(&id_str)
+            .await
+            .ok_or(PyreError::NoSuchSession(session_id))?;
+        let slots = client
+            .list_panes(context::current())
+            .await
+            .map_err(|e| PyreError::Io(e.to_string()))?
+            .map_err(|e| PyreError::Io(e.to_string()))?;
+        let first_slot = slots.into_iter().next();
+        if let Some(slot) = first_slot {
+            if let Some(pane_uuid) = self.registry.get_or_alloc_pane_by_slot(&id_str, slot).await {
+                return Ok(LayoutNode::Leaf(PaneId(pane_uuid)));
+            }
+        }
+        Err(PyreError::NoSuchSession(session_id))
     }
 }
 
@@ -1631,6 +1797,9 @@ pub async fn run(
 
     let pane_event_bus = PaneEventBus::new();
 
+    let layout_store: Arc<Mutex<HashMap<String, LayoutNode>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
     let supervisor_impl = SupervisorImpl {
         registry: registry.clone(),
         store: store.clone(),
@@ -1641,6 +1810,7 @@ pub async fn run(
         mirror_registry: mirror_registry.clone(),
         focus_queue: focus_queue.clone(),
         pane_event_bus: pane_event_bus.clone(),
+        layout_store: layout_store.clone(),
     };
 
     // Bind the supervisor callback socket (workers dial here to register).

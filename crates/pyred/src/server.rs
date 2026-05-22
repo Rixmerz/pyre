@@ -4,9 +4,9 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use pyre_proto::{
-    AttachAck, Block, BlockHit, BlockId, ListBlocksReq, OpenPaneReq, PaneEvent, PaneId, PaneInfo,
-    PaneStateKind, PyreError, ReplayBlocks, ResizePaneReq, ResizePaneRes, SearchBlocksReq,
-    SessionId, SessionInfo, SpawnReq, SpawnResp,
+    layout, AttachAck, Block, BlockHit, BlockId, ListBlocksReq, OpenPaneReq, OpenPaneSplitReq,
+    PaneEvent, PaneId, PaneInfo, PaneStateKind, PyreError, ReplayBlocks, ResizePaneReq,
+    ResizePaneRes, SearchBlocksReq, SessionId, SessionInfo, SpawnReq, SpawnResp,
 };
 use tarpc::context;
 
@@ -170,7 +170,7 @@ impl pyre_proto::service::PyreDaemon for DaemonImpl {
 
     async fn close_pane(self, _ctx: context::Context, pane: PaneId) -> Result<(), PyreError> {
         self.registry
-            .close_pane(pane)
+            .close_pane(pane, Some(&self.store))
             .await
             .map_err(|e| PyreError::Io(e.to_string()))
     }
@@ -465,6 +465,50 @@ impl pyre_proto::service::PyreDaemon for DaemonImpl {
         }
         tracing::info!("gc_stale_sessions: evicted {} session(s)", evicted.len());
         Ok(evicted)
+    }
+
+    // ── Layout RPCs (M7-C, ADR-0005) ──────────────────────────────────────
+
+    async fn open_pane_split(
+        self,
+        _ctx: context::Context,
+        req: OpenPaneSplitReq,
+    ) -> Result<PaneId, PyreError> {
+        self.registry
+            .open_pane_split(
+                req.parent_pane,
+                req.orient,
+                req.name,
+                req.cwd,
+                req.cmd,
+                self.store.clone(),
+                self.block_index.clone(),
+            )
+            .await
+            .map_err(|e| PyreError::SpawnFailed(e.to_string()))
+    }
+
+    async fn set_pane_weight(
+        self,
+        _ctx: context::Context,
+        pane: PaneId,
+        weight: u16,
+    ) -> Result<(), PyreError> {
+        self.registry
+            .set_pane_weight(pane, weight, &self.store)
+            .await
+            .map_err(|e| PyreError::Io(e.to_string()))
+    }
+
+    async fn get_session_layout(
+        self,
+        _ctx: context::Context,
+        session_id: SessionId,
+    ) -> Result<layout::LayoutNode, PyreError> {
+        self.registry
+            .get_layout(session_id)
+            .await
+            .ok_or(PyreError::NoSuchSession(session_id))
     }
 
     async fn next_pane_event(

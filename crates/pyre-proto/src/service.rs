@@ -23,7 +23,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{PaneId, SessionId};
+use crate::{layout, PaneId, SessionId};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Pane event types for the broadcast long-poll RPC
@@ -127,6 +127,23 @@ mod bytes_serde {
 pub const MODE_CONTROL: u8 = 0x01;
 pub const MODE_STREAM: u8 = 0x02;
 
+/// Request to split a pane, creating a sibling in the session layout.
+///
+/// The `parent` pane becomes one half of a two-child split at the given
+/// `orient`.  The new pane uses the same session, `cwd`, and `cmd` as the
+/// parent unless overridden.  `name` is an optional human-readable label.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenPaneSplitReq {
+    pub parent_pane: PaneId,
+    pub orient: layout::Orient,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<std::path::PathBuf>,
+    #[serde(default)]
+    pub cmd: Option<String>,
+}
+
 #[tarpc::service]
 pub trait PyreDaemon {
     async fn spawn(req: SpawnReq) -> Result<crate::SpawnResp, PyreError>;
@@ -198,6 +215,26 @@ pub trait PyreDaemon {
     /// This cleans up zombie sessions accumulated from pre-6046eea daemon
     /// restarts where `close_pane` eviction was not yet wired.
     async fn gc_stale_sessions() -> Result<Vec<String>, PyreError>;
+
+    // ── Layout RPCs (M7-C, ADR-0005) ──────────────────────────────────────
+
+    /// Create a new pane by splitting `parent_pane` in half at the given
+    /// orientation.  The parent's `Leaf` node is replaced with a 50/50
+    /// two-child split; the returned `PaneId` is the new sibling.
+    ///
+    /// Persists the updated layout to SQLite and emits `LayoutChanged`.
+    async fn open_pane_split(req: OpenPaneSplitReq) -> Result<PaneId, PyreError>;
+
+    /// Adjust the weight of the split-child that contains `pane`.
+    ///
+    /// The weight is clamped to `[5, 95]`; siblings are rebalanced
+    /// proportionally so weights sum to 100.  Persists and emits `LayoutChanged`.
+    async fn set_pane_weight(pane: PaneId, weight: u16) -> Result<(), PyreError>;
+
+    /// Return the persisted `LayoutNode` tree for `session_id`.
+    ///
+    /// Returns `PyreError::NoSuchSession` if the session is not found.
+    async fn get_session_layout(session_id: SessionId) -> Result<layout::LayoutNode, PyreError>;
 }
 
 /// Process metadata returned by `inspect_pid`.

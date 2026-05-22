@@ -7,8 +7,8 @@ use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use pyre_proto::{
-    AgentKind, BlockEvent, OpenPaneReq, PaneEvent, PaneEventKind, PaneId, PaneInfo, PaneStateKind,
-    SessionId, SessionInfo, SpawnReq,
+    AgentKind, BlockEvent, LayoutNode, OpenPaneReq, Orient, PaneEvent, PaneEventKind, PaneId,
+    PaneInfo, PaneStateKind, SessionId, SessionInfo, SpawnReq,
 };
 use std::collections::HashMap;
 use std::sync::{
@@ -138,6 +138,12 @@ pub struct SessionState {
     pub created_at: DateTime<Utc>,
     pub last_active_at: Mutex<DateTime<Utc>>,
     pub panes: Mutex<HashMap<PaneId, Arc<PaneState>>>,
+    /// Persisted tiling layout for this session (ADR-0005 M7-C).
+    ///
+    /// Initialised to `LayoutNode::Leaf(first_pane_id)` when the first pane
+    /// is created.  Mutations are serialised through this `Mutex` to prevent
+    /// concurrent-split races (ADR-0005 open question #3).
+    pub layout: Mutex<Option<LayoutNode>>,
 }
 
 /// Ring buffer capacity for pane events.  Large enough that a briefly
@@ -237,6 +243,7 @@ impl SessionRegistry {
             created_at: now,
             last_active_at: Mutex::new(now),
             panes: Mutex::new(HashMap::new()),
+            layout: Mutex::new(None),
         });
         self.sessions.lock().await.insert(id, state.clone());
         // Best-effort: persist the new session row. Errors are non-fatal here
@@ -284,7 +291,7 @@ impl SessionRegistry {
             session_id,
             pane_name,
             Some(&session_name_str),
-            store,
+            store.clone(),
             block_index,
             Arc::clone(self),
         )
@@ -293,6 +300,21 @@ impl SessionRegistry {
 
         session.panes.lock().await.insert(pane.id, pane.clone());
         *session.last_active_at.lock().await = Utc::now();
+
+        // Initialise layout on first pane: Leaf(pane_id).  Subsequent panes
+        // are added via open_pane_split which calls split_focused explicitly.
+        {
+            let mut layout = session.layout.lock().await;
+            if layout.is_none() {
+                *layout = Some(LayoutNode::Leaf(pane.id));
+                let json =
+                    serde_json::to_string(layout.as_ref().expect("just set")).unwrap_or_default();
+                drop(layout);
+                if let Err(e) = store.upsert_session_layout(session.id, &json).await {
+                    tracing::warn!("upsert_session_layout {}: {e:#}", session.id);
+                }
+            }
+        }
 
         // Emit Spawned event *after* the pane is registered so any
         // subscriber that immediately calls list_all_panes will see it.
@@ -327,7 +349,7 @@ impl SessionRegistry {
         None
     }
 
-    pub async fn close_pane(&self, pane_id: PaneId) -> Result<()> {
+    pub async fn close_pane(&self, pane_id: PaneId, store: Option<&Store>) -> Result<()> {
         let (session, pane) = self
             .get_pane(pane_id)
             .await
@@ -336,9 +358,140 @@ impl SessionRegistry {
         pane.kill()?;
         *pane.closed_at.lock().await = Some(Utc::now());
         session.panes.lock().await.remove(&pane_id);
+
+        // Collapse the layout tree. Persist → emit (ADR-0005 write-before-broadcast
+        // invariant) so reattach after the event sees the updated layout.
+        let layout_changed = {
+            let mut layout = session.layout.lock().await;
+            if let Some(ref mut tree) = *layout {
+                tree.close(&pane_id);
+                if let Some(s) = store {
+                    let json = serde_json::to_string(tree).unwrap_or_default();
+                    if let Err(e) = s.upsert_session_layout(session.id, &json).await {
+                        tracing::warn!("upsert_session_layout on close {}: {e:#}", session.id);
+                    }
+                }
+                true
+            } else {
+                false
+            }
+        };
+        if layout_changed {
+            self.emit_event(pane_id, PaneEventKind::LayoutChanged, None, None);
+        }
+
         self.evict_session_if_empty(session.id).await;
         self.emit_event(pane_id, PaneEventKind::Closed, None, None);
         Ok(())
+    }
+
+    /// Retrieve the current `LayoutNode` for a session, falling back to a
+    /// single-leaf layout built from the first live pane if none is set.
+    pub async fn get_layout(&self, session_id: SessionId) -> Option<LayoutNode> {
+        let session = self.get_session(session_id).await?;
+        let layout = session.layout.lock().await;
+        if let Some(ref tree) = *layout {
+            return Some(tree.clone());
+        }
+        // Fallback: build Leaf from first pane.
+        drop(layout);
+        let panes = session.panes.lock().await;
+        panes.values().next().map(|p| LayoutNode::Leaf(p.id))
+    }
+
+    /// Split `parent_pane` in half, spawn a new sibling pane, update the
+    /// session layout, persist, and emit `LayoutChanged`.
+    ///
+    /// Returns the `PaneId` of the newly created sibling pane.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open_pane_split(
+        self: &Arc<Self>,
+        parent_pane: PaneId,
+        orient: Orient,
+        name: Option<String>,
+        cwd: Option<std::path::PathBuf>,
+        cmd: Option<String>,
+        store: Arc<Store>,
+        block_index: Arc<crate::index::BlockIndex>,
+    ) -> Result<PaneId> {
+        let (session, parent_state) = self
+            .get_pane(parent_pane)
+            .await
+            .ok_or_else(|| anyhow!("no such pane {parent_pane}"))?;
+
+        // Build the open-pane request mirroring the parent pane's settings.
+        let open_req = OpenPaneReq {
+            session: session.id,
+            shell: cmd.or_else(|| Some(parent_state.shell.clone())),
+            cwd,
+            cols: parent_state.cols,
+            rows: parent_state.rows,
+            env: vec![],
+            name,
+        };
+
+        // Spawn the new pane (registers it in session.panes).
+        let new_pane = self
+            .open_pane(session.id, open_req, store.clone(), block_index)
+            .await?;
+
+        // Mutate the layout under the mutex — serialize concurrent splits.
+        {
+            let mut layout = session.layout.lock().await;
+            let tree = layout.get_or_insert_with(|| LayoutNode::Leaf(parent_pane));
+            tree.split_focused(&parent_pane, new_pane.id, orient);
+            let json = serde_json::to_string(tree).unwrap_or_default();
+            drop(layout);
+            if let Err(e) = store.upsert_session_layout(session.id, &json).await {
+                tracing::warn!("upsert_session_layout after split {}: {e:#}", session.id);
+            }
+        }
+
+        // LayoutChanged must be emitted *after* the SQLite write (ADR-0005 invariant).
+        self.emit_event(new_pane.id, PaneEventKind::LayoutChanged, None, None);
+
+        Ok(new_pane.id)
+    }
+
+    /// Adjust the weight of the split-child containing `pane`, clamp to
+    /// `[5, 95]`, rebalance siblings, persist, emit `LayoutChanged`.
+    pub async fn set_pane_weight(&self, pane: PaneId, weight: u16, store: &Store) -> Result<()> {
+        let (session, _) = self
+            .get_pane(pane)
+            .await
+            .ok_or_else(|| anyhow!("no such pane {pane}"))?;
+
+        {
+            let mut layout = session.layout.lock().await;
+            let tree = layout
+                .as_mut()
+                .ok_or_else(|| anyhow!("session has no layout"))?;
+            tree.set_weight(&pane, weight);
+            let json = serde_json::to_string(tree).unwrap_or_default();
+            drop(layout);
+            store.upsert_session_layout(session.id, &json).await?;
+        }
+
+        self.emit_event(pane, PaneEventKind::LayoutChanged, None, None);
+        Ok(())
+    }
+
+    /// Persist a layout JSON string to the store and update the in-memory state.
+    #[allow(dead_code)]
+    pub async fn persist_layout_json(
+        &self,
+        session_id: SessionId,
+        json: &str,
+        store: &Store,
+    ) -> Result<()> {
+        let session = self
+            .get_session(session_id)
+            .await
+            .ok_or_else(|| anyhow!("no such session {session_id}"))?;
+        let node: LayoutNode =
+            serde_json::from_str(json).map_err(|e| anyhow!("invalid layout JSON: {e}"))?;
+        *session.layout.lock().await = Some(node);
+        store.upsert_session_layout(session_id, json).await
     }
 
     /// Remove `session_id` from the registry if it has no remaining panes.
@@ -523,5 +676,111 @@ fn pane_info_from_state(p: &Arc<PaneState>) -> PaneInfo {
         agent,
         seen,
         name: p.name.clone(),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pyre_proto::{LayoutNode, Orient, PaneId};
+
+    /// A freshly created `SessionState` has no layout until the first pane opens.
+    #[tokio::test]
+    async fn default_layout_is_none_before_first_pane() {
+        let sess = SessionState {
+            id: SessionId::new(),
+            name: RwLock::new("test".into()),
+            created_at: Utc::now(),
+            last_active_at: Mutex::new(Utc::now()),
+            panes: Mutex::new(HashMap::new()),
+            layout: Mutex::new(None),
+        };
+        let layout = sess.layout.lock().await;
+        assert!(layout.is_none(), "layout must be None before first pane");
+    }
+
+    /// Initialising layout to a single Leaf then splitting produces the correct
+    /// tree without touching the real PTY or store.
+    #[tokio::test]
+    async fn apply_split_updates_layout_node() {
+        let pane_a = PaneId::new();
+        let pane_b = PaneId::new();
+
+        let sess = SessionState {
+            id: SessionId::new(),
+            name: RwLock::new("test".into()),
+            created_at: Utc::now(),
+            last_active_at: Mutex::new(Utc::now()),
+            panes: Mutex::new(HashMap::new()),
+            layout: Mutex::new(Some(LayoutNode::Leaf(pane_a))),
+        };
+
+        // Simulate what open_pane_split does: split the focused leaf.
+        {
+            let mut layout = sess.layout.lock().await;
+            let tree = layout.as_mut().expect("layout set");
+            tree.split_focused(&pane_a, pane_b, Orient::Vertical);
+        }
+
+        let layout = sess.layout.lock().await;
+        let tree = layout.as_ref().expect("layout present");
+        let vp = pyre_proto::layout::Rect {
+            x: 0,
+            y: 0,
+            w: 1000,
+            h: 1000,
+        };
+        let leaves = tree.leaves(vp);
+        assert_eq!(leaves.len(), 2, "split should produce 2 leaves");
+        assert_eq!(leaves[0].0, pane_a);
+        assert_eq!(leaves[1].0, pane_b);
+    }
+
+    /// Closing a pane collapses the split back to a single leaf.
+    #[tokio::test]
+    async fn close_pane_collapses_split() {
+        let pane_a = PaneId::new();
+        let pane_b = PaneId::new();
+
+        let mut tree = LayoutNode::VSplit(vec![
+            (LayoutNode::Leaf(pane_a), 50),
+            (LayoutNode::Leaf(pane_b), 50),
+        ]);
+
+        tree.close(&pane_b);
+
+        // After close, the tree should be a single Leaf(pane_a).
+        assert!(
+            matches!(tree, LayoutNode::Leaf(id) if id == pane_a),
+            "closing the second pane should collapse to Leaf(pane_a)"
+        );
+    }
+
+    /// `set_weight` clamps to [5, 95] and rebalances siblings.
+    #[tokio::test]
+    async fn set_weight_clamps_and_rebalances() {
+        let pane_a = PaneId::new();
+        let pane_b = PaneId::new();
+        let mut tree = LayoutNode::VSplit(vec![
+            (LayoutNode::Leaf(pane_a), 50),
+            (LayoutNode::Leaf(pane_b), 50),
+        ]);
+
+        tree.set_weight(&pane_a, 80);
+
+        let vp = pyre_proto::layout::Rect {
+            x: 0,
+            y: 0,
+            w: 1000,
+            h: 1000,
+        };
+        let leaves = tree.leaves(vp);
+        // pane_a gets 80%, pane_b gets 20%.
+        assert!(leaves[0].1.w >= 750, "pane_a should be ~800px wide");
+        assert!(leaves[1].1.w <= 250, "pane_b should be ~200px wide");
     }
 }
