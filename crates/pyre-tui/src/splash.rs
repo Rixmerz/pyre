@@ -6,14 +6,6 @@
 //!   Phase B — launch: buffer shifts up each frame until the fire clears.
 //!
 //! Skipped when stdout is not a TTY, `PYRE_NO_SPLASH=1`, or `--no-splash`.
-//!
-//! The splash color palette is overridden by the active theme's palette roles:
-//!   - Core / mid-flame  → `border_focus` (ember/accent role)
-//!   - Tip / hottest     → `cursor`       (spark/bright role)
-//!   - Edges / cool      → `warn`         (amber role, used as flame edge)
-//!
-//! Values below the "edge" threshold still render through the generic fire
-//! gradient so black/cold cells look consistent.
 
 use std::io::{self, IsTerminal, Write};
 use std::thread;
@@ -25,34 +17,7 @@ const FRAME_DELAY: Duration = Duration::from_millis(9);
 const PHASE_A_END: usize = 14;
 const FRAMES_TOTAL: usize = 65;
 
-/// Theme-derived color overrides for the splash flame.
-///
-/// Each field is `(r, g, b)`. `None` means "use the built-in fire palette
-/// entry at that heat level". All three default to `None` so the classic
-/// ember look is preserved when no theme config is present.
-pub struct SplashColors {
-    /// Color applied at heat levels ≥ 38 (hottest tip / white-hot).
-    pub tip: Option<(u8, u8, u8)>,
-    /// Color applied at heat levels 20..37 (bright core).
-    pub core: Option<(u8, u8, u8)>,
-    /// Color applied at heat levels 8..19 (outer edges).
-    pub edge: Option<(u8, u8, u8)>,
-}
-
-impl SplashColors {
-    pub fn from_palette(p: &pyre_themes::Palette) -> Self {
-        fn rgb(c: pyre_themes::Rgb) -> (u8, u8, u8) {
-            (c.0, c.1, c.2)
-        }
-        Self {
-            tip: Some(rgb(p.cursor)),
-            core: Some(rgb(p.border_focus)),
-            edge: Some(rgb(p.warn)),
-        }
-    }
-}
-
-pub fn play_splash(no_splash: bool, colors: Option<SplashColors>) {
+pub fn play_splash(no_splash: bool) {
     if no_splash {
         return;
     }
@@ -62,50 +27,10 @@ pub fn play_splash(no_splash: bool, colors: Option<SplashColors>) {
     if !io::stdout().is_terminal() {
         return;
     }
-    let _ = run_fire(colors.unwrap_or(SplashColors {
-        tip: None,
-        core: None,
-        edge: None,
-    }));
+    let _ = run_fire();
 }
 
-/// Map a heat index (0..=MAX_HEAT) to an `(r, g, b)` triplet, honoring any
-/// theme color overrides for the tip / core / edge heat bands.
-#[inline]
-fn heat_to_rgb(heat: usize, sc: &SplashColors) -> (u8, u8, u8) {
-    let idx = heat.min(MAX_HEAT as usize);
-    if idx >= 38 {
-        sc.tip.unwrap_or(PALETTE[idx])
-    } else if idx >= 20 {
-        // Blend palette base toward theme core color so the gradient is smooth.
-        if let Some((tr, tg, tb)) = sc.core {
-            let base = PALETTE[idx];
-            let blend = (idx - 20) as f32 / 18.0; // 0.0 at 20, 1.0 at 38
-            let r = (base.0 as f32 * (1.0 - blend) + tr as f32 * blend).round() as u8;
-            let g = (base.1 as f32 * (1.0 - blend) + tg as f32 * blend).round() as u8;
-            let b = (base.2 as f32 * (1.0 - blend) + tb as f32 * blend).round() as u8;
-            (r, g, b)
-        } else {
-            PALETTE[idx]
-        }
-    } else if idx >= 8 {
-        if let Some((tr, tg, tb)) = sc.edge {
-            let base = PALETTE[idx];
-            let blend = (idx - 8) as f32 / 12.0; // 0.0 at 8, 1.0 at 20
-            let r = (base.0 as f32 * (1.0 - blend) + tr as f32 * blend).round() as u8;
-            let g = (base.1 as f32 * (1.0 - blend) + tg as f32 * blend).round() as u8;
-            let b = (base.2 as f32 * (1.0 - blend) + tb as f32 * blend).round() as u8;
-            (r, g, b)
-        } else {
-            PALETTE[idx]
-        }
-    } else {
-        // Cold / black cells — always use the built-in dark entries.
-        PALETTE[idx]
-    }
-}
-
-fn run_fire(sc: SplashColors) -> io::Result<()> {
+fn run_fire() -> io::Result<()> {
     let mut out = io::stdout();
 
     let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -175,8 +100,8 @@ fn run_fire(sc: SplashColors) -> io::Result<()> {
                     0
                 };
 
-                let (fr, fg, fb) = heat_to_rgb(top_heat, &sc);
-                let (br, bg, bb) = heat_to_rgb(bot_heat, &sc);
+                let (fr, fg, fb) = PALETTE[top_heat];
+                let (br, bg, bb) = PALETTE[bot_heat];
 
                 write!(
                     buf,
