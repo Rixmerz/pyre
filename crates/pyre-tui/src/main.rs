@@ -1090,7 +1090,10 @@ struct AppState {
     status_msg: Option<String>,
     /// Whether the sidebar is visible.
     sidebar_open: bool,
-    /// Cached pane info for sidebar display.
+    /// Cached pane info — used for sidebar display AND pane border titles.
+    /// Refreshed every second regardless of sidebar visibility so that
+    /// `render_pane` can resolve user-provided names even when the sidebar
+    /// is closed.
     sidebar_data: Vec<pyre_proto::PaneInfo>,
     /// Last time sidebar data was fetched.
     sidebar_last_poll: Instant,
@@ -1429,9 +1432,17 @@ fn render_pane(
     anim_frame: u64,
     attention: bool,
     theme: &theme::LegacyTheme,
+    panes_meta: &[pyre_proto::PaneInfo],
 ) {
     let short8: String = slot.pane_id.0.to_string().chars().take(8).collect();
     let seed = slot.pane_id.0.as_u128() as u32;
+    // Use the user-provided name when available; fall back to short UUID prefix.
+    let pane_title: String = panes_meta
+        .iter()
+        .find(|p| p.id == slot.pane_id)
+        .and_then(|p| p.name.as_deref().filter(|s| !s.is_empty()))
+        .map(|s| format!(" {s} "))
+        .unwrap_or_else(|| format!(" pane {short8} "));
     let border_block = if focused {
         let border_style = if attention {
             fire_motion::ember_border_style(anim_frame, seed, theme.border_focus, theme.spark)
@@ -1447,7 +1458,7 @@ fn render_pane(
             .borders(Borders::ALL)
             .border_type(BorderType::Thick)
             .border_style(border_style)
-            .title(Span::styled(format!(" pane {short8} "), title_style))
+            .title(Span::styled(pane_title.clone(), title_style))
     } else if attention {
         RatatuiBlock::default()
             .borders(Borders::ALL)
@@ -1459,7 +1470,7 @@ fn render_pane(
                 theme.primary,
             ))
             .title(Span::styled(
-                format!(" pane {short8} "),
+                pane_title.clone(),
                 fire_motion::ember_title_style(anim_frame, seed, theme.text_dim, theme.secondary),
             ))
     } else {
@@ -1467,10 +1478,7 @@ fn render_pane(
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(theme.border())
-            .title(Span::styled(
-                format!(" pane {short8} "),
-                theme.title(theme.text_dim),
-            ))
+            .title(Span::styled(pane_title, theme.title(theme.text_dim)))
     };
 
     let inner = border_block.inner(area);
@@ -1813,6 +1821,7 @@ fn render_layout(
                         anim_frame,
                         attention,
                         theme,
+                        panes_meta,
                     );
                 }
             }
@@ -2723,6 +2732,7 @@ fn draw_frame(
                         anim_frame,
                         attention,
                         &t,
+                        panes_meta,
                     );
                 }
             }
@@ -4387,8 +4397,11 @@ async fn run_tui(
 
         apply_focus_request(&mut state).await;
 
-        // Sidebar poll — 1s when open, up to 50 panes.
-        if state.sidebar_open && state.sidebar_last_poll.elapsed() >= Duration::from_secs(1) {
+        // Pane-meta poll — 1s, unconditional.  Feeds both the sidebar display
+        // and pane border titles (via `render_pane`).  Running regardless of
+        // sidebar visibility ensures names are available even when the sidebar
+        // is closed.
+        if state.sidebar_last_poll.elapsed() >= Duration::from_secs(1) {
             state.sidebar_last_poll = Instant::now();
             if let Ok(Ok(mut panes)) = state
                 .control
