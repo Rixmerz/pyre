@@ -4641,6 +4641,10 @@ async fn run_tui(
             if let Ok(Ok(daemon_sessions)) =
                 state.control.list_sessions(tarpc::context::current()).await
             {
+                // Preserve the active session across all list mutations below.
+                // Insertions and removals shift indices; we restore by ID
+                // after every mutation batch so the user's view never jumps.
+                let prev_active_id = state.sessions.get(state.active_session).map(|sv| sv.id);
                 // Add sessions that appeared in the daemon but are unknown to TUI.
                 let known_ids: Vec<SessionId> = state.sessions.iter().map(|s| s.id).collect();
                 for info in &daemon_sessions {
@@ -4848,9 +4852,25 @@ async fn run_tui(
                     .collect();
                 for &idx in to_remove.iter().rev() {
                     state.sessions.remove(idx);
-                    if state.active_session >= state.sessions.len() && !state.sessions.is_empty() {
+                }
+
+                // Restore active_session to the index of the session the user
+                // was viewing before this sync cycle. Removals at indices lower
+                // than the previous active_session shift every subsequent index
+                // down, so the naïve numeric index is no longer reliable.
+                // Only change active_session if the previously-active session
+                // itself was pruned (it disappeared from the daemon), in which
+                // case fall back to the last remaining session.
+                if let Some(id) = prev_active_id {
+                    if let Some(new_idx) = state.sessions.iter().position(|sv| sv.id == id) {
+                        state.active_session = new_idx;
+                    } else if !state.sessions.is_empty() {
+                        // The session the user was on no longer exists — pick last.
                         state.active_session = state.sessions.len() - 1;
                     }
+                } else if state.active_session >= state.sessions.len() && !state.sessions.is_empty()
+                {
+                    state.active_session = state.sessions.len() - 1;
                 }
             }
         }

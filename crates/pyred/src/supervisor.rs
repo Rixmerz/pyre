@@ -682,7 +682,11 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
         // Holding a tokio RwLock read guard across await points blocks any
         // concurrent writer (e.g. register_worker), which causes the 5 s
         // registration timeout inside spawn() to fire.
-        let snapshot: Vec<(String, uuid::Uuid, pyre_proto::supervisor::WorkerControlClient)> = {
+        let snapshot: Vec<(
+            String,
+            uuid::Uuid,
+            pyre_proto::supervisor::WorkerControlClient,
+        )> = {
             let handles = self.registry.inner.read().await;
             handles
                 .iter()
@@ -925,7 +929,11 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
     async fn list_all_panes(self, _ctx: context::Context) -> Result<Vec<PaneInfo>, PyreError> {
         // Snapshot the registry without holding the read lock across async I/O
         // (same pattern as list_sessions — avoids blocking register_worker).
-        let snapshot: Vec<(String, uuid::Uuid, pyre_proto::supervisor::WorkerControlClient)> = {
+        let snapshot: Vec<(
+            String,
+            uuid::Uuid,
+            pyre_proto::supervisor::WorkerControlClient,
+        )> = {
             let handles = self.registry.inner.read().await;
             handles
                 .iter()
