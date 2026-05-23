@@ -32,51 +32,46 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use clap::Parser;
-use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    KeyCode, KeyModifiers,
-};
-use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::event::{Event, KeyCode, KeyModifiers};
 use futures::SinkExt;
 use futures::StreamExt;
 use pyre_proto::{
     blocks::{BlockHit, SearchBlocksReq},
     layout::{LayoutNode, Orient},
-    write_control_client, Block, InputFrame, OpenPaneReq, OpenPaneSplitReq, OutputFrame, PaneId,
-    PidInspect, PyreDaemonClient, SessionId, SpawnReq, SpawnResp, MODE_STREAM,
+    Block, InputFrame, OpenPaneReq, OpenPaneSplitReq, OutputFrame, PaneId, PyreDaemonClient,
+    SessionId, SpawnReq, SpawnResp, MODE_STREAM,
 };
 use pyre_themes::{Registry, Theme};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::Terminal;
+mod app;
 mod clipboard;
 mod fire_motion;
 mod input;
 mod model;
 mod render;
+mod rpc;
 mod splash;
 mod theme;
+pub use app::restore_active_session;
+use app::{AppState, PendingMenuAction, SessionView};
 use fire_motion::AnimClock;
 use input::keyboard::{handle_key, KeyAction};
 use input::mouse::handle_mouse;
 use model::pane::{EventProxy, PaneEvent, PaneInit, PaneSlot};
-use model::selection::{ClickTracker, Selection};
 use model::tab::Tab;
-use model::toast::{pane_event_to_toast, Toast, ToastDeck};
+use model::toast::{Toast, ToastDeck};
 use render::frame::draw_frame;
 use render::overlay::pager::PagerState;
-use render::overlay::picker::ThemePickerState;
 use render::overlay::search::{parse_search_input, SearchState};
 use render::pane::TermSize;
 use render::sidebar::session_name_for;
+use rpc::events::{spawn_block_poll_task, spawn_push_event_task};
+use rpc::{control_client, first_pane, resolve_pane, resolve_session, TermGuard};
 use std::collections::HashMap;
-use std::process::Stdio;
-use tarpc::client;
-use tarpc::tokio_serde::formats::Bincode;
-// EMBER constant removed — all render paths use LegacyTheme::from_palette now.
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
-use tokio::process::Command as TokioCommand;
 use tokio::sync::{mpsc, watch};
 use tokio_serde::formats::SymmetricalBincode;
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
@@ -172,178 +167,10 @@ fn resolve_shell(shell_arg: Option<String>) -> Option<String> {
         })
 }
 
-async fn control_client(socket: &Path) -> Result<PyreDaemonClient> {
-    // Try connecting first. On ENOENT/ECONNREFUSED, spawn pyred and retry.
-    if let Ok(sock) = try_connect_control(socket).await {
-        return Ok(sock);
-    }
+// control_client, try_connect_control, resolve_session, resolve_pane, first_pane
+// live in rpc::client — imported at the top of this file.
 
-    // Daemon not running — spawn it.
-    let pyred_bin = std::env::var("PYRED_BIN").ok().unwrap_or_else(|| {
-        // Sibling of current_exe() (e.g. target/release/pyred next to target/release/pyre-tui).
-        if let Ok(exe) = std::env::current_exe() {
-            let sibling = exe.parent().map(|p| p.join("pyred"));
-            if let Some(path) = sibling {
-                if path.exists() {
-                    return path.to_string_lossy().into_owned();
-                }
-            }
-        }
-        "pyred".to_owned()
-    });
-
-    tracing::info!(
-        "pyred not reachable at {}; spawning {}",
-        socket.display(),
-        pyred_bin
-    );
-    let mut child = TokioCommand::new(&pyred_bin)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        // Inherit stderr so startup errors from pyred are visible in the
-        // user's terminal (e.g. Tantivy lock contention, bind failures).
-        .stderr(Stdio::inherit())
-        .spawn()
-        .with_context(|| format!("failed to spawn pyred binary '{pyred_bin}'"))?;
-
-    // Poll every 100 ms for up to 5 s (50 attempts).
-    // If the child exits before the socket becomes ready, surface its exit
-    // status immediately rather than waiting out the full timeout.
-    let mut last_err = anyhow!("daemon did not come up after 5 s");
-    for _ in 0..50 {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        // Check whether the child already exited (e.g. crashed on lock).
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                return Err(anyhow!(
-                    "spawned pyred exited immediately with status {status}; \
-                     check stderr for details (Tantivy lock? stale socket?)"
-                ));
-            }
-            Ok(None) => {} // still running — keep polling
-            Err(e) => tracing::warn!("try_wait on pyred child: {e}"),
-        }
-
-        match try_connect_control(socket).await {
-            Ok(client) => return Ok(client),
-            Err(e) => last_err = e,
-        }
-    }
-    Err(last_err).with_context(|| {
-        format!(
-            "spawned pyred but socket {} never became ready; check pyred logs",
-            socket.display()
-        )
-    })
-}
-
-/// Single non-retrying connect attempt; wraps the mode-byte handshake.
-async fn try_connect_control(socket: &Path) -> Result<PyreDaemonClient> {
-    let mut sock = UnixStream::connect(socket)
-        .await
-        .with_context(|| format!("connect {}", socket.display()))?;
-    write_control_client(&mut sock).await?;
-
-    let transport = tarpc::serde_transport::new(
-        tokio_util::codec::Framed::new(sock, LengthDelimitedCodec::new()),
-        Bincode::default(),
-    );
-    Ok(PyreDaemonClient::new(client::Config::default(), transport).spawn())
-}
-
-async fn resolve_session(client: &PyreDaemonClient, prefix: &str) -> Result<SessionId> {
-    let sessions = client
-        .list_sessions(tarpc::context::current())
-        .await
-        .context("rpc transport")?
-        .map_err(|e| anyhow!("daemon list_sessions: {e}"))?;
-
-    let matches: Vec<_> = sessions
-        .iter()
-        .filter(|s| s.id.0.to_string().starts_with(prefix))
-        .collect();
-
-    match matches.len() {
-        0 => Err(anyhow!("no session matches prefix '{prefix}'")),
-        1 => Ok(matches[0].id),
-        _ => Err(anyhow!(
-            "{} sessions match prefix '{prefix}'; provide a longer prefix",
-            matches.len()
-        )),
-    }
-}
-
-async fn resolve_pane(
-    client: &PyreDaemonClient,
-    session: SessionId,
-    prefix: &str,
-) -> Result<PaneId> {
-    let panes = client
-        .list_panes(tarpc::context::current(), session)
-        .await
-        .context("rpc transport")?
-        .map_err(|e| anyhow!("daemon list_panes: {e}"))?;
-
-    let matches: Vec<_> = panes
-        .iter()
-        .filter(|p| p.id.0.to_string().starts_with(prefix))
-        .collect();
-
-    match matches.len() {
-        0 => Err(anyhow!("no pane matches prefix '{prefix}'")),
-        1 => Ok(matches[0].id),
-        _ => Err(anyhow!(
-            "{} panes match prefix '{prefix}'; provide a longer prefix",
-            matches.len()
-        )),
-    }
-}
-
-async fn first_pane(client: &PyreDaemonClient, session: SessionId) -> Result<PaneId> {
-    let panes = client
-        .list_panes(tarpc::context::current(), session)
-        .await
-        .context("rpc transport")?
-        .map_err(|e| anyhow!("daemon list_panes: {e}"))?;
-
-    panes
-        .into_iter()
-        .next()
-        .map(|p| p.id)
-        .ok_or_else(|| anyhow!("session has no panes"))
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Terminal restore guard
-// ─────────────────────────────────────────────────────────────────────────────
-
-struct TermGuard;
-
-impl TermGuard {
-    fn enter() -> Result<Self> {
-        crossterm::terminal::enable_raw_mode()?;
-        crossterm::execute!(
-            stdout(),
-            EnterAlternateScreen,
-            EnableMouseCapture,
-            EnableBracketedPaste
-        )?;
-        Ok(Self)
-    }
-}
-
-impl Drop for TermGuard {
-    fn drop(&mut self) {
-        let _ = crossterm::execute!(
-            stdout(),
-            DisableBracketedPaste,
-            DisableMouseCapture,
-            LeaveAlternateScreen
-        );
-        let _ = crossterm::terminal::disable_raw_mode();
-    }
-}
+// TermGuard lives in rpc::client — imported via `use rpc::TermGuard`.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Key serialization
@@ -415,13 +242,7 @@ pub(crate) struct ContextMenu {
     pub(crate) item_rects: Vec<Rect>,
 }
 
-/// Per-session view: tabs and panes for one daemon session.
-struct SessionView {
-    id: SessionId,
-    name: String,
-    tabs: Vec<Tab>,
-    active_tab: usize,
-}
+// SessionView lives in app::sessions — re-exported via app::SessionView.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PromptKind {
@@ -435,123 +256,7 @@ pub(crate) struct NamePrompt {
     pub(crate) input: String,
 }
 
-#[allow(dead_code)]
-pub(crate) struct AppState {
-    /// All known sessions (may have tabs loaded lazily).
-    sessions: Vec<SessionView>,
-    /// Index into `sessions` that is currently displayed.
-    active_session: usize,
-    /// All attached pane slots (shared across all sessions). None = closed/removed.
-    slots: Vec<Option<PaneSlot>>,
-    /// Set to `true` when the active session's active tab has no live pane slots.
-    /// Triggers a "Session ended" overlay and accepts q/Esc/Ctrl-C to quit.
-    session_lost: bool,
-    control: PyreDaemonClient,
-    socket: PathBuf,
-    shell: Option<String>,
-    search: SearchState,
-    /// One-line status message shown when action feedback is needed.
-    status_msg: Option<String>,
-    /// Whether the sidebar is visible.
-    sidebar_open: bool,
-    /// Cached pane info — used for sidebar display AND pane border titles.
-    /// Refreshed every second regardless of sidebar visibility so that
-    /// `render_pane` can resolve user-provided names even when the sidebar
-    /// is closed.
-    sidebar_data: Vec<pyre_proto::PaneInfo>,
-    /// Last time sidebar data was fetched.
-    sidebar_last_poll: Instant,
-    /// Selected row index within the sidebar.
-    sidebar_cursor: usize,
-    /// Whether the sidebar panel has keyboard focus.
-    sidebar_focused: bool,
-    /// Active text selection (drag or click-to-select).
-    selection: Option<Selection>,
-    /// State for double/triple-click detection.
-    last_click: Option<ClickTracker>,
-    /// Right-click context menu state.
-    context_menu: Option<ContextMenu>,
-    /// PID inspect overlay data.
-    pid_inspect: Option<PidInspect>,
-    /// Name-prompt overlay (new session or new tab).
-    prompt: Option<NamePrompt>,
-    /// Session strip hit-test rects: (session_vec_index, rect).
-    session_strip_rects: Vec<(usize, Rect)>,
-    /// Horizontal scroll offset (in columns) for the session strip.
-    session_strip_scroll: usize,
-    /// Rect of the left-scroll indicator `◄` in the session strip (when overflow left).
-    session_strip_left_arrow: Option<Rect>,
-    /// Rect of the right-scroll indicator `►` in the session strip (when overflow right).
-    session_strip_right_arrow: Option<Rect>,
-    /// Rect of the [+] button in the session strip.
-    session_plus_rect: Option<Rect>,
-    /// Rect of the [+] button in the tabs strip.
-    tab_plus_rect: Option<Rect>,
-    /// Queued resize RPCs collected by render_pane (sync); drained after each draw.
-    pending_resizes: Vec<(PaneId, pyre_proto::PaneSize)>,
-    /// Per-tab chip rects captured during last render: vec of (tab_vec_index, chip_rect).
-    tab_chip_rects: Vec<(usize, Rect)>,
-    /// Active tab-drag: (tab_vec_index, start_col) — set on mouse-down on a chip.
-    dragging_tab: Option<(usize, u16)>,
-    /// Rect of the pager overlay as rendered last frame (for mouse-wheel routing).
-    pager_rect: Option<Rect>,
-    /// Last time the session list was refreshed from the daemon.
-    session_list_last_poll: Instant,
-    /// Last time the active session's layout was resynced from the daemon.
-    /// Acts as a safety-net periodic refresh of the tab's LayoutNode tree.
-    layout_resync_last_poll: Instant,
-    /// Latest block snapshot delivered by the background poll task.
-    /// Key = PaneId, value = blocks for that pane (up to 20, newest last).
-    blocks_rx: watch::Receiver<HashMap<PaneId, Vec<Block>>>,
-    /// In-TUI ember motion (shared curves with startup splash).
-    anim: AnimClock,
-    /// Block stdout modal pager (Some = open, None = closed).
-    pager: Option<PagerState>,
-    /// Active theme (loaded from config on startup, switchable at runtime).
-    theme: Theme,
-    /// Theme picker overlay (Some = open, None = closed).
-    theme_picker: Option<ThemePickerState>,
-    /// Ephemeral toast notifications (pane state changes).
-    toast_deck: ToastDeck,
-    /// Receiver for toasts produced by the background push-event task.
-    toast_rx: mpsc::Receiver<Toast>,
-    /// Deferred async action queued by the (sync) mouse handler and drained in the event loop.
-    pending_menu_action: Option<PendingMenuAction>,
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Deferred async actions (queued by sync mouse handler, drained in event loop)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Actions that require async context (RPC calls) but originate from the sync
-/// `handle_mouse` function. The event loop drains this after every mouse event.
-#[allow(dead_code)]
-enum PendingMenuAction {
-    /// Execute the highlighted item of the context menu.
-    ContextMenuCommit,
-    /// Activate a specific context menu item by index (mouse-left on item row).
-    ContextMenuActivate(usize),
-    /// Split active pane horizontally (HSplit).
-    SplitH,
-    /// Split active pane vertically (VSplit).
-    SplitV,
-    /// Open a rename prompt for the active session.
-    RenameSession,
-    /// Jump to search result at given index (mouse click on result row).
-    SearchJump(usize),
-}
-
-impl AppState {
-    /// Convenience: active session's session id.
-    fn active_session_id(&self) -> SessionId {
-        self.sessions[self.active_session].id
-    }
-
-    /// Convenience: active session view (mutable).
-    fn active_session_view_mut(&mut self) -> &mut SessionView {
-        &mut self.sessions[self.active_session]
-    }
-}
+// AppState, PendingMenuAction live in app::state — imported via `use app::{AppState, PendingMenuAction}`.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Layout helpers (M7-D: PaneId-keyed, delegates to pyre_proto::layout)
@@ -1110,18 +815,11 @@ fn initial_app_state(
 ) -> AppState {
     let initial_pane_id = initial_slot.pane_id;
     AppState {
-        sessions: vec![SessionView {
-            id: session,
-            name: session_name,
-            tabs: vec![Tab {
-                root: LayoutNode::Leaf(initial_pane_id),
-                focus_pane: initial_pane_id,
-                zoomed: None,
-                boundaries: Vec::new(),
-                drag: None,
-            }],
-            active_tab: 0,
-        }],
+        sessions: vec![SessionView::new_single_pane(
+            session,
+            session_name,
+            initial_pane_id,
+        )],
         active_session: 0,
         slots: vec![Some(initial_slot)],
         control,
@@ -1238,41 +936,10 @@ async fn run_tui(
     }
 
     // ── Background block-poll task (Bug 2 fix) ──────────────────────────────
-    // list_blocks is moved off the hot event loop into its own task. A
-    // watch channel carries the latest snapshot; the event loop does a
-    // non-blocking borrow_and_update read and never awaits the RPC directly.
-    let (blocks_tx, blocks_rx) = watch::channel(HashMap::<PaneId, Vec<Block>>::new());
-    {
-        let poll_client = control.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(500));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                interval.tick().await;
-                let req = pyre_proto::blocks::ListBlocksReq {
-                    session: None,
-                    limit: 20,
-                };
-                // Apply a 2 s hard timeout so a stuck daemon cannot pin this task.
-                let result = tokio::time::timeout(
-                    Duration::from_secs(2),
-                    poll_client.list_blocks(tarpc::context::current(), req),
-                )
-                .await;
-                if let Ok(Ok(Ok(blocks))) = result {
-                    // Group by pane_id so the event loop can index directly.
-                    let mut map: HashMap<PaneId, Vec<Block>> = HashMap::new();
-                    for b in blocks {
-                        map.entry(b.pane).or_default().push(b);
-                    }
-                    // send only fails when all receivers are dropped (TUI exited).
-                    if blocks_tx.send(map).is_err() {
-                        break;
-                    }
-                }
-            }
-        });
-    }
+    // list_blocks is moved off the hot event loop into its own task via
+    // rpc::events::spawn_block_poll_task. A watch channel carries the latest
+    // snapshot; the event loop does a non-blocking borrow_and_update read.
+    let blocks_rx = spawn_block_poll_task(control.clone());
 
     // Load theme from config (non-fatal — fall back to default on any error).
     let theme = {
@@ -1290,52 +957,9 @@ async fn run_tui(
     let notif_cfg = pyre_themes::config::load_notifications_config().unwrap_or_default();
 
     // ── Background push-event task ─────────────────────────────────────────
-    // Long-polls `next_pane_event` and sends resulting Toasts into `toast_rx`.
+    // Long-polls `next_pane_event` via rpc::events::spawn_push_event_task.
     // The event loop drains the channel each tick without awaiting the RPC.
-    let (toast_tx, toast_rx) = mpsc::channel::<Toast>(64);
-    {
-        let push_client_socket = socket.clone();
-        let ttl = Duration::from_millis(notif_cfg.ttl_ms);
-        tokio::spawn(async move {
-            let mut seq: u64 = 0;
-            let mut backoff = Duration::from_millis(200);
-            loop {
-                let client = match try_connect_control(&push_client_socket).await {
-                    Ok(c) => c,
-                    Err(_) => {
-                        tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(Duration::from_secs(5));
-                        continue;
-                    }
-                };
-                backoff = Duration::from_millis(200);
-
-                match client
-                    .next_pane_event(tarpc::context::current(), seq, 30_000)
-                    .await
-                {
-                    Ok(Ok(events)) if !events.is_empty() => {
-                        if let Some(last) = events.last() {
-                            seq = last.seq;
-                        }
-                        for ev in &events {
-                            if let Some(toast) = pane_event_to_toast(ev, ttl) {
-                                // Silently drop if receiver is gone (TUI exiting).
-                                let _ = toast_tx.try_send(toast);
-                            }
-                        }
-                    }
-                    Ok(Ok(_)) => {
-                        // Normal long-poll timeout; loop immediately.
-                    }
-                    _ => {
-                        tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(Duration::from_secs(5));
-                    }
-                }
-            }
-        });
-    }
+    let toast_rx = spawn_push_event_task(socket.clone(), Duration::from_millis(notif_cfg.ttl_ms));
 
     let toast_deck = ToastDeck::new(notif_cfg.enabled, notif_cfg.ttl_ms, notif_cfg.max_visible);
 
@@ -1382,18 +1006,11 @@ async fn run_tui(
                         }
                         let eager_pane_id = p.id;
                         state.slots.push(Some(slot));
-                        state.sessions.push(SessionView {
-                            id: info.id,
-                            name: info.name,
-                            tabs: vec![Tab {
-                                root: LayoutNode::Leaf(eager_pane_id),
-                                focus_pane: eager_pane_id,
-                                zoomed: None,
-                                boundaries: Vec::new(),
-                                drag: None,
-                            }],
-                            active_tab: 0,
-                        });
+                        state.sessions.push(SessionView::new_single_pane(
+                            info.id,
+                            info.name,
+                            eager_pane_id,
+                        ));
                     }
                 }
             }
@@ -1583,18 +1200,11 @@ async fn run_tui(
                                 match attach_pane(&state.socket, info.id, pane_id, sc, sr).await {
                                     Ok(slot) => {
                                         state.slots.push(Some(slot));
-                                        state.sessions.push(SessionView {
-                                            id: info.id,
-                                            name: info.name.clone(),
-                                            tabs: vec![Tab {
-                                                root: LayoutNode::Leaf(pane_id),
-                                                focus_pane: pane_id,
-                                                zoomed: None,
-                                                boundaries: Vec::new(),
-                                                drag: None,
-                                            }],
-                                            active_tab: 0,
-                                        });
+                                        state.sessions.push(SessionView::new_single_pane(
+                                            info.id,
+                                            info.name.clone(),
+                                            pane_id,
+                                        ));
                                     }
                                     Err(e) => {
                                         tracing::warn!(
@@ -1653,12 +1263,8 @@ async fn run_tui(
                         // tree; creating a new Tab here would be wrong when the
                         // pane was added via open_pane_split (it belongs inside
                         // the existing tab's split, not as a separate tab).
-                        let fresh_layout = state
-                            .control
-                            .get_session_layout(tarpc::context::current(), info.id)
-                            .await
-                            .ok()
-                            .and_then(|r| r.ok());
+                        let fresh_layout =
+                            rpc::layout::get_session_layout(&state.control, info.id).await;
 
                         // Attach a slot for each new pane (I/O streams).
                         for pane_info in &new_panes {
@@ -1773,24 +1379,8 @@ async fn run_tui(
                     state.sessions.remove(idx);
                 }
 
-                // Restore active_session to the index of the session the user
-                // was viewing before this sync cycle. Removals at indices lower
-                // than the previous active_session shift every subsequent index
-                // down, so the naïve numeric index is no longer reliable.
-                // Only change active_session if the previously-active session
-                // itself was pruned (it disappeared from the daemon), in which
-                // case fall back to the last remaining session.
-                if let Some(id) = prev_active_id {
-                    if let Some(new_idx) = state.sessions.iter().position(|sv| sv.id == id) {
-                        state.active_session = new_idx;
-                    } else if !state.sessions.is_empty() {
-                        // The session the user was on no longer exists — pick last.
-                        state.active_session = state.sessions.len() - 1;
-                    }
-                } else if state.active_session >= state.sessions.len() && !state.sessions.is_empty()
-                {
-                    state.active_session = state.sessions.len() - 1;
-                }
+                // Restore active_session by ID via app::restore_active_session.
+                restore_active_session(&state.sessions, &mut state.active_session, prev_active_id);
             }
         }
 
@@ -1807,10 +1397,8 @@ async fn run_tui(
         if state.layout_resync_last_poll.elapsed() >= Duration::from_secs(5) {
             state.layout_resync_last_poll = Instant::now();
             let active_session_id = state.sessions[state.active_session].id;
-            if let Ok(Ok(fresh_layout)) = state
-                .control
-                .get_session_layout(tarpc::context::current(), active_session_id)
-                .await
+            if let Some(fresh_layout) =
+                rpc::layout::get_session_layout(&state.control, active_session_id).await
             {
                 let si = state.active_session;
                 let at = state.sessions[si].active_tab;
