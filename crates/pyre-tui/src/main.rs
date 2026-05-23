@@ -1490,6 +1490,18 @@ fn render_pane(
     let inner = border_block.inner(area);
     frame.render_widget(border_block, area);
 
+    // Guard: if the allocated area is degenerate (e.g. terminal is narrower than
+    // the minimum pane layout), skip all rendering for this pane. Passing cols=0
+    // or rows=0 to alacritty_terminal Grid::resize causes an underflow at
+    // `Column(columns - 1)` and panics. This can happen when the host terminal is
+    // very small, a split produces a zero-height child, or the TUI is run inside a
+    // pseudo-terminal with a 0×0 initial size (e.g. `script` without explicit stty).
+    if inner.width == 0 || inner.height < 2 {
+        // Area is too small to fit border (2 rows) + ribbon (1 row) + at least 1
+        // content row. Leave parser_sized as-is so the next frame will retry.
+        return;
+    }
+
     // Split inner area: vt100/scrollback area (Min 1) on top, ribbon (1 line) at bottom.
     let split = Layout::default()
         .direction(Direction::Vertical)
@@ -1558,7 +1570,15 @@ fn render_pane(
                 new_cols = target_cols,
                 "render_pane: terminal resize"
             );
-            slot.term.resize(TermSize::new(target_cols, target_rows));
+            // Belt-and-suspenders guard: alacritty Grid::resize panics when
+            // columns == 0 (underflow at `Column(columns - 1)`). The outer
+            // `inner.height < 2` guard above should prevent this, but a split
+            // with Constraint::Min(1) can still yield height 0 in degenerate
+            // layouts. Skip the resize instead of panicking; the next frame
+            // will retry once the terminal has a proper size.
+            if target_cols > 0 && target_rows > 0 {
+                slot.term.resize(TermSize::new(target_cols, target_rows));
+            }
         }
         // On the first render we now know the real pane area. Drain any bytes
         // that arrived before this frame (buffered in pending_output at wrong
@@ -6104,10 +6124,17 @@ async fn main() -> Result<()> {
                 .map_err(|e| anyhow!("daemon list_sessions: {e}"))?;
 
             // Iterate sessions and pick the first one that has a live pane.
-            // Stale sessions (worker evicted, zero panes) will fail first_pane;
-            // skip them rather than trying to open a pane on a dead worker.
+            // list_sessions already computes pane_count per session via an
+            // internal list_panes RPC; use that to skip sessions with zero panes
+            // without issuing an additional list_panes RPC per stale session.
+            // With many persisted stale sessions (e.g. 37 out of 38), this avoids
+            // 37 extra sequential RPCs on every startup.
             let mut init = PaneInit::Spawn;
             for sess in existing {
+                if sess.pane_count == 0 {
+                    // Fast path: daemon already knows this session has no panes.
+                    continue;
+                }
                 match first_pane(&client, sess.id).await {
                     Ok(pane) => {
                         init = PaneInit::Existing {
