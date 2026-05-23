@@ -1,5 +1,24 @@
 # pyre — Roadmap
 
+## v0.4 — stabilization sprint
+
+Refactor + hardening sprint. god-file split, workspace-wide newtypes, architectural
+invariants documented, TUI test harness scaffolded, P5 bugs fixed.
+
+| Commit | Scope | Notes |
+|--------|-------|-------|
+| `e8259de` | PaneId + SessionId newtypes workspace-wide | Type-safe IDs across all crates |
+| `4833a06` | docs/INVARIANTS.md + render_smoke test harness | 8 invariants codified; scaffold for UI regression tests |
+| `0fc2e3b`..`64b65f1` | god-file split (10 refactor commits) | main.rs 6000+ lines → 204 lines; app/, render/, input/, rpc/, model/ modules |
+| `1f21bc9` | fix: guard render_pane against zero-size areas | Prevents panic on empty pane during startup |
+| `e38a7ee` | fix: preserve active_session across session-list refresh | Stability fix for Spawned events |
+| `7d8080b` | fix: pin close-X hit rect to exactly one cell at tab chip right edge | P5 mouse precision fix |
+| `c4c71ee` | fix: filter stale sessions (pane_count==0) from session strip render | Prevents ghost tabs |
+| `cc67ab6` | fix: extract pick_attach_session + empty list auto-spawns | UX: no more blank screen on first attach |
+| `19cb49b` | fix: close-X dispatch only removes target pane, never quits app | P5 root cause: LayoutNode::close on single-leaf tree produced zombie session |
+
+---
+
 ## v0.3.0 ready
 
 Layout-aware daemon (M7 complete). LayoutNode is now a first-class

@@ -5,12 +5,17 @@ on `pyre`. Read it first, then follow the links below.
 
 ## Next step
 
-**v0.3.0 layout-aware daemon shipped.** M7-A..F: LayoutNode in pyre-proto (b3e79a5), pyred persists session.layout + open_pane_split/set_pane_weight/get_session_layout RPCs (7a8e7b8), TUI consumes via daemon (87859d5), GPU mirrors (7643c84), MCP session_layout accepts split spec + 2 new tools (748bf9a). PROTO_VERSION=4. ADR-0005 documents the design.
+**v0.4.0 stabilization sprint complete.** Key deliverables:
 
-Next: cut v0.3.0 release tag after final verify + reinstall.
+- god-file split: `pyre-tui/src/main.rs` reduced from 6000+ lines to 204 lines; logic extracted into `app/`, `render/`, `input/`, `rpc/`, `model/` modules across ~15 commits.
+- PaneId/SessionId newtypes workspace-wide (commit e8259de) — type-safe IDs throughout all crates.
+- `docs/INVARIANTS.md` codifying 8 architectural invariants for the TUI state machine.
+- TUI test harness scaffolded: `tests/render_smoke.rs` + `tests/close_pane_dispatch.rs` (commit 4833a06).
+- P5 bugs fixed: close-X real root cause was `LayoutNode::close` on a single-leaf tree producing a zombie session; fixed in commit 19cb49b. Also fixed: close-X hit rect (7d8080b), stale session filter (c4c71ee), `pick_attach_session` empty-list auto-spawn (cc67ab6).
+- 36 RFs (requirements) tracked via livespec at `.claude/notions/refactor-plan-v04.md`.
 
-See [ROADMAP.md](ROADMAP.md) `## v0.3.0 ready` for milestone table.
-v0.2.0 surface (M1..M5) and v0.1.0 surface (S1..S7) remain complete and documented below.
+v0.4.0 release tag cut. See [ROADMAP.md](ROADMAP.md) `## v0.4 — stabilization sprint` for full commit table.
+v0.3.0 surface (M7-A..F), v0.2.0 surface (M1..M5), and v0.1.0 surface (S1..S7) remain complete and documented below.
 
 ## Files to read first
 

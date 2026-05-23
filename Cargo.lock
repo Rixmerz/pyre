@@ -3147,7 +3147,7 @@ dependencies = [
 
 [[package]]
 name = "pyre-gpu"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -3171,7 +3171,7 @@ dependencies = [
 
 [[package]]
 name = "pyre-mcp"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -3192,7 +3192,7 @@ dependencies = [
 
 [[package]]
 name = "pyre-proto"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "chrono",
@@ -3207,7 +3207,7 @@ dependencies = [
 
 [[package]]
 name = "pyre-themes"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -3218,7 +3218,7 @@ dependencies = [
 
 [[package]]
 name = "pyre-tui"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -3246,7 +3246,7 @@ dependencies = [
 
 [[package]]
 name = "pyrec"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "bincode",
@@ -3269,7 +3269,7 @@ dependencies = [
 
 [[package]]
 name = "pyred"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
