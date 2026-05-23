@@ -113,6 +113,14 @@ impl LayoutNode {
         let all = self.all_leaves();
         let pos = all.iter().position(|id| id == pane)?;
 
+        // Edge case: root is the single leaf being closed.
+        // `remove_leaf` returns `true` on a bare `Leaf` but has no parent to
+        // call `retain_mut`, so *self is left unchanged.  Detect this before
+        // calling `remove_leaf` so we return `None` (empty tree) correctly.
+        if all.len() == 1 {
+            return None;
+        }
+
         self.remove_leaf(pane);
 
         let remaining = self.all_leaves();

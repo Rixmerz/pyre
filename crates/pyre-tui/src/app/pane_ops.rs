@@ -390,7 +390,23 @@ pub(crate) fn close_pane_by_slot_idx(state: &mut AppState, slot_idx: usize) {
         state.slots[slot_idx] = None;
     }
 
-    let remaining = pane_leaves_in_order(&state.sessions[sess_idx].tabs[tab_idx].root);
+    // `LayoutNode::close` returns `None` in two cases:
+    //   (a) `pane_id` was not found in the tree, OR
+    //   (b) `pane_id` was the only leaf — the root cannot be replaced with an
+    //       Empty variant, so the tree is left as `Leaf(pane_id)` even though
+    //       the close was logically successful.
+    //
+    // Distinguish (b) from (a): if `new_focus_pane.is_none()` AND the tree
+    // still only contains `pane_id`, we are in case (b) — the tab is now
+    // empty.  Force `remaining` to empty so the tab-removal path below fires.
+    let remaining = {
+        let leaves = pane_leaves_in_order(&state.sessions[sess_idx].tabs[tab_idx].root);
+        if new_focus_pane.is_none() && leaves.as_slice() == [pane_id] {
+            vec![]
+        } else {
+            leaves
+        }
+    };
 
     if remaining.is_empty() {
         state.sessions[sess_idx].tabs.remove(tab_idx);
@@ -428,5 +444,513 @@ pub(crate) fn close_focused_pane(state: &mut AppState) {
     let focus_pane = state.sessions[sess_idx].tabs[tab_idx].focus_pane;
     if let Some(slot_idx) = focused_slot_idx(focus_pane, &state.slots) {
         close_pane_by_slot_idx(state, slot_idx);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    use bytes::Bytes;
+    use futures::StreamExt;
+    use pyre_proto::{
+        layout::LayoutNode, PaneId, PyreDaemon, PyreDaemonClient, PyreError, SessionId,
+    };
+    use tarpc::server::{BaseChannel, Channel};
+    use tokio::sync::{mpsc, watch};
+
+    use alacritty_terminal::term::Config as TermConfig;
+    use alacritty_terminal::vte::ansi::Processor as AnsiProcessor;
+    use alacritty_terminal::Term;
+
+    use crate::app::sessions::SessionView;
+    use crate::app::state::AppState;
+    use crate::fire_motion::AnimClock;
+    use crate::model::layout::pane_leaves_in_order;
+    use crate::model::pane::{EventProxy, PaneEvent, PaneSlot};
+    use crate::model::tab::Tab;
+    use crate::model::toast::ToastDeck;
+    use crate::render::overlay::search::SearchState;
+    use crate::render::pane::TermSize;
+
+    use super::{close_focused_pane, close_pane_by_slot_idx};
+
+    // ── Stub daemon ──────────────────────────────────────────────────────────
+
+    /// A no-op tarpc server that satisfies the trait bound so we can build a
+    /// `PyreDaemonClient` without a live daemon process.
+    /// `close_pane_by_slot_idx` fires the close RPC fire-and-forget and
+    /// ignores the result, so `close_pane` returning `Ok(())` is sufficient.
+    #[derive(Clone)]
+    struct StubDaemon;
+
+    impl pyre_proto::service::PyreDaemon for StubDaemon {
+        async fn spawn(
+            self,
+            _ctx: tarpc::context::Context,
+            _req: pyre_proto::SpawnReq,
+        ) -> Result<pyre_proto::SpawnResp, PyreError> {
+            Err(PyreError::SpawnFailed("stub".into()))
+        }
+        async fn attach(
+            self,
+            _ctx: tarpc::context::Context,
+            _session: SessionId,
+        ) -> Result<pyre_proto::AttachAck, PyreError> {
+            Err(PyreError::NoSuchSession(_session))
+        }
+        async fn detach(
+            self,
+            _ctx: tarpc::context::Context,
+            _session: SessionId,
+        ) -> Result<(), PyreError> {
+            Ok(())
+        }
+        async fn kill(
+            self,
+            _ctx: tarpc::context::Context,
+            _session: SessionId,
+        ) -> Result<(), PyreError> {
+            Ok(())
+        }
+        async fn list_blocks(
+            self,
+            _ctx: tarpc::context::Context,
+            _req: pyre_proto::blocks::ListBlocksReq,
+        ) -> Result<Vec<pyre_proto::Block>, PyreError> {
+            Ok(vec![])
+        }
+        async fn search_blocks(
+            self,
+            _ctx: tarpc::context::Context,
+            _req: pyre_proto::blocks::SearchBlocksReq,
+        ) -> Result<Vec<pyre_proto::blocks::BlockHit>, PyreError> {
+            Ok(vec![])
+        }
+        async fn list_sessions(
+            self,
+            _ctx: tarpc::context::Context,
+        ) -> Result<Vec<pyre_proto::SessionInfo>, PyreError> {
+            Ok(vec![])
+        }
+        async fn list_panes(
+            self,
+            _ctx: tarpc::context::Context,
+            _session: SessionId,
+        ) -> Result<Vec<pyre_proto::PaneInfo>, PyreError> {
+            Ok(vec![])
+        }
+        async fn open_pane(
+            self,
+            _ctx: tarpc::context::Context,
+            _req: pyre_proto::OpenPaneReq,
+        ) -> Result<PaneId, PyreError> {
+            Err(PyreError::SpawnFailed("stub".into()))
+        }
+        async fn close_pane(
+            self,
+            _ctx: tarpc::context::Context,
+            _pane: PaneId,
+        ) -> Result<(), PyreError> {
+            Ok(()) // fire-and-forget; must not fail
+        }
+        async fn replay(
+            self,
+            _ctx: tarpc::context::Context,
+            _pane: PaneId,
+            _recent_blocks: u32,
+        ) -> Result<pyre_proto::ReplayBlocks, PyreError> {
+            Err(PyreError::NoSuchPane(_pane))
+        }
+        async fn get_block_stdout(
+            self,
+            _ctx: tarpc::context::Context,
+            _block_id: pyre_proto::BlockId,
+        ) -> Result<Vec<u8>, PyreError> {
+            Ok(vec![])
+        }
+        async fn capture_pane(
+            self,
+            _ctx: tarpc::context::Context,
+            _pane: PaneId,
+            _lines: u32,
+        ) -> Result<Vec<u8>, PyreError> {
+            Ok(vec![])
+        }
+        async fn close_session(
+            self,
+            _ctx: tarpc::context::Context,
+            _session: SessionId,
+        ) -> Result<(), PyreError> {
+            Ok(())
+        }
+        async fn set_pane_state(
+            self,
+            _ctx: tarpc::context::Context,
+            _pane: PaneId,
+            _state: pyre_proto::PaneStateKind,
+            _reason: String,
+        ) -> Result<(), PyreError> {
+            Ok(())
+        }
+        async fn list_all_panes(
+            self,
+            _ctx: tarpc::context::Context,
+        ) -> Result<Vec<pyre_proto::PaneInfo>, PyreError> {
+            Ok(vec![])
+        }
+        async fn inspect_pid(
+            self,
+            _ctx: tarpc::context::Context,
+            _pane: PaneId,
+        ) -> Result<pyre_proto::PidInspect, PyreError> {
+            Err(PyreError::NoSuchPane(_pane))
+        }
+        async fn send_keys(
+            self,
+            _ctx: tarpc::context::Context,
+            _pane: PaneId,
+            _bytes: Vec<u8>,
+        ) -> Result<(), PyreError> {
+            Ok(())
+        }
+        async fn resize_pane(
+            self,
+            _ctx: tarpc::context::Context,
+            _req: pyre_proto::ResizePaneReq,
+        ) -> Result<pyre_proto::ResizePaneRes, PyreError> {
+            Err(PyreError::NoSuchPane(_req.pane_id))
+        }
+        async fn rename_session(
+            self,
+            _ctx: tarpc::context::Context,
+            _session: SessionId,
+            _name: String,
+        ) -> Result<(), PyreError> {
+            Ok(())
+        }
+        async fn wait_pane_state(
+            self,
+            _ctx: tarpc::context::Context,
+            _pane: PaneId,
+            _state: pyre_proto::PaneStateKind,
+            _timeout_ms: u32,
+        ) -> Result<bool, PyreError> {
+            Ok(false)
+        }
+        async fn mark_pane_seen(
+            self,
+            _ctx: tarpc::context::Context,
+            _pane: PaneId,
+        ) -> Result<(), PyreError> {
+            Ok(())
+        }
+        async fn last_block_for_pane(
+            self,
+            _ctx: tarpc::context::Context,
+            _pane: PaneId,
+        ) -> Result<Option<pyre_proto::Block>, PyreError> {
+            Ok(None)
+        }
+        async fn request_focus(
+            self,
+            _ctx: tarpc::context::Context,
+            _pane_id: PaneId,
+        ) -> Result<bool, PyreError> {
+            Ok(false)
+        }
+        async fn take_focus_request(
+            self,
+            _ctx: tarpc::context::Context,
+        ) -> Result<Option<PaneId>, PyreError> {
+            Ok(None)
+        }
+        async fn next_pane_event(
+            self,
+            _ctx: tarpc::context::Context,
+            _after_seq: u64,
+            _timeout_ms: u32,
+        ) -> Result<Vec<pyre_proto::service::PaneEvent>, PyreError> {
+            Ok(vec![])
+        }
+        async fn gc_stale_sessions(
+            self,
+            _ctx: tarpc::context::Context,
+        ) -> Result<Vec<String>, PyreError> {
+            Ok(vec![])
+        }
+        async fn open_pane_split(
+            self,
+            _ctx: tarpc::context::Context,
+            _req: pyre_proto::service::OpenPaneSplitReq,
+        ) -> Result<PaneId, PyreError> {
+            Err(PyreError::SpawnFailed("stub".into()))
+        }
+        async fn set_pane_weight(
+            self,
+            _ctx: tarpc::context::Context,
+            _pane: PaneId,
+            _weight: u16,
+        ) -> Result<(), PyreError> {
+            Ok(())
+        }
+        async fn get_session_layout(
+            self,
+            _ctx: tarpc::context::Context,
+            _session: SessionId,
+        ) -> Result<LayoutNode, PyreError> {
+            Err(PyreError::NoSuchSession(_session))
+        }
+    }
+
+    // ── Test helpers ─────────────────────────────────────────────────────────
+
+    /// Build an in-process tarpc client backed by `StubDaemon`.
+    async fn stub_client() -> PyreDaemonClient {
+        let (client_transport, server_transport) = tarpc::transport::channel::unbounded();
+        let server = BaseChannel::with_defaults(server_transport);
+        tokio::spawn(
+            server
+                .execute(StubDaemon.serve())
+                .for_each(|resp| async move {
+                    tokio::spawn(resp);
+                }),
+        );
+        PyreDaemonClient::new(tarpc::client::Config::default(), client_transport).spawn()
+    }
+
+    /// Construct a minimal live `PaneSlot` for a given `PaneId`.
+    fn make_slot(pane_id: PaneId) -> PaneSlot {
+        let event_proxy = EventProxy::new();
+        let term = Term::new(
+            TermConfig::default(),
+            &TermSize::new(80, 24),
+            event_proxy.clone(),
+        );
+        let (input_tx, _input_rx) = mpsc::channel::<Bytes>(8);
+        let (_output_tx, output_rx) = mpsc::channel::<PaneEvent>(8);
+        PaneSlot {
+            pane_id,
+            term,
+            processor: AnsiProcessor::new(),
+            event_proxy,
+            input_tx,
+            output_rx,
+            recent_blocks: vec![],
+            ribbon_cursor: None,
+            last_sent_size: (80, 24),
+            frames_received: 0,
+            scroll_offset: 0,
+            scrollback_capacity: 0,
+            last_screen_rect: ratatui::layout::Rect::default(),
+            ribbon_chip_rects: vec![],
+            pending_output: vec![],
+            parser_sized: false,
+            last_output_log: None,
+        }
+    }
+
+    /// Build a minimal `AppState` with one session containing a VSplit of two
+    /// panes: `pane_a` (focused) and `pane_b`.  Two live slots are inserted.
+    async fn two_pane_state(pane_a: PaneId, pane_b: PaneId, session: SessionId) -> AppState {
+        let control = stub_client().await;
+        let (_, blocks_rx) = watch::channel(HashMap::new());
+        let (_, toast_rx) = mpsc::channel(1);
+
+        let reg = pyre_themes::Registry::builtin();
+        let theme = reg
+            .get(pyre_themes::Registry::default_theme())
+            .expect("default theme present")
+            .clone();
+
+        let tab = Tab {
+            root: LayoutNode::VSplit(vec![
+                (LayoutNode::Leaf(pane_a), 50),
+                (LayoutNode::Leaf(pane_b), 50),
+            ]),
+            focus_pane: pane_a,
+            zoomed: None,
+            boundaries: vec![],
+            drag: None,
+        };
+
+        AppState {
+            sessions: vec![SessionView {
+                id: session,
+                name: "test-session".into(),
+                tabs: vec![tab],
+                active_tab: 0,
+            }],
+            active_session: 0,
+            slots: vec![Some(make_slot(pane_a)), Some(make_slot(pane_b))],
+            session_lost: false,
+            control,
+            socket: PathBuf::from("/tmp/pyre-test.sock"),
+            shell: None,
+            search: SearchState::default(),
+            status_msg: None,
+            sidebar_open: false,
+            sidebar_data: vec![],
+            sidebar_last_poll: Instant::now() - Duration::from_secs(10),
+            sidebar_cursor: 0,
+            sidebar_focused: false,
+            selection: None,
+            last_click: None,
+            context_menu: None,
+            pid_inspect: None,
+            prompt: None,
+            session_strip_rects: vec![],
+            session_strip_scroll: 0,
+            session_strip_left_arrow: None,
+            session_strip_right_arrow: None,
+            session_plus_rect: None,
+            tab_plus_rect: None,
+            pending_resizes: vec![],
+            tab_chip_rects: vec![],
+            dragging_tab: None,
+            pager_rect: None,
+            session_list_last_poll: Instant::now() - Duration::from_secs(10),
+            layout_resync_last_poll: Instant::now() - Duration::from_secs(10),
+            blocks_rx,
+            anim: AnimClock::new(),
+            pager: None,
+            theme,
+            theme_picker: None,
+            toast_deck: ToastDeck::new(false, 3000, 3),
+            toast_rx,
+            pending_menu_action: None,
+        }
+    }
+
+    // ── Tests ─────────────────────────────────────────────────────────────────
+
+    /// Closing the focused pane of a 2-pane session removes only that pane,
+    /// the sibling pane survives, the session is not removed, and
+    /// `sessions.is_empty()` remains false (no should_quit).
+    ///
+    /// This is the primary regression guard for the Ctrl-B+x / close-X bug:
+    /// before the fix, the `LayoutNode::close` single-leaf path left a zombie
+    /// leaf in the tree after the SECOND pane was closed, preventing tab
+    /// removal and causing `session_lost` to fire spuriously.
+    #[tokio::test]
+    async fn close_focused_pane_of_split_removes_only_target() {
+        let pane_a = PaneId::new();
+        let pane_b = PaneId::new();
+        let session = SessionId::new();
+
+        let mut state = two_pane_state(pane_a, pane_b, session).await;
+
+        // Precondition: 2 panes in the tab.
+        assert_eq!(
+            pane_leaves_in_order(&state.sessions[0].tabs[0].root).len(),
+            2,
+            "precondition: tab must have 2 panes"
+        );
+
+        // Act: close pane_a (the focused pane, slot index 0).
+        close_pane_by_slot_idx(&mut state, 0);
+
+        // Session must survive.
+        assert!(
+            !state.sessions.is_empty(),
+            "sessions must not be empty after closing one pane of a split"
+        );
+
+        // Exactly one pane left in the tab.
+        let remaining = pane_leaves_in_order(&state.sessions[0].tabs[0].root);
+        assert_eq!(
+            remaining.len(),
+            1,
+            "tab must have exactly 1 pane after closing one of two"
+        );
+        assert_eq!(
+            remaining[0], pane_b,
+            "the surviving pane must be pane_b (the sibling)"
+        );
+
+        // Focus must have shifted to pane_b.
+        assert_eq!(
+            state.sessions[0].tabs[0].focus_pane, pane_b,
+            "focus must be on the surviving pane"
+        );
+
+        // Slot 0 is dead (closed), slot 1 is still live.
+        assert!(
+            state.slots[0].is_none(),
+            "slot 0 (pane_a) must be None after close"
+        );
+        assert!(state.slots[1].is_some(), "slot 1 (pane_b) must remain live");
+    }
+
+    /// Closing the LAST pane in a single-pane session removes the tab AND
+    /// the session.  The caller (event loop) checks `sessions.is_empty()` to
+    /// decide whether to quit — this test verifies that path triggers correctly
+    /// rather than leaving a zombie tab with a dead slot.
+    ///
+    /// Before the fix in `close_pane_by_slot_idx`, `LayoutNode::close` returned
+    /// `None` on a single-leaf tree but left the tree as `Leaf(pane_id)`.
+    /// `pane_leaves_in_order` then returned `[pane_id]` (non-empty), so the
+    /// tab was NOT removed.  The session-lost overlay fired instead of a clean
+    /// quit, and subsequent key presses were ignored by the overlay intercept
+    /// until the user explicitly pressed 'q'.
+    #[tokio::test]
+    async fn close_last_pane_removes_tab_and_session() {
+        let pane_a = PaneId::new();
+        let pane_b = PaneId::new();
+        let session = SessionId::new();
+
+        // Start with a 2-pane state and close both panes sequentially.
+        let mut state = two_pane_state(pane_a, pane_b, session).await;
+
+        // Close pane_a (slot 0) — leaves a 1-pane tab.
+        close_pane_by_slot_idx(&mut state, 0);
+        assert!(
+            !state.sessions.is_empty(),
+            "session must survive after first close"
+        );
+        assert_eq!(
+            pane_leaves_in_order(&state.sessions[0].tabs[0].root).len(),
+            1,
+            "one pane must remain after first close"
+        );
+
+        // Close pane_b (now slot 1) — last pane in the session.
+        close_pane_by_slot_idx(&mut state, 1);
+
+        // Session must be gone.
+        assert!(
+            state.sessions.is_empty(),
+            "sessions must be empty after closing all panes — event loop should quit"
+        );
+    }
+
+    /// `close_focused_pane` dispatches correctly through `focused_slot_idx`
+    /// and produces the same outcome as calling `close_pane_by_slot_idx`
+    /// directly — only the focused pane is removed.
+    #[tokio::test]
+    async fn close_focused_pane_dispatch_removes_only_focus() {
+        let pane_a = PaneId::new();
+        let pane_b = PaneId::new();
+        let session = SessionId::new();
+
+        let mut state = two_pane_state(pane_a, pane_b, session).await;
+        // pane_a is the focused pane (set in two_pane_state).
+        assert_eq!(state.sessions[0].tabs[0].focus_pane, pane_a);
+
+        close_focused_pane(&mut state);
+
+        assert!(
+            !state.sessions.is_empty(),
+            "should_quit must be false — session survives"
+        );
+        let remaining = pane_leaves_in_order(&state.sessions[0].tabs[0].root);
+        assert_eq!(remaining, vec![pane_b], "only pane_b must remain");
+        assert_eq!(state.sessions[0].tabs[0].focus_pane, pane_b);
     }
 }

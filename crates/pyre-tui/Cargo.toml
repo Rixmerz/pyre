@@ -34,3 +34,4 @@ regex = { workspace = true }
 [dev-dependencies]
 insta = { version = "1", features = ["yaml"] }
 ratatui = { workspace = true }
+chrono = { workspace = true }

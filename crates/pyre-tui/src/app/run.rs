@@ -619,6 +619,12 @@ pub(crate) async fn run_tui(
         }
 
         // Session-lost detection.
+        //
+        // The active tab is "lost" when every pane in it has a dead (None) slot.
+        // Recovery order:
+        //   1. Another live tab within the SAME session (switch tab).
+        //   2. Another live session entirely (switch session).
+        //   3. No live panes anywhere → show the session-lost overlay.
         {
             let si = state.active_session;
             let ti = state.sessions[si].active_tab;
@@ -627,20 +633,38 @@ pub(crate) async fn run_tui(
                 .all(|pid| pane_to_slot_idx(&state.slots, *pid).is_none());
 
             if all_dead && !state.session_lost {
-                let alt = (0..state.sessions.len()).find(|&other_si| {
-                    if other_si == si {
-                        return false;
-                    }
-                    let other_ti = state.sessions[other_si].active_tab;
-                    pane_leaves_in_order(&state.sessions[other_si].tabs[other_ti].root)
+                // Try another tab in the same session first.
+                let alt_tab =
+                    state.sessions[si]
+                        .tabs
                         .iter()
-                        .any(|pid| pane_to_slot_idx(&state.slots, *pid).is_some())
-                });
-                if let Some(next_si) = alt {
-                    state.active_session = next_si;
+                        .enumerate()
+                        .find(|&(other_ti, tab)| {
+                            other_ti != ti
+                                && pane_leaves_in_order(&tab.root)
+                                    .iter()
+                                    .any(|pid| pane_to_slot_idx(&state.slots, *pid).is_some())
+                        });
+                if let Some((next_ti, _)) = alt_tab {
+                    state.sessions[si].active_tab = next_ti;
                     state.session_lost = false;
                 } else {
-                    state.session_lost = true;
+                    // No live tab in this session — try another session.
+                    let alt_session = (0..state.sessions.len()).find(|&other_si| {
+                        if other_si == si {
+                            return false;
+                        }
+                        let other_ti = state.sessions[other_si].active_tab;
+                        pane_leaves_in_order(&state.sessions[other_si].tabs[other_ti].root)
+                            .iter()
+                            .any(|pid| pane_to_slot_idx(&state.slots, *pid).is_some())
+                    });
+                    if let Some(next_si) = alt_session {
+                        state.active_session = next_si;
+                        state.session_lost = false;
+                    } else {
+                        state.session_lost = true;
+                    }
                 }
             } else if !all_dead {
                 state.session_lost = false;

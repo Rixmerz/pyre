@@ -3223,6 +3223,7 @@ dependencies = [
  "alacritty_terminal",
  "anyhow",
  "bytes",
+ "chrono",
  "clap",
  "crossterm",
  "futures",
