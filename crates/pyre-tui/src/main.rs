@@ -58,9 +58,14 @@ use ratatui::widgets::{
 use ratatui::Terminal;
 mod clipboard;
 mod fire_motion;
+mod model;
 mod splash;
 mod theme;
 use fire_motion::AnimClock;
+use model::pane::{DragState, EventProxy, PaneEvent, PaneInit, PaneSlot, SplitBoundary};
+use model::selection::{ClickTracker, Selection, SelectionBase};
+use model::tab::{tab_reorder, Tab};
+use model::toast::{pane_event_to_toast, Toast, ToastDeck, ToastKind};
 use std::collections::HashMap;
 use std::process::Stdio;
 use tarpc::client;
@@ -79,135 +84,6 @@ use alacritty_terminal::index::{Column as TermColumn, Line as TermLine, Point as
 use alacritty_terminal::term::{cell::Flags as CellFlags, Config as TermConfig};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Processor as AnsiProcessor};
 use alacritty_terminal::Term;
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Toast notification subsystem
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Visual kind of a toast notification; controls border colour from the palette.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ToastKind {
-    Info,
-    Success,
-    Warn,
-    Error,
-}
-
-/// A single ephemeral notification card.
-#[derive(Debug, Clone)]
-struct Toast {
-    /// Bold title line, e.g. "claude · pane #a1b2c3d4".
-    title: String,
-    /// Dimmed body line, e.g. "Waiting for input".
-    body: String,
-    /// Determines border colour.
-    kind: ToastKind,
-    /// When the toast was created.
-    born_at: Instant,
-    /// How long before it expires.
-    ttl: Duration,
-}
-
-impl Toast {
-    /// Fraction of TTL remaining [0.0, 1.0].
-    fn remaining_fraction(&self) -> f32 {
-        let elapsed = self.born_at.elapsed();
-        if elapsed >= self.ttl {
-            0.0
-        } else {
-            1.0 - (elapsed.as_secs_f32() / self.ttl.as_secs_f32())
-        }
-    }
-
-    fn is_expired(&self) -> bool {
-        self.born_at.elapsed() >= self.ttl
-    }
-}
-
-/// Stack of live toasts rendered bottom-right.
-struct ToastDeck {
-    toasts: std::collections::VecDeque<Toast>,
-    max_visible: usize,
-    /// Whether toast display is enabled (toggleable via Ctrl-B N).
-    enabled: bool,
-    /// TTL applied to new toasts.
-    ttl: Duration,
-}
-
-impl ToastDeck {
-    fn new(enabled: bool, ttl_ms: u64, max_visible: usize) -> Self {
-        Self {
-            toasts: std::collections::VecDeque::new(),
-            max_visible,
-            enabled,
-            ttl: Duration::from_millis(ttl_ms),
-        }
-    }
-
-    /// Push a new toast; trims oldest when over `max_visible`.
-    fn push(&mut self, title: String, body: String, kind: ToastKind) {
-        if !self.enabled {
-            return;
-        }
-        let toast = Toast {
-            title,
-            body,
-            kind,
-            born_at: Instant::now(),
-            ttl: self.ttl,
-        };
-        self.toasts.push_back(toast);
-        while self.toasts.len() > self.max_visible {
-            self.toasts.pop_front();
-        }
-    }
-
-    /// Drop expired toasts. Call once per UI tick.
-    fn tick(&mut self) {
-        self.toasts.retain(|t| !t.is_expired());
-    }
-}
-
-/// Map a `PaneEvent` to an optional toast.
-/// Returns `None` for Idle/Running (spam suppression) and unknown states.
-fn pane_event_to_toast(event: &pyre_proto::PaneEvent, ttl: Duration) -> Option<Toast> {
-    use pyre_proto::{PaneEventKind, PaneStateKind};
-
-    let short: String = event.pane_id.chars().take(8).collect();
-    let agent_label = event
-        .agent
-        .map(|a| format!(" ({})", a.label()))
-        .unwrap_or_default();
-    let title = format!("{short}{agent_label}");
-
-    let (body, kind) = match event.kind {
-        PaneEventKind::Spawned => ("Spawned".to_owned(), ToastKind::Info),
-        PaneEventKind::Closed => ("Closed".to_owned(), ToastKind::Info),
-        PaneEventKind::StateChanged => {
-            match event.state {
-                Some(PaneStateKind::WaitingInput) => {
-                    ("Waiting for input".to_owned(), ToastKind::Warn)
-                }
-                Some(PaneStateKind::Done) => ("Done".to_owned(), ToastKind::Success),
-                Some(PaneStateKind::Crashed) => ("Failed".to_owned(), ToastKind::Error),
-                // Idle and Running are high-frequency — suppress.
-                Some(PaneStateKind::Idle) | Some(PaneStateKind::Running) => return None,
-                _ => return None,
-            }
-        }
-        // Layout topology changes do not produce a toast — clients re-fetch
-        // via get_session_layout on this event (ADR-0005 M7-B).
-        PaneEventKind::LayoutChanged => return None,
-    };
-
-    Some(Toast {
-        title,
-        body,
-        kind,
-        born_at: Instant::now(),
-        ttl,
-    })
-}
 
 /// Render the toast deck in the bottom-right corner of `frame`.
 ///
@@ -643,185 +519,6 @@ fn ansi_color(color: AnsiColor) -> Option<Color> {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// EventProxy — forwards PtyWrite responses from Term back to the PTY input.
-// This is critical for DSR/CPR (cursor position reports) so TUIs that issue
-// ?6n or ?1000h don't hang waiting for a reply.
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[derive(Clone)]
-struct EventProxy {
-    /// Queued PtyWrite responses; drained by PaneSlot::drain_pty_responses.
-    queue: Arc<Mutex<Vec<String>>>,
-}
-
-impl EventProxy {
-    fn new() -> Self {
-        Self {
-            queue: Arc::new(Mutex::new(Vec::new())),
-        }
-    }
-
-    /// Drain any accumulated response bytes into `dest`. Call this after
-    /// `process_output` and send the collected bytes back to the daemon input
-    /// channel so child programs receive their CPR / DSR replies.
-    fn drain(&self) -> Vec<u8> {
-        let mut q = self.queue.lock().expect("event proxy lock");
-        let mut out: Vec<u8> = Vec::new();
-        for s in q.drain(..) {
-            out.extend_from_slice(s.as_bytes());
-        }
-        out
-    }
-}
-
-impl EventListener for EventProxy {
-    fn send_event(&self, event: TermEvent) {
-        if let TermEvent::PtyWrite(s) = event {
-            self.queue.lock().expect("event proxy lock").push(s);
-        }
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Multi-pane layout data model
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Events flowing from the net→UI background task to the main loop.
-enum PaneEvent {
-    Output(Bytes),
-    /// Stream ended. `frames_received` is the total number of `OutputFrame`
-    /// messages successfully decoded before the stream closed. A value of 0
-    /// means the connection was rejected at the handshake level (e.g. worker
-    /// returned "pane not found") rather than a real pane exit; in that case
-    /// the TUI should skip the `close_pane` RPC to avoid a respawn loop.
-    Closed {
-        frames_received: u64,
-    },
-}
-
-/// One attached PTY pane with its I/O channels and VT parser.
-struct PaneSlot {
-    pane_id: PaneId,
-    /// alacritty_terminal state machine — handles alt-screen, DSR/CPR, mouse.
-    term: Term<EventProxy>,
-    /// VTE ANSI byte-stream processor that feeds bytes into `term`.
-    processor: AnsiProcessor,
-    /// Event proxy shared with `term`; drained after each process_output call
-    /// to forward CPR/DSR replies back to the child PTY.
-    event_proxy: EventProxy,
-    /// Bytes to send to this pane (written by the key handler).
-    input_tx: mpsc::Sender<Bytes>,
-    /// Events from daemon for this pane (drained each UI tick).
-    output_rx: mpsc::Receiver<PaneEvent>,
-    /// Last polled block list for the ribbon (up to 20 entries, newest last).
-    recent_blocks: Vec<Block>,
-    /// `None` = live (rightmost highlighted); `Some(i)` = scrollback cursor.
-    ribbon_cursor: Option<usize>,
-
-    /// Last PTY size successfully sent to the daemon, to avoid spamming per frame.
-    last_sent_size: (u16, u16),
-
-    /// Number of OutputFrame messages received from the daemon on this stream.
-    /// Used to distinguish a connection-level failure (zero frames → do not fire
-    /// close_pane RPC) from a legitimate pane exit (≥1 frames → fire close_pane).
-    frames_received: u64,
-
-    /// 0 = live view; N = N lines scrolled back via vt100 native scrollback.
-    scroll_offset: usize,
-    /// Total scrollback lines available as of the last render (cached via peek/restore).
-    /// vt100::Screen::scrollback() returns the *current offset*, not the capacity;
-    /// we peek by setting MAX and reading the clamped value, then restore.
-    scrollback_capacity: usize,
-    /// The screen rect captured during the last render, used for mouse hit-test.
-    last_screen_rect: Rect,
-    /// Ribbon chip rects captured during last render: (block_idx, rect).
-    ribbon_chip_rects: Vec<(usize, Rect)>,
-    /// Output bytes received before the first render (parser not yet sized to
-    /// the real pane area). Drained into the parser on the first render frame.
-    pending_output: Vec<u8>,
-    /// True once the parser has been sized to the actual pane area and
-    /// `pending_output` has been flushed. Set on the first `render_pane` call.
-    parser_sized: bool,
-    /// Timestamp of the last `process_output` debug log emission (50 ms throttle).
-    last_output_log: Option<Instant>,
-}
-
-impl PaneSlot {
-    /// Feed raw bytes into the alacritty Term processor.
-    /// If the terminal has not yet been sized to the real pane area (before the
-    /// first render frame), bytes are buffered in `pending_output` instead of
-    /// being processed at the wrong terminal dimensions. `render_pane` drains
-    /// the buffer once it knows the correct area size.
-    fn process_output(&mut self, data: &[u8]) {
-        // Throttled debug log: at most once per 50 ms to avoid flooding.
-        let now = Instant::now();
-        let emit = match self.last_output_log {
-            None => true,
-            Some(t) => now.duration_since(t) >= Duration::from_millis(50),
-        };
-        if emit {
-            tracing::debug!(
-                bytes = data.len(),
-                parser_sized = self.parser_sized,
-                pane_id = %self.pane_id.0,
-                "process_output: chunk"
-            );
-            self.last_output_log = Some(now);
-        }
-
-        if self.parser_sized {
-            self.processor.advance(&mut self.term, data);
-        } else {
-            self.pending_output.extend_from_slice(data);
-        }
-    }
-
-    /// Drain any PtyWrite responses generated by the Term (CPR/DSR replies)
-    /// and return them as raw bytes to be forwarded back to the child PTY.
-    fn drain_pty_responses(&self) -> Vec<u8> {
-        self.event_proxy.drain()
-    }
-}
-
-/// A boundary between two split children — used for drag-resize hit-testing.
-#[derive(Clone)]
-struct SplitBoundary {
-    /// Screen coordinate (column for VSplit, row for HSplit) of the boundary.
-    coord: u16,
-    /// Axis: true = horizontal split (drag row), false = vertical split (drag col).
-    is_hsplit: bool,
-    /// Path to the parent split node.
-    parent_path: Vec<usize>,
-    /// Index of the LEFT/TOP child (the boundary is between child_idx and child_idx+1).
-    child_idx: usize,
-    /// Total size of the parent in the split axis (height for HSplit, width for VSplit).
-    parent_size: u16,
-}
-
-/// Active drag state.
-struct DragState {
-    boundary: SplitBoundary,
-    /// Terminal coordinate (col or row depending on axis) where drag began.
-    start_coord: u16,
-    /// Weights of all children in the parent split at drag start.
-    start_weights: Vec<u16>,
-}
-
-/// One tab, owning a layout tree and a cursor into the focused leaf.
-struct Tab {
-    /// Daemon-owned tiling tree. Leaves carry stable `PaneId` UUIDs (M7-D).
-    root: LayoutNode,
-    /// The `PaneId` of the focused pane. Stable across layout mutations.
-    focus_pane: PaneId,
-    /// When Some, renders only this pane filling the full body area (zoom).
-    zoomed: Option<PaneId>,
-    /// Boundaries collected during the last render, used for drag-resize hit-test.
-    boundaries: Vec<SplitBoundary>,
-    /// Active drag state (set on mouse-down near a boundary).
-    drag: Option<DragState>,
-}
-
 /// State for the full-text search overlay (Ctrl-B /).
 struct SearchState {
     open: bool,
@@ -862,20 +559,16 @@ impl PagerState {
         }
     }
 
-    /// Number of lines in the body.
     fn len(&self) -> usize {
         self.lines.len()
     }
 
-    /// Scroll up (towards top). Returns true if position changed.
     fn scroll_up(&mut self, n: usize) -> bool {
         let prev = self.scroll;
         self.scroll = self.scroll.saturating_sub(n);
         self.scroll != prev
     }
 
-    /// Scroll down (towards bottom). `visible_rows` is the number of rows
-    /// the pager body can display. Returns true if position changed.
     fn scroll_down(&mut self, n: usize, visible_rows: usize) -> bool {
         let prev = self.scroll;
         let max_scroll = self.len().saturating_sub(visible_rows);
@@ -884,7 +577,6 @@ impl PagerState {
     }
 }
 
-/// Split `!query` failures filter from the tantivy query string.
 fn parse_search_input(input: &str) -> (String, bool) {
     if let Some(rest) = input.strip_prefix('!') {
         (rest.trim_start().to_string(), true)
@@ -919,92 +611,6 @@ struct ThemePickerState {
     original_theme: Theme,
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Drag-selection types
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[derive(Clone)]
-enum SelectionBase {
-    Live,
-    /// window_top: how many lines past the live viewport the drag started,
-    /// matching `slot.scroll_offset` at the time drag began.
-    Scrollback(usize),
-}
-
-#[derive(Clone)]
-struct Selection {
-    pane_idx: usize,
-    /// (row, col) relative to the pane's vt100/content area, viewport-relative.
-    start: (u16, u16),
-    end: (u16, u16),
-    dragging: bool,
-    base: SelectionBase,
-}
-
-impl Selection {
-    fn normalized(&self) -> ((u16, u16), (u16, u16)) {
-        let (sr, sc) = self.start;
-        let (er, ec) = self.end;
-        if (sr, sc) <= (er, ec) {
-            ((sr, sc), (er, ec))
-        } else {
-            ((er, ec), (sr, sc))
-        }
-    }
-
-    #[allow(dead_code)]
-    fn contains(&self, row: u16, col: u16) -> bool {
-        let ((r0, c0), (r1, c1)) = self.normalized();
-        if row < r0 || row > r1 {
-            return false;
-        }
-        if row == r0 && col < c0 {
-            return false;
-        }
-        if row == r1 && col > c1 {
-            return false;
-        }
-        true
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Click tracker (for double/triple-click detection)
-// ─────────────────────────────────────────────────────────────────────────────
-
-struct ClickTracker {
-    last_at: Instant,
-    last_pos: (u16, u16), // (col, row) in terminal coordinates
-    count: u8,
-    #[allow(dead_code)]
-    pane_idx: usize,
-}
-
-impl ClickTracker {
-    /// Given a new click at `now` / `pos`, return the resulting click count
-    /// (1 = single, 2 = double, 3 = triple). Resets to 1 when more than
-    /// `window_ms` have passed or the cell position changed.
-    fn click_count(
-        now: Instant,
-        last_at: Instant,
-        last_pos: (u16, u16),
-        new_pos: (u16, u16),
-        prev_count: u8,
-        window_ms: u64,
-    ) -> u8 {
-        let elapsed = now.duration_since(last_at).as_millis() as u64;
-        if elapsed <= window_ms && last_pos == new_pos {
-            prev_count.saturating_add(1).min(3)
-        } else {
-            1
-        }
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Right-click context menu
-// ─────────────────────────────────────────────────────────────────────────────
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MenuItem {
     Copy,
@@ -1038,14 +644,9 @@ const MENU_ITEMS: &[MenuItem] = &[
 ];
 
 struct ContextMenu {
-    /// Rect where the menu is rendered (computed on open).
     rect: Rect,
-    /// Currently highlighted menu row (0-based).
     cursor: usize,
-    /// Slot index of the pane that was right-clicked.
     target_slot: usize,
-    /// Per-item rects written by render_context_menu each frame so mouse-left
-    /// can hit-test individual items without recomputing the clamped popup rect.
     item_rects: Vec<Rect>,
 }
 
@@ -1057,7 +658,6 @@ struct SessionView {
     active_tab: usize,
 }
 
-/// Which kind of name-prompt overlay is open.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PromptKind {
     NewSession,
@@ -1065,7 +665,6 @@ enum PromptKind {
     RenameSession(SessionId),
 }
 
-/// Name-prompt overlay state.
 struct NamePrompt {
     kind: PromptKind,
     input: String,
@@ -3337,17 +2936,6 @@ fn word_bounds(
     (c0 as u16, c1 as u16)
 }
 
-/// Reorder tabs: move tab at `from` to position `to` (0-based), shifting others.
-/// Returns the new vec. No-op if indices are equal or out of range.
-fn tab_reorder(mut tabs: Vec<Tab>, from: usize, to: usize) -> Vec<Tab> {
-    if from == to || from >= tabs.len() || to >= tabs.len() {
-        return tabs;
-    }
-    let tab = tabs.remove(from);
-    tabs.insert(to, tab);
-    tabs
-}
-
 /// Apply a delta-percentage resize to two adjacent split children at `[idx]` and
 /// `[idx+1]` within `weights`. Each child is clamped to a minimum of `min_pct`
 /// (default 5). The pair's total is preserved. Returns the updated weights vec.
@@ -4246,24 +3834,6 @@ fn initial_app_state(
         pending_menu_action: None,
         session_lost: false,
     }
-}
-
-/// Describes how `run_tui` should acquire the initial session and pane.
-///
-/// Spawning the PTY must happen AFTER the terminal enters alternate-screen so
-/// that `terminal.size()` returns true dimensions.  Passing intent here
-/// (instead of pre-spawning in `main`) prevents the shell from starting at
-/// the 80×24 placeholder that `crossterm::terminal::size()` returns before
-/// alt-screen is entered.
-enum PaneInit {
-    /// Session and pane already exist (e.g. `pyre attach`).
-    Existing {
-        session: SessionId,
-        session_name: String,
-        pane: PaneId,
-    },
-    /// No sessions exist (or all existing sessions are stale); spawn a fresh session+pane at real terminal size.
-    Spawn,
 }
 
 async fn run_tui(
