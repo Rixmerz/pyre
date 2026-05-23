@@ -43,6 +43,91 @@ pub(crate) enum PaneInit {
     },
 }
 
+/// Pick the first non-stale session from a daemon session list.
+///
+/// Returns `Some(&SessionInfo)` for the first session whose `pane_count > 0`,
+/// or `None` when the list is empty / all sessions are stale.
+///
+/// This is the pure, synchronous decision that drives the Spawn vs Existing
+/// branch in `main`.  Extracting it enables regression tests without a live daemon.
+///
+/// I-7: empty list → caller must spawn exactly one session.
+/// I-5: `pane_count == 0` sessions are stale and must be skipped.
+pub(crate) fn pick_attach_session(
+    sessions: &[pyre_proto::SessionInfo],
+) -> Option<&pyre_proto::SessionInfo> {
+    sessions.iter().find(|s| s.pane_count > 0)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests — initial session selection (I-5, I-7)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod init_tests {
+    use super::*;
+    use chrono::Utc;
+    use pyre_proto::{SessionId, SessionInfo};
+
+    fn make_session_info(pane_count: u32) -> SessionInfo {
+        SessionInfo {
+            id: SessionId(uuid::Uuid::new_v4()),
+            name: "test".into(),
+            pane_count,
+            created_at: Utc::now(),
+            last_active_at: Utc::now(),
+        }
+    }
+
+    /// I-7: when the daemon returns an empty session list, `pick_attach_session`
+    /// returns None → the caller must trigger auto-spawn (PaneInit::Spawn).
+    #[test]
+    fn test_auto_spawn_on_empty_session_list() {
+        let sessions: Vec<SessionInfo> = Vec::new();
+        let picked = pick_attach_session(&sessions);
+        assert!(
+            picked.is_none(),
+            "empty list must return None → caller must spawn"
+        );
+    }
+
+    /// I-5 + I-7: when all sessions are stale (pane_count == 0), the list is
+    /// effectively empty from the attach perspective → spawn.
+    #[test]
+    fn test_auto_spawn_when_all_sessions_stale() {
+        let sessions = vec![make_session_info(0), make_session_info(0)];
+        let picked = pick_attach_session(&sessions);
+        assert!(
+            picked.is_none(),
+            "all-stale list must return None → caller must spawn"
+        );
+    }
+
+    /// When a live session exists, it must be returned for attachment — no spawn.
+    #[test]
+    fn test_picks_live_session_skips_stale() {
+        let stale = make_session_info(0);
+        let live = make_session_info(2);
+        let sessions = vec![stale.clone(), live.clone()];
+        let picked = pick_attach_session(&sessions).expect("live session present — must not spawn");
+        assert_eq!(
+            picked.id, live.id,
+            "must skip the stale session and return the live one"
+        );
+    }
+
+    /// First non-stale session wins, even if later sessions have more panes.
+    #[test]
+    fn test_picks_first_live_session() {
+        let first_live = make_session_info(1);
+        let second_live = make_session_info(5);
+        let sessions = vec![first_live.clone(), second_live.clone()];
+        let picked =
+            pick_attach_session(&sessions).expect("live sessions present — must not spawn");
+        assert_eq!(picked.id, first_live.id, "must pick the first live session");
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "pyre", version, about = "Pyre TUI — ratatui terminal frontend")]
 struct Cli {
@@ -145,22 +230,18 @@ async fn main() -> Result<()> {
                 .context("rpc transport")?
                 .map_err(|e| anyhow!("daemon list_sessions: {e}"))?;
 
+            // I-5/I-7: skip stale sessions (pane_count == 0); if none survive,
+            // pick_attach_session returns None and we spawn a fresh session.
             let mut init = PaneInit::Spawn;
-            for sess in existing {
-                if sess.pane_count == 0 {
-                    continue;
+            if let Some(candidate) = pick_attach_session(&existing) {
+                if let Ok(pane) = first_pane(&client, candidate.id).await {
+                    init = PaneInit::Existing {
+                        session: candidate.id,
+                        session_name: candidate.name.clone(),
+                        pane,
+                    };
                 }
-                match first_pane(&client, sess.id).await {
-                    Ok(pane) => {
-                        init = PaneInit::Existing {
-                            session: sess.id,
-                            session_name: sess.name,
-                            pane,
-                        };
-                        break;
-                    }
-                    Err(_) => continue,
-                }
+                // first_pane Err → fall back to Spawn
             }
             run_tui(socket, init, client, shell).await
         }
