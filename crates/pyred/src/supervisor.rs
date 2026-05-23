@@ -677,16 +677,29 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
     }
 
     async fn list_sessions(self, _ctx: context::Context) -> Result<Vec<SessionInfo>, PyreError> {
-        let handles = self.registry.inner.read().await;
-        let mut sessions = Vec::with_capacity(handles.len());
-        for (session_id_str, handle) in handles.iter() {
-            let pane_count = match handle.ctrl_client.list_panes(context::current()).await {
+        // Collect (session_id_str, uuid, ctrl_client) while holding the read
+        // lock for the minimum possible time — no async I/O inside the lock.
+        // Holding a tokio RwLock read guard across await points blocks any
+        // concurrent writer (e.g. register_worker), which causes the 5 s
+        // registration timeout inside spawn() to fire.
+        let snapshot: Vec<(String, uuid::Uuid, pyre_proto::supervisor::WorkerControlClient)> = {
+            let handles = self.registry.inner.read().await;
+            handles
+                .iter()
+                .filter_map(|(id_str, handle)| {
+                    uuid::Uuid::parse_str(id_str)
+                        .ok()
+                        .map(|u| (id_str.clone(), u, handle.ctrl_client.clone()))
+                })
+                .collect()
+        }; // read lock dropped here
+
+        let mut sessions = Vec::with_capacity(snapshot.len());
+        for (session_id_str, uuid, ctrl_client) in snapshot {
+            let sid = SessionId(uuid);
+            let pane_count = match ctrl_client.list_panes(context::current()).await {
                 Ok(Ok(slots)) => slots.len() as u32,
                 _ => 0,
-            };
-            let sid = match uuid::Uuid::parse_str(session_id_str) {
-                Ok(u) => SessionId(u),
-                Err(_) => continue,
             };
             // Look up the human-readable name persisted in the supervisor store.
             // Fall back to the UUID string only when the row is absent (e.g.
@@ -910,27 +923,36 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
     }
 
     async fn list_all_panes(self, _ctx: context::Context) -> Result<Vec<PaneInfo>, PyreError> {
-        let handles = self.registry.inner.read().await;
+        // Snapshot the registry without holding the read lock across async I/O
+        // (same pattern as list_sessions — avoids blocking register_worker).
+        let snapshot: Vec<(String, uuid::Uuid, pyre_proto::supervisor::WorkerControlClient)> = {
+            let handles = self.registry.inner.read().await;
+            handles
+                .iter()
+                .filter_map(|(id_str, handle)| {
+                    uuid::Uuid::parse_str(id_str)
+                        .ok()
+                        .map(|u| (id_str.clone(), u, handle.ctrl_client.clone()))
+                })
+                .collect()
+        }; // read lock dropped here
+
         let mut all = Vec::new();
-        for (session_id_str, handle) in handles.iter() {
-            let sid = match uuid::Uuid::parse_str(session_id_str) {
-                Ok(u) => SessionId(u),
-                Err(_) => continue,
-            };
-            let slots = match handle.ctrl_client.list_panes(context::current()).await {
+        for (session_id_str, uuid, ctrl_client) in snapshot {
+            let sid = SessionId(uuid);
+            let slots = match ctrl_client.list_panes(context::current()).await {
                 Ok(Ok(s)) => s,
                 _ => continue,
             };
             for slot_idx in slots {
                 let Some(pane_uuid) = self
                     .registry
-                    .get_or_alloc_pane_by_slot(session_id_str, slot_idx)
+                    .get_or_alloc_pane_by_slot(&session_id_str, slot_idx)
                     .await
                 else {
                     continue;
                 };
-                let mut info = match handle
-                    .ctrl_client
+                let mut info = match ctrl_client
                     .get_pane_info(context::current(), slot_idx)
                     .await
                 {
