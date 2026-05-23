@@ -1,0 +1,6 @@
+---
+source: crates/pyre-tui/tests/render_smoke.rs
+assertion_line: 92
+expression: buf
+---
+
