@@ -193,7 +193,7 @@ impl SessionRegistry {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
         let ev = PaneEvent {
             seq,
-            pane_id: pane_id.0.to_string(),
+            pane_id,
             kind,
             state,
             agent,

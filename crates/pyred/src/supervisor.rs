@@ -77,7 +77,7 @@ impl PaneEventBus {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
         let ev = PaneEvent {
             seq,
-            pane_id: pane_id.0.to_string(),
+            pane_id,
             kind,
             state,
             agent: None,
@@ -455,7 +455,7 @@ pub struct SupervisorImpl {
     /// Per-pane broadcast hubs: one worker connection shared by N TUI clients.
     pub mirror_registry: PaneMirrorRegistry,
     /// Pending focus requests enqueued by `request_focus`, dequeued by `take_focus_request`.
-    pub focus_queue: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    pub focus_queue: Arc<std::sync::Mutex<std::collections::VecDeque<PaneId>>>,
     /// Pane lifecycle event bus: broadcast ring for `next_pane_event` long-poll.
     pub pane_event_bus: Arc<PaneEventBus>,
     /// In-memory per-session layout store for the supervisor (M7-C, ADR-0005).
@@ -1115,7 +1115,7 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
     async fn request_focus(
         self,
         _ctx: context::Context,
-        pane_id: String,
+        pane_id: PaneId,
     ) -> Result<bool, PyreError> {
         self.focus_queue
             .lock()
@@ -1124,7 +1124,7 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
         Ok(true)
     }
 
-    async fn take_focus_request(self, _ctx: context::Context) -> Result<Option<String>, PyreError> {
+    async fn take_focus_request(self, _ctx: context::Context) -> Result<Option<PaneId>, PyreError> {
         Ok(self
             .focus_queue
             .lock()
@@ -1968,7 +1968,7 @@ pub async fn run(
     let pending_registrations: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
-    let focus_queue: Arc<std::sync::Mutex<std::collections::VecDeque<String>>> =
+    let focus_queue: Arc<std::sync::Mutex<std::collections::VecDeque<PaneId>>> =
         Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
 
     let pane_event_bus = PaneEventBus::new();

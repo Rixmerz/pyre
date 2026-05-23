@@ -191,28 +191,24 @@ pub(crate) fn focus_slot(state: &mut AppState, target_slot_idx: usize) {
 /// Replaces the former dropfile (`focus.request`) approach with an RPC call so
 /// that concurrent `pyrec select-pane` invocations are handled atomically.
 pub(crate) async fn apply_focus_request(state: &mut AppState) {
-    let Ok(Ok(Some(pane_str))) = state
+    let Ok(Ok(Some(pane_id))) = state
         .control
         .take_focus_request(tarpc::context::current())
         .await
     else {
         return;
     };
-    let Ok(pane_uuid) = uuid::Uuid::parse_str(&pane_str) else {
-        return;
-    };
-    let pane_id = PaneId(pane_uuid);
     if let Some(slot_idx) = state
         .slots
         .iter()
         .position(|s| s.as_ref().is_some_and(|slot| slot.pane_id == pane_id))
     {
         focus_slot(state, slot_idx);
-        let short: String = pane_str.chars().take(8).collect();
+        let short = &pane_id.to_string()[..8];
         state.status_msg = Some(format!("focused pane {short} (select-pane)"));
     } else {
         state.status_msg = Some(format!(
-            "select-pane: pane {pane_str} not open in this TUI — attach it first"
+            "select-pane: pane {pane_id} not open in this TUI — attach it first"
         ));
     }
 }

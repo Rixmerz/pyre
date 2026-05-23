@@ -50,7 +50,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use futures::StreamExt;
 use pyre_proto::service::PyreDaemon as _;
-use pyre_proto::{read_control_version_after_tag, MODE_CONTROL, MODE_STREAM, PROTO_VERSION};
+use pyre_proto::{
+    read_control_version_after_tag, PaneId, MODE_CONTROL, MODE_STREAM, PROTO_VERSION,
+};
 use tarpc::server::{BaseChannel, Channel};
 use tarpc::tokio_serde::formats::Bincode;
 use tokio::io::AsyncReadExt;
@@ -111,7 +113,7 @@ async fn handle_conn(
     registry: Arc<SessionRegistry>,
     store: Arc<Store>,
     block_index: Arc<BlockIndex>,
-    focus_queue: Arc<Mutex<VecDeque<String>>>,
+    focus_queue: Arc<Mutex<VecDeque<PaneId>>>,
 ) -> Result<()> {
     let mut sock = sock;
     let mut tag = [0u8; 1];
@@ -161,7 +163,7 @@ async fn run_single(path: PathBuf) -> Result<()> {
     );
 
     let registry = Arc::new(SessionRegistry::new());
-    let focus_queue: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let focus_queue: Arc<Mutex<VecDeque<PaneId>>> = Arc::new(Mutex::new(VecDeque::new()));
 
     let hooks = Arc::new(HooksConfig::load());
     let _state_engine = spawn_state_engine(registry.clone(), hooks.clone());

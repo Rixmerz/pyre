@@ -1317,7 +1317,7 @@ async fn run_select_pane(sock_path: PathBuf, target: String) -> Result<()> {
     let client = control_client(&sock_path).await?;
     let pane = resolve_pane_global(&client, &target).await?;
     client
-        .request_focus(tarpc::context::current(), pane.0.to_string())
+        .request_focus(tarpc::context::current(), pane)
         .await
         .context("rpc transport")?
         .map_err(|e| anyhow!("daemon request_focus: {e}"))?;

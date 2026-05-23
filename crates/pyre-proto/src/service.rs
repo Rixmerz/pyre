@@ -53,8 +53,8 @@ pub enum PaneEventKind {
 pub struct PaneEvent {
     /// Monotonically increasing sequence number (starts at 1).
     pub seq: u64,
-    /// String representation of the `PaneId` UUID.
-    pub pane_id: String,
+    /// Stable identifier for the pane that triggered this event.
+    pub pane_id: crate::PaneId,
     /// What happened.
     pub kind: PaneEventKind,
     /// Current state, if known (absent for `Closed`).
@@ -196,9 +196,9 @@ pub trait PyreDaemon {
     /// Return the most recently finalized block for a pane, if any.
     async fn last_block_for_pane(pane: PaneId) -> Result<Option<crate::Block>, PyreError>;
     /// Enqueue a focus request for a pane (replaces the focus.request dropfile).
-    async fn request_focus(pane_id: String) -> Result<bool, PyreError>;
+    async fn request_focus(pane_id: crate::PaneId) -> Result<bool, PyreError>;
     /// Dequeue the oldest pending focus request, if any (polled by the TUI each tick).
-    async fn take_focus_request() -> Result<Option<String>, PyreError>;
+    async fn take_focus_request() -> Result<Option<crate::PaneId>, PyreError>;
     /// Long-poll for pane lifecycle events.
     ///
     /// Returns all events whose `seq` is strictly greater than `after_seq`,

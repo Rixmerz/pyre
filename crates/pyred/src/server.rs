@@ -20,7 +20,7 @@ pub struct DaemonImpl {
     pub block_index: Arc<BlockIndex>,
     /// Pending focus requests enqueued by `request_focus` and dequeued by `take_focus_request`.
     /// Shared across all control connections so pyrec and the TUI see the same queue.
-    pub focus_queue: Arc<Mutex<VecDeque<String>>>,
+    pub focus_queue: Arc<Mutex<VecDeque<PaneId>>>,
 }
 
 impl pyre_proto::service::PyreDaemon for DaemonImpl {
@@ -434,7 +434,7 @@ impl pyre_proto::service::PyreDaemon for DaemonImpl {
     async fn request_focus(
         self,
         _ctx: context::Context,
-        pane_id: String,
+        pane_id: PaneId,
     ) -> Result<bool, PyreError> {
         self.focus_queue
             .lock()
@@ -443,7 +443,7 @@ impl pyre_proto::service::PyreDaemon for DaemonImpl {
         Ok(true)
     }
 
-    async fn take_focus_request(self, _ctx: context::Context) -> Result<Option<String>, PyreError> {
+    async fn take_focus_request(self, _ctx: context::Context) -> Result<Option<PaneId>, PyreError> {
         Ok(self
             .focus_queue
             .lock()

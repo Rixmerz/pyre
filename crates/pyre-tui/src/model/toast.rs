@@ -93,7 +93,7 @@ impl ToastDeck {
 pub fn pane_event_to_toast(event: &pyre_proto::PaneEvent, ttl: Duration) -> Option<Toast> {
     use pyre_proto::{PaneEventKind, PaneStateKind};
 
-    let short: String = event.pane_id.chars().take(8).collect();
+    let short: String = event.pane_id.to_string().chars().take(8).collect();
     let agent_label = event
         .agent
         .map(|a| format!(" ({})", a.label()))
@@ -174,7 +174,9 @@ mod tests {
     ) -> pyre_proto::PaneEvent {
         pyre_proto::PaneEvent {
             seq: 1,
-            pane_id: "aabbccdd-0000-0000-0000-000000000000".into(),
+            pane_id: pyre_proto::PaneId(
+                uuid::Uuid::parse_str("aabbccdd-0000-0000-0000-000000000000").unwrap(),
+            ),
             kind,
             state,
             agent: None,
