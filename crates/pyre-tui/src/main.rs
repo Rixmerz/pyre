@@ -59,6 +59,7 @@ use ratatui::Terminal;
 mod clipboard;
 mod fire_motion;
 mod model;
+mod render;
 mod splash;
 mod theme;
 use fire_motion::AnimClock;
@@ -66,6 +67,10 @@ use model::pane::{DragState, EventProxy, PaneEvent, PaneInit, PaneSlot, SplitBou
 use model::selection::{ClickTracker, Selection, SelectionBase};
 use model::tab::{tab_reorder, Tab};
 use model::toast::{pane_event_to_toast, Toast, ToastDeck, ToastKind};
+use render::overlay::pager::{render_pager, PagerState};
+use render::overlay::picker::{render_theme_picker, ThemePickerState};
+use render::overlay::search::{parse_search_input, render_search_overlay, SearchState};
+use render::overlay::session_lost::render_session_lost_overlay;
 use std::collections::HashMap;
 use std::process::Stdio;
 use tarpc::client;
@@ -519,98 +524,6 @@ fn ansi_color(color: AnsiColor) -> Option<Color> {
     }
 }
 
-/// State for the full-text search overlay (Ctrl-B /).
-struct SearchState {
-    open: bool,
-    input: String,
-    /// Selected result index.
-    cursor: usize,
-    results: Vec<BlockHit>,
-    last_query_at: Instant,
-    pending_query: Option<String>,
-    /// Prefix `!` in the search box sets this (non-zero exit only).
-    failures_only: bool,
-    rx: Option<mpsc::Receiver<Vec<BlockHit>>>,
-    /// Result row rects captured during last render: (result_index, rect).
-    result_rects: Vec<(usize, Rect)>,
-}
-
-/// State for the block stdout modal pager (Enter in ribbon mode).
-struct PagerState {
-    /// Block identifier shown in the title bar.
-    block_id: String,
-    /// Exit code shown in the title bar (`None` = still running).
-    exit_code: Option<i32>,
-    /// Output lines (raw bytes decoded as lossy UTF-8, split on `\n`).
-    lines: Vec<String>,
-    /// First visible line index (scrolled position).
-    scroll: usize,
-}
-
-impl PagerState {
-    fn new(block_id: String, exit_code: Option<i32>, raw: &[u8]) -> Self {
-        let text = String::from_utf8_lossy(raw);
-        let lines: Vec<String> = text.split('\n').map(|l| l.to_owned()).collect();
-        Self {
-            block_id,
-            exit_code,
-            lines,
-            scroll: 0,
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.lines.len()
-    }
-
-    fn scroll_up(&mut self, n: usize) -> bool {
-        let prev = self.scroll;
-        self.scroll = self.scroll.saturating_sub(n);
-        self.scroll != prev
-    }
-
-    fn scroll_down(&mut self, n: usize, visible_rows: usize) -> bool {
-        let prev = self.scroll;
-        let max_scroll = self.len().saturating_sub(visible_rows);
-        self.scroll = (self.scroll + n).min(max_scroll);
-        self.scroll != prev
-    }
-}
-
-fn parse_search_input(input: &str) -> (String, bool) {
-    if let Some(rest) = input.strip_prefix('!') {
-        (rest.trim_start().to_string(), true)
-    } else {
-        (input.to_string(), false)
-    }
-}
-
-impl Default for SearchState {
-    fn default() -> Self {
-        Self {
-            open: false,
-            input: String::new(),
-            cursor: 0,
-            results: Vec::new(),
-            last_query_at: Instant::now(),
-            pending_query: None,
-            failures_only: false,
-            rx: None,
-            result_rects: Vec::new(),
-        }
-    }
-}
-
-/// State for the theme picker overlay (Ctrl-B T).
-struct ThemePickerState {
-    /// Index of the currently highlighted theme in the registry list.
-    cursor: usize,
-    /// Snapshot of theme names from the registry, in display order.
-    names: Vec<&'static str>,
-    /// Theme that was active when the picker opened — restored on Esc/q.
-    original_theme: Theme,
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MenuItem {
     Copy,
@@ -671,7 +584,7 @@ struct NamePrompt {
 }
 
 #[allow(dead_code)]
-struct AppState {
+pub(crate) struct AppState {
     /// All known sessions (may have tabs loaded lazily).
     sessions: Vec<SessionView>,
     /// Index into `sessions` that is currently displayed.
@@ -1534,212 +1447,6 @@ fn render_layout(
     }
 }
 
-/// Render the search overlay centered on the terminal.
-fn render_search_overlay(frame: &mut ratatui::Frame, app: &mut AppState, t: &theme::LegacyTheme) {
-    let area = frame.area();
-
-    // Centered rect: ~70% width, ~60% height.
-    let w = (area.width as f32 * 0.70) as u16;
-    let h = (area.height as f32 * 0.60) as u16;
-    let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let overlay_rect = Rect::new(x, y, w.max(20), h.max(6));
-
-    // Clear backing area so panes don't bleed through.
-    frame.render_widget(Clear, overlay_rect);
-
-    let outer = RatatuiBlock::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Double)
-        .border_style(t.border_focus())
-        .title(Span::styled(" search (! = failures) ", t.title(t.primary)))
-        .style(t.overlay());
-    let inner = outer.inner(overlay_rect);
-    frame.render_widget(outer, overlay_rect);
-
-    // Split inner: 3-line input box + remainder for results.
-    let split = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(1)])
-        .split(inner);
-
-    let input_area = split[0];
-    let results_area = split[1];
-
-    // Input box — prompt prefix `> ` in primary, query in text, cursor █ in spark.
-    let cursor_f = app.anim.frame();
-    let input_spans = vec![
-        Span::styled("> ", Style::default().fg(t.primary)),
-        Span::styled(app.search.input.as_str(), Style::default().fg(t.text)),
-        Span::styled(
-            "█",
-            fire_motion::ember_fg_style(cursor_f, 0x_a11ce, t.spark, t.secondary, 0.9),
-        ),
-    ];
-    let input_block = RatatuiBlock::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(t.border())
-        .style(t.overlay());
-    let input_para = Paragraph::new(Line::from(input_spans))
-        .block(input_block)
-        .style(t.bg_style());
-    frame.render_widget(input_para, input_area);
-
-    // Set host cursor at end of input text: inner input area x + 2 (prompt) + query len.
-    // The input block has 1-cell border on each side, so inner starts at input_area.x + 1.
-    let inner_x = input_area.x + 1;
-    let inner_y = input_area.y + 1;
-    // "> " prefix (2 chars) + query length, clamped to inner width.
-    let inner_width = input_area.width.saturating_sub(2); // subtract left+right border
-    let cursor_col = (2u16 + app.search.input.len() as u16).min(inner_width.saturating_sub(1));
-    frame.set_cursor_position((inner_x + cursor_col, inner_y));
-
-    // Results list.
-    let items: Vec<ListItem> = app
-        .search
-        .results
-        .iter()
-        .map(|hit| {
-            let b = &hit.block;
-            let pane_short: String = b.pane.0.to_string().chars().take(8).collect();
-            let ts_short = b.started_at.format("%H:%M:%S").to_string();
-            let snippet: String = if hit.snippet.is_empty() {
-                b.command.chars().take(80).collect()
-            } else {
-                hit.snippet.chars().take(80).collect()
-            };
-            ListItem::new(format!("[{pane_short}] {ts_short} {snippet}"))
-                .style(Style::default().fg(t.text))
-        })
-        .collect();
-
-    let list = List::new(items)
-        .block(
-            RatatuiBlock::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(t.border())
-                .title(Span::styled(
-                    format!(" {} results ", app.search.results.len()),
-                    Style::default().fg(t.text_dim),
-                ))
-                .style(t.overlay()),
-        )
-        .highlight_style(t.selection());
-
-    // Use a stateful list so we can highlight the cursor item.
-    let mut list_state = ratatui::widgets::ListState::default();
-    if !app.search.results.is_empty() {
-        list_state.select(Some(app.search.cursor));
-    }
-    frame.render_stateful_widget(list, results_area, &mut list_state);
-
-    // Populate result_rects for mouse click-to-jump. Each result row is 1 line
-    // tall; the list block has a 1-cell border on each side, so body starts at
-    // results_area.y + 1 (top border) and x = results_area.x + 1 (left border).
-    let inner_x = results_area.x.saturating_add(1);
-    let inner_y = results_area.y.saturating_add(1);
-    let inner_w = results_area.width.saturating_sub(2);
-    app.search.result_rects = app
-        .search
-        .results
-        .iter()
-        .enumerate()
-        .filter_map(|(i, _)| {
-            let row_y = inner_y.checked_add(i as u16)?;
-            if row_y
-                >= results_area
-                    .y
-                    .saturating_add(results_area.height)
-                    .saturating_sub(1)
-            {
-                return None; // clipped by bottom border
-            }
-            Some((i, Rect::new(inner_x, row_y, inner_w, 1)))
-        })
-        .collect();
-}
-
-/// Render the full-screen block stdout pager overlay.
-///
-/// Layout (top-to-bottom):
-///   - Title bar  (1 row): block id + exit code
-///   - Body       (fill):  scrollable stdout lines
-///   - Footer     (1 row): scroll hints + keybinding hint
-fn render_pager(frame: &mut ratatui::Frame, pager: &PagerState, t: &theme::LegacyTheme) {
-    let area = frame.area();
-
-    // Dim the background to indicate a blocking overlay.
-    frame.render_widget(Clear, area);
-
-    let outer = RatatuiBlock::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Double)
-        .border_style(t.border_focus())
-        .style(t.overlay());
-
-    // Build a title that includes the block id and exit code.
-    let exit_label = match pager.exit_code {
-        None => " running ".to_owned(),
-        Some(0) => " exit 0 ".to_owned(),
-        Some(n) => format!(" exit {n} "),
-    };
-    let title_str = format!(" {} |{exit_label}", &pager.block_id);
-
-    let outer_with_title = outer.title(Span::styled(title_str, t.title(t.primary)));
-    let inner = outer_with_title.inner(area);
-    frame.render_widget(outer_with_title, area);
-
-    // Split inner into body + footer.
-    let splits = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(inner);
-    let body_area = splits[0];
-    let footer_area = splits[1];
-
-    let visible_rows = body_area.height as usize;
-
-    // Collect visible lines.
-    let visible: Vec<Line> = pager
-        .lines
-        .iter()
-        .skip(pager.scroll)
-        .take(visible_rows)
-        .map(|l| Line::from(Span::styled(l.as_str(), Style::default().fg(t.text))))
-        .collect();
-
-    let body = Paragraph::new(visible)
-        .style(t.bg_style())
-        .wrap(ratatui::widgets::Wrap { trim: false });
-    frame.render_widget(body, body_area);
-
-    // Scrollbar on the right edge of body_area.
-    let total_lines = pager.len();
-    if total_lines > visible_rows {
-        let mut sb_state =
-            ScrollbarState::new(total_lines.saturating_sub(visible_rows)).position(pager.scroll);
-        frame.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight),
-            body_area,
-            &mut sb_state,
-        );
-    }
-
-    // Footer: hint line.
-    let hint = Paragraph::new(Line::from(vec![
-        Span::styled(" ↑/↓ ", Style::default().fg(t.primary)),
-        Span::styled("scroll  ", Style::default().fg(t.text_dim)),
-        Span::styled("PgUp/PgDn ", Style::default().fg(t.primary)),
-        Span::styled("page  ", Style::default().fg(t.text_dim)),
-        Span::styled("q/Esc ", Style::default().fg(t.primary)),
-        Span::styled("close", Style::default().fg(t.text_dim)),
-    ]))
-    .style(t.bg_style());
-    frame.render_widget(hint, footer_area);
-}
-
 fn state_dot_char(state: pyre_proto::PaneStateKind) -> char {
     use pyre_proto::PaneStateKind::*;
     match state {
@@ -1941,92 +1648,6 @@ fn render_name_prompt(
 /// Layout: centered modal ~60% wide × ~70% tall.
 /// Each row shows: `[kind] display_name  ░ bg ░ fg ░ accent ░ border_focus ░ cursor ░ ok ░ warn ░ error`
 /// Each swatch reflects THAT theme's own palette, not the active theme.
-fn render_theme_picker(frame: &mut ratatui::Frame, state: &AppState, t: &theme::LegacyTheme) {
-    let picker = match state.theme_picker.as_ref() {
-        Some(p) => p,
-        None => return,
-    };
-
-    let reg = Registry::builtin();
-    let themes = reg.list();
-
-    let area = frame.area();
-    let w = (area.width as f32 * 0.60) as u16;
-    let h = (area.height as f32 * 0.70) as u16;
-    let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let overlay_rect = Rect::new(x, y, w.max(40), h.max(8));
-
-    frame.render_widget(Clear, overlay_rect);
-
-    let outer = RatatuiBlock::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Double)
-        .border_style(t.border_focus())
-        .title(Span::styled(
-            " theme picker  ↑/↓ select  Enter apply  Esc cancel ",
-            t.title(t.primary),
-        ))
-        .style(t.overlay());
-    let inner = outer.inner(overlay_rect);
-    frame.render_widget(outer, overlay_rect);
-
-    let visible_rows = inner.height as usize;
-
-    // Scroll window: keep cursor visible.
-    let scroll_top = if picker.cursor >= visible_rows {
-        picker.cursor - visible_rows + 1
-    } else {
-        0
-    };
-
-    for (row_idx, theme_idx) in (scroll_top..).take(visible_rows).enumerate() {
-        let Some(row_theme) = themes.get(theme_idx) else {
-            break;
-        };
-
-        let y_pos = inner.y + row_idx as u16;
-        let is_selected = theme_idx == picker.cursor;
-
-        let kind_badge = match row_theme.kind {
-            pyre_themes::ThemeKind::Dark => "dark ",
-            pyre_themes::ThemeKind::Light => "lite ",
-        };
-
-        // Each swatch uses THAT theme's own palette colours so the user can
-        // see what each theme looks like before committing.
-        let swatch_roles: [ratatui::style::Color; 8] = [
-            row_theme.palette.bg.to_ratatui(),
-            row_theme.palette.fg.to_ratatui(),
-            row_theme.palette.accent.to_ratatui(),
-            row_theme.palette.border_focus.to_ratatui(),
-            row_theme.palette.cursor.to_ratatui(),
-            row_theme.palette.ok.to_ratatui(),
-            row_theme.palette.warn.to_ratatui(),
-            row_theme.palette.error.to_ratatui(),
-        ];
-
-        // Selected row uses active theme's primary/bg; others use active bg/fg.
-        let row_bg = if is_selected { t.primary } else { t.bg };
-        let row_fg = if is_selected { t.bg } else { t.text };
-
-        let label = format!("{kind_badge}{}", row_theme.display_name);
-        let mut spans: Vec<Span> = vec![Span::styled(
-            format!(" {label:<28} "),
-            Style::default().fg(row_fg).bg(row_bg),
-        )];
-
-        for swatch in &swatch_roles {
-            spans.push(Span::styled("░", Style::default().fg(*swatch).bg(row_bg)));
-        }
-        spans.push(Span::styled(" ", Style::default().bg(row_bg)));
-
-        frame.render_widget(
-            ratatui::widgets::Paragraph::new(Line::from(spans)),
-            Rect::new(inner.x, y_pos, inner.width, 1),
-        );
-    }
-}
 
 /// Render the right-click context menu overlay.
 ///
@@ -2085,73 +1706,6 @@ fn render_context_menu(frame: &mut ratatui::Frame, state: &mut AppState, t: &the
     if let Some(ref mut m) = state.context_menu {
         m.item_rects = new_item_rects;
     }
-}
-
-/// Render a centered "Session ended" overlay.
-///
-/// Drawn when `state.session_lost == true` — all pane slots for the active
-/// session's active tab are None (daemon evicted the session). Covers the
-/// entire frame so the blank pane area is not visible.
-fn render_session_lost_overlay(frame: &mut ratatui::Frame, t: &theme::LegacyTheme) {
-    let area = frame.area();
-    // Clear the whole frame first.
-    frame.render_widget(RatatuiBlock::default().style(t.bg_style()), area);
-
-    let w: u16 = 52;
-    let h: u16 = 5;
-    let x = area.x + area.width.saturating_sub(w) / 2;
-    let y = area.y + area.height.saturating_sub(h) / 2;
-    let overlay_rect = Rect::new(x, y, w.min(area.width), h.min(area.height));
-
-    frame.render_widget(Clear, overlay_rect);
-
-    let block = RatatuiBlock::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(t.text_dim))
-        .title(Span::styled(
-            " session ended ",
-            Style::default().fg(t.text_dim),
-        ))
-        .style(t.bg_style());
-    let inner = block.inner(overlay_rect);
-    frame.render_widget(block, overlay_rect);
-
-    let splits = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1)])
-        .split(inner);
-
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![Span::styled(
-            "All panes closed.",
-            Style::default().fg(t.text_dim),
-        )]))
-        .style(t.bg_style()),
-        splits[0],
-    );
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("Press ", Style::default().fg(t.text_dim)),
-            Span::styled(
-                "q",
-                Style::default().fg(t.primary).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" / ", Style::default().fg(t.text_dim)),
-            Span::styled(
-                "Esc",
-                Style::default().fg(t.primary).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" / ", Style::default().fg(t.text_dim)),
-            Span::styled(
-                "Ctrl-C",
-                Style::default().fg(t.primary).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" to quit.", Style::default().fg(t.text_dim)),
-        ]))
-        .style(t.bg_style()),
-        splits[1],
-    );
 }
 
 fn draw_frame(
@@ -2661,13 +2215,14 @@ fn draw_frame(
             state.pager_rect = Some(pager_full);
         } else {
             state.pager_rect = None;
-            if state.theme_picker.is_some() {
-                render_theme_picker(frame, state, &t);
+            if let Some(ref picker) = state.theme_picker {
+                render_theme_picker(frame, picker, &t);
             } else if let Some(ref prompt) = state.prompt {
                 render_name_prompt(frame, prompt, state.anim.frame(), &t);
             } else if state.search.open {
                 // Search overlay — drawn on top of everything else and owns cursor.
-                render_search_overlay(frame, state, &t);
+                let anim_frame = state.anim.frame();
+                render_search_overlay(frame, &mut state.search, anim_frame, &t);
             }
         }
 
