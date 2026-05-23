@@ -2,6 +2,7 @@
 //!
 //! Extracted from `draw_frame` in main.rs (Wave 1D refactor).
 
+use crate::app::sessions::session_is_live;
 use crate::fire_motion;
 use crate::theme;
 use crate::AppState;
@@ -38,6 +39,13 @@ pub fn render_session_strip(
     let mut pill_items: Vec<PillItem> = Vec::new();
     let anim_f = state.anim.frame();
     for (i, sv) in state.sessions.iter().enumerate() {
+        // I-5: skip stale sessions — those whose all pane slots are dead.
+        // Rendering a stale session as a clickable pill lets the user switch to
+        // a blank pane area with no live PTY, violating the invariant that every
+        // pill in the strip points to a renderable session.
+        if !session_is_live(sv, &state.slots) {
+            continue;
+        }
         let rollup = session_worst_pane(&state.sidebar_data, sv.id);
         let rollup_tag = rollup
             .map(|p| format!(":{}", agent_ui_label(p.state, p.seen)))
