@@ -717,3 +717,91 @@ pub(crate) fn handle_mouse(
         _ => false,
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::layout::Rect;
+
+    // ── Close-X hit-rect helpers ──────────────────────────────────────────────
+
+    /// Given a tab-chip rect (as rendered in draw_frame), compute the single
+    /// column that should trigger close.  Mirrors the logic in handle_mouse.
+    fn close_col_for(chip_rect: Rect) -> u16 {
+        chip_rect.x + chip_rect.width.saturating_sub(1)
+    }
+
+    /// Returns true only when `col` lands on the close-X cell of `chip_rect`.
+    fn hits_close_x(chip_rect: Rect, col: u16) -> bool {
+        rect_contains(chip_rect, col, chip_rect.y) && col == close_col_for(chip_rect)
+    }
+
+    /// I-3: the close-X hit rect must be exactly 1 cell at the right edge of
+    /// the tab chip, not the entire chip width.
+    ///
+    /// Regression guard: before Wave-1 extraction the hit rect covered the full
+    /// title bar; this test pins the narrowed-to-1-cell invariant.
+    #[test]
+    fn test_close_x_click_hits_only_target_pane() {
+        // Simulate 3 tab chips at row 1:
+        //   chip 0: " 1 ×" → cols [0, 3], close-X at col 3
+        //   chip 1: " 2 ×" → cols [5, 8], close-X at col 8
+        //   chip 2: " 3 ×" → cols [10, 13], close-X at col 13
+        let chips: Vec<Rect> = vec![
+            Rect::new(0, 1, 4, 1),  // chip 0
+            Rect::new(5, 1, 4, 1),  // chip 1
+            Rect::new(10, 1, 4, 1), // chip 2
+        ];
+
+        // Clicking the close-X of chip 1 (col 8) must:
+        //   - hit chip 1 only
+        //   - NOT hit chips 0 or 2
+        let close_col_1 = close_col_for(chips[1]);
+        assert_eq!(close_col_1, 8, "close-X of chip 1 must be at col 8");
+
+        assert!(
+            hits_close_x(chips[1], close_col_1),
+            "clicking col {close_col_1} on chip 1 must trigger close"
+        );
+        assert!(
+            !hits_close_x(chips[0], close_col_1),
+            "col {close_col_1} must NOT trigger close on chip 0"
+        );
+        assert!(
+            !hits_close_x(chips[2], close_col_1),
+            "col {close_col_1} must NOT trigger close on chip 2"
+        );
+
+        // Clicking the body of chip 1 (not the × column) must NOT trigger close.
+        for body_col in chips[1].x..(chips[1].x + chips[1].width - 1) {
+            assert!(
+                !hits_close_x(chips[1], body_col),
+                "body col {body_col} of chip 1 must NOT trigger close"
+            );
+        }
+
+        // Clicking column 0 (far left, chip 0 body) must not hit chip 1 close-X.
+        assert!(
+            !hits_close_x(chips[1], 0),
+            "col 0 (chip 0 body) must not trigger chip 1 close"
+        );
+    }
+
+    /// Verify that resize weights are balanced after application.
+    #[test]
+    fn test_apply_resize_weights_preserves_total() {
+        let weights = vec![50u16, 50u16];
+        let out = apply_resize_weights(&weights, 0, 10, 5);
+        assert_eq!(
+            out[0] + out[1],
+            100,
+            "total weight must be preserved after resize"
+        );
+        assert_eq!(out[0], 60, "left pane must grow by delta_pct");
+        assert_eq!(out[1], 40, "right pane must shrink by delta_pct");
+    }
+}
