@@ -1,12 +1,12 @@
+use crate::fire_motion;
 use crate::theme;
 use crate::AppState;
-use crate::fire_motion;
 use pyre_proto::PaneStateKind;
 use ratatui::layout::Rect;
+use ratatui::style::Color;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block as RatatuiBlock, BorderType, Borders, List, ListItem};
-use ratatui::style::Color;
 
 /// Map a pane state to the dot character used in the sidebar and status rollup.
 pub(crate) fn state_dot_char(state: PaneStateKind) -> char {
@@ -48,10 +48,10 @@ pub(crate) fn agent_ui_label(state: PaneStateKind, seen: bool) -> &'static str {
 }
 
 /// Worst pane in a session (for session-strip rollup).
-pub(crate) fn session_worst_pane<'a>(
-    sidebar: &'a [pyre_proto::PaneInfo],
+pub(crate) fn session_worst_pane(
+    sidebar: &[pyre_proto::PaneInfo],
     session_id: pyre_proto::SessionId,
-) -> Option<&'a pyre_proto::PaneInfo> {
+) -> Option<&pyre_proto::PaneInfo> {
     use PaneStateKind::*;
     let rank = |s: PaneStateKind| -> u8 {
         match s {
@@ -106,17 +106,16 @@ pub(crate) fn render_sidebar(
             let dot = state_dot_char(info.state);
             let anim_f = state.anim.frame();
             let seed = info.id.0.as_u128() as u32;
-            let dot_color =
-                if info.state == PaneStateKind::WaitingInput && !info.seen {
-                    let p = fire_motion::pulse_phase(anim_f, seed, 9.0);
-                    fire_motion::lerp_rgb(
-                        fire_motion::rgb_tuple(state_dot_color(info.state, t)),
-                        fire_motion::rgb_tuple(t.secondary),
-                        p * 0.55,
-                    )
-                } else {
-                    state_dot_color(info.state, t)
-                };
+            let dot_color = if info.state == PaneStateKind::WaitingInput && !info.seen {
+                let p = fire_motion::pulse_phase(anim_f, seed, 9.0);
+                fire_motion::lerp_rgb(
+                    fire_motion::rgb_tuple(state_dot_color(info.state, t)),
+                    fire_motion::rgb_tuple(t.secondary),
+                    p * 0.55,
+                )
+            } else {
+                state_dot_color(info.state, t)
+            };
             let label = agent_ui_label(info.state, info.seen);
             let agent = info.agent.label();
             let id_str = info.id.0.to_string();

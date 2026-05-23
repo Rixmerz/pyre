@@ -7,9 +7,7 @@ use crate::theme;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Block as RatatuiBlock, BorderType, Borders, Clear, Paragraph,
-};
+use ratatui::widgets::{Block as RatatuiBlock, BorderType, Borders, Clear, Paragraph};
 
 pub fn render_toast_deck(frame: &mut ratatui::Frame, deck: &ToastDeck, t: &theme::LegacyTheme) {
     if !deck.enabled || deck.toasts.is_empty() {
