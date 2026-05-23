@@ -182,19 +182,3 @@ impl PaneSlot {
         self.event_proxy.drain()
     }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// PaneInit — how a pane is initialised at startup
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// How the TUI should initialise its first pane on startup.
-pub enum PaneInit {
-    /// Session and pane already exist (e.g. `pyre attach`).
-    Existing {
-        session: pyre_proto::SessionId,
-        session_name: String,
-        pane: PaneId,
-    },
-    /// No sessions exist (or all existing sessions are stale); spawn a fresh session+pane at real terminal size.
-    Spawn,
-}

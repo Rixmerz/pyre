@@ -9,15 +9,14 @@ use tokio::sync::{mpsc, watch};
 
 use crate::app::sessions::SessionView;
 use crate::fire_motion::AnimClock;
+use crate::model::context_menu::ContextMenu;
 use crate::model::pane::PaneSlot;
+use crate::model::prompt::NamePrompt;
 use crate::model::selection::{ClickTracker, Selection};
 use crate::model::toast::{Toast, ToastDeck};
 use crate::render::overlay::pager::PagerState;
 use crate::render::overlay::picker::ThemePickerState;
 use crate::render::overlay::search::SearchState;
-// ContextMenu, NamePrompt, PromptKind, MenuItem, MENU_ITEMS remain in main.rs
-// and are referenced via crate:: in the modules that need them.
-use crate::{ContextMenu, NamePrompt};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Deferred async actions

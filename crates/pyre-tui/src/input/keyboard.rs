@@ -14,12 +14,44 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use pyre_themes::Registry;
 use ratatui::layout::Rect;
 
+use bytes::Bytes;
+
 use crate::render::overlay::pager::PagerState;
 use crate::{
-    close_pane_by_slot_idx, focused_slot_idx, key_to_bytes, open_new_session, open_new_tab,
-    pane_leaves_in_order, pane_to_slot_idx, split_active, AppState, MenuItem, PromptKind,
-    MENU_ITEMS,
+    close_pane_by_slot_idx, focused_slot_idx, open_new_session, open_new_tab, pane_leaves_in_order,
+    pane_to_slot_idx, split_active, AppState, MenuItem, PromptKind, MENU_ITEMS,
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Key serialization
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub(crate) fn key_to_bytes(code: KeyCode, modifiers: KeyModifiers) -> Option<Bytes> {
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        if let KeyCode::Char(c) = code {
+            let byte = (c.to_ascii_lowercase() as u8) & 0x1f;
+            return Some(Bytes::copy_from_slice(&[byte]));
+        }
+    }
+
+    let bytes: &[u8] = match code {
+        KeyCode::Char(c) => {
+            let mut buf = [0u8; 4];
+            let s = c.encode_utf8(&mut buf);
+            return Some(Bytes::copy_from_slice(s.as_bytes()));
+        }
+        KeyCode::Enter => b"\r",
+        KeyCode::Backspace => b"\x7f",
+        KeyCode::Tab => b"\t",
+        KeyCode::Esc => b"\x1b",
+        KeyCode::Up => b"\x1b[A",
+        KeyCode::Down => b"\x1b[B",
+        KeyCode::Right => b"\x1b[C",
+        KeyCode::Left => b"\x1b[D",
+        _ => return None,
+    };
+    Some(Bytes::copy_from_slice(bytes))
+}
 
 use super::prefix::{handle_prefix_key, PrefixAction};
 
