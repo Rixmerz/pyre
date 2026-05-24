@@ -129,31 +129,31 @@ pyrec display-message "hello from script"
 | `tmux select-pane -t <pane>` | `pyrec select-pane -t <pane>` (requires running `pyre` TUI) |
 | `tmux display-message "msg"` | `pyrec display-message "msg"` |
 | `tmux attach-session -t <session>` | `pyrec attach <session>` |
-| `tmux detach-client` | `Ctrl-B d` in `pyre`, or close the pyrec process |
+| `tmux detach-client` | `Ctrl-Space d` in `pyre`, or close the pyrec process |
 
 ---
 
 ## pyre key bindings
 
-### Prefix: `Ctrl-B`
+### Prefix: `Ctrl-Space`
 
 | Binding | Action |
 |---------|--------|
-| `Ctrl-B c` | Open new pane in current session |
-| `Ctrl-B n` | Focus next pane |
-| `Ctrl-B p` | Focus previous pane |
-| `Ctrl-B "` | Horizontal split (new pane below) |
-| `Ctrl-B %` | Vertical split (new pane right) |
-| `Ctrl-B q` | Close current pane |
-| `Ctrl-B y` | Copy current pane scrollback to clipboard |
-| `Ctrl-B z` | Toggle zoom (fullscreen) on current pane |
-| `Ctrl-B s` | Open block search dialog (Tantivy) |
-| `Ctrl-B [` | Enter scroll mode |
-| `Ctrl-B ]` | Exit scroll mode |
-| `Ctrl-B d` | Detach (leave daemon running, exit TUI) |
-| `Ctrl-B ?` | Show key binding help overlay |
-| `Ctrl-B T` | Open theme picker overlay (live switch, persists to config) |
-| `Ctrl-B N` | Toggle toast notifications on/off |
+| `Ctrl-Space c` | Open new pane in current session |
+| `Ctrl-Space n` | Focus next pane |
+| `Ctrl-Space p` | Focus previous pane |
+| `Ctrl-Space "` | Horizontal split (new pane below) |
+| `Ctrl-Space %` | Vertical split (new pane right) |
+| `Ctrl-Space q` | Close current pane |
+| `Ctrl-Space y` | Copy current pane scrollback to clipboard |
+| `Ctrl-Space z` | Toggle zoom (fullscreen) on current pane |
+| `Ctrl-Space s` | Open block search dialog (Tantivy) |
+| `Ctrl-Space [` | Enter scroll mode |
+| `Ctrl-Space ]` | Exit scroll mode |
+| `Ctrl-Space d` | Detach (leave daemon running, exit TUI) |
+| `Ctrl-Space ?` | Show key binding help overlay |
+| `Ctrl-Space T` | Open theme picker overlay (live switch, persists to config) |
+| `Ctrl-Space N` | Toggle toast notifications on/off |
 
 ### Scroll mode
 
@@ -268,7 +268,7 @@ palettes: `catppuccin-mocha`, `catppuccin-latte`, `tokyo-night`,
 
 ### Live picker
 
-`Ctrl-B T` opens the theme picker overlay inside `pyre`.
+`Ctrl-Space T` opens the theme picker overlay inside `pyre`.
 
 | Key | Action |
 |-----|--------|
@@ -302,13 +302,13 @@ deck suppresses high-frequency transitions (`Idle`, `Running`) — only
 
 | Binding | Action |
 |---------|--------|
-| `Ctrl-B N` | Toggle the deck on / off |
+| `Ctrl-Space N` | Toggle the deck on / off |
 
 ### Config
 
 ```toml
 [ui.notifications]
-enabled     = true   # master toggle (matches Ctrl-B N initial state)
+enabled     = true   # master toggle (matches Ctrl-Space N initial state)
 ttl_ms      = 4000   # per-toast lifetime
 max_visible = 5      # cap on simultaneous toasts; oldest evicted first
 ```

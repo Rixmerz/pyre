@@ -154,7 +154,7 @@ pub(crate) async fn run_tui(
 
     let mut initial_slot = attach_pane(&socket, session, pane, init_cols, init_rows).await?;
 
-    // Pre-populate the block ribbon for the initial pane so that Ctrl-B [
+    // Pre-populate the block ribbon for the initial pane so that Ctrl-Space [
     // shows previous command history immediately on reattach (S3).
     match tokio::time::timeout(
         Duration::from_secs(2),

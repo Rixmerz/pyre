@@ -48,7 +48,7 @@ impl Toast {
 pub struct ToastDeck {
     pub toasts: std::collections::VecDeque<Toast>,
     pub max_visible: usize,
-    /// Whether toast display is enabled (toggleable via Ctrl-B N).
+    /// Whether toast display is enabled (toggleable via Ctrl-Space N).
     pub enabled: bool,
     /// TTL applied to new toasts.
     pub ttl: Duration,

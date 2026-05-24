@@ -834,7 +834,7 @@ mod tests {
     /// the sibling pane survives, the session is not removed, and
     /// `sessions.is_empty()` remains false (no should_quit).
     ///
-    /// This is the primary regression guard for the Ctrl-B+x / close-X bug:
+    /// This is the primary regression guard for the Ctrl-Space+x / close-X bug:
     /// before the fix, the `LayoutNode::close` single-leaf path left a zombie
     /// leaf in the tree after the SECOND pane was closed, preventing tab
     /// removal and causing `session_lost` to fire spuriously.

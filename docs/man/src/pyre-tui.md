@@ -22,7 +22,7 @@ cell in a grid layout. The block ribbon at the bottom shows recent command
 blocks for the focused pane.
 
 pyre is mouse-first: click to focus a pane, scroll to navigate output.
-Keyboard control uses the Ctrl-B prefix, consistent with tmux muscle memory.
+Keyboard control uses the Ctrl-Space prefix, consistent with tmux muscle memory.
 
 # OPTIONS
 
@@ -37,45 +37,45 @@ Keyboard control uses the Ctrl-B prefix, consistent with tmux muscle memory.
 
 # KEY BINDINGS
 
-## Prefix: Ctrl-B
+## Prefix: Ctrl-Space
 
-**Ctrl-B c**
+**Ctrl-Space c**
 : Open a new pane in the current session.
 
-**Ctrl-B n**
+**Ctrl-Space n**
 : Focus the next pane.
 
-**Ctrl-B p**
+**Ctrl-Space p**
 : Focus the previous pane.
 
-**Ctrl-B "**
+**Ctrl-Space "**
 : Horizontal split (new pane below).
 
-**Ctrl-B %**
+**Ctrl-Space %**
 : Vertical split (new pane right).
 
-**Ctrl-B q**
+**Ctrl-Space q**
 : Close the current pane.
 
-**Ctrl-B y**
+**Ctrl-Space y**
 : Copy pane scrollback to system clipboard.
 
-**Ctrl-B z**
+**Ctrl-Space z**
 : Toggle zoom (fullscreen) on current pane.
 
-**Ctrl-B s**
+**Ctrl-Space s**
 : Open block search dialog.
 
-**Ctrl-B [**
+**Ctrl-Space [**
 : Enter scroll mode.
 
-**Ctrl-B ]**
+**Ctrl-Space ]**
 : Exit scroll mode.
 
-**Ctrl-B d**
+**Ctrl-Space d**
 : Detach (leave daemon running, exit pyre).
 
-**Ctrl-B ?**
+**Ctrl-Space ?**
 : Show key binding help overlay.
 
 ## Scroll mode

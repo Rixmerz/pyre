@@ -6,7 +6,7 @@ use ratatui::widgets::{Block as RatatuiBlock, BorderType, Borders, Clear, Paragr
 
 use crate::theme;
 
-/// State for the theme picker overlay (Ctrl-B T).
+/// State for the theme picker overlay (Ctrl-Space T).
 pub struct ThemePickerState {
     /// Index of the currently highlighted theme in the registry list.
     pub cursor: usize,

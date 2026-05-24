@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use crate::fire_motion;
 use crate::theme;
 
-/// State for the full-text search overlay (Ctrl-B /).
+/// State for the full-text search overlay (Ctrl-Space /).
 pub struct SearchState {
     pub open: bool,
     pub input: String,

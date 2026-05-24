@@ -144,7 +144,7 @@ Valid values (18 built-in palettes):
 | `terminal` | follows terminal palette |
 | `ember` | dark (pyre default) |
 
-Unknown names fall back to `ember`. In `pyre-tui`, `Ctrl-B T` opens
+Unknown names fall back to `ember`. In `pyre-tui`, `Ctrl-Space T` opens
 a live picker that mutates the active theme and rewrites this key on
 disk. `pyre-gpu` reads the key at startup; live switch is TUI-only
 for now.
@@ -157,12 +157,12 @@ are suppressed.
 
 ```toml
 [ui.notifications]
-enabled     = true   # master toggle; matches Ctrl-B N initial state
+enabled     = true   # master toggle; matches Ctrl-Space N initial state
 ttl_ms      = 4000   # per-toast lifetime in milliseconds
 max_visible = 5      # cap on simultaneous toasts; oldest evicted first
 ```
 
-`Ctrl-B N` flips `enabled` at runtime. M2 of the v0.2 UX sprint
+`Ctrl-Space N` flips `enabled` at runtime. M2 of the v0.2 UX sprint
 extends this with desktop bridges (`notify-send` / D-Bus on Linux,
 `osascript` on macOS) and per-kind routing — in flight, not landed.
 

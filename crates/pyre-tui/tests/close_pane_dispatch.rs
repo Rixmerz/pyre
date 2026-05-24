@@ -1,6 +1,6 @@
 //! Integration tests for the close-pane dispatch path.
 //!
-//! These tests exercise the two components that together fix the Ctrl-B+x /
+//! These tests exercise the two components that together fix the Ctrl-Space+x /
 //! close-X bug:
 //!
 //! 1. `LayoutNode::close` — single-leaf early-return guard (pyre-proto).

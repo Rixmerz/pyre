@@ -1,7 +1,7 @@
-//! Ctrl-B prefix key handler — extracted from run_tui event loop (Wave 1E).
+//! Ctrl-Space prefix key handler — extracted from run_tui event loop (Wave 1E).
 //!
 //! The prefix state machine is a single boolean (`prefix_active`) local to the
-//! event loop. When Ctrl-B is detected the flag is set; on the next key event
+//! event loop. When Ctrl-Space is detected the flag is set; on the next key event
 //! this module dispatches the bound action and returns `PrefixAction` so the
 //! caller knows whether to `continue` the loop or `break` (quit).
 
@@ -20,11 +20,11 @@ use crate::{
 pub(crate) enum PrefixAction {
     /// Action executed; caller should `continue` the event loop.
     Continue,
-    /// Quit requested (Ctrl-B q or Ctrl-B x with no sessions left).
+    /// Quit requested (Ctrl-Space q or Ctrl-Space x with no sessions left).
     Quit,
 }
 
-/// Handle one key following a Ctrl-B prefix.
+/// Handle one key following a Ctrl-Space prefix.
 ///
 /// The caller must clear `prefix_active` before calling this. The function
 /// handles the entire prefix match and returns a `PrefixAction` so the caller
@@ -107,7 +107,7 @@ pub(crate) async fn handle_prefix_key(state: &mut AppState, code: KeyCode) -> Pr
             state.status_msg = None;
         }
 
-        // Zoom toggle (Ctrl-B z)
+        // Zoom toggle (Ctrl-Space z)
         KeyCode::Char('z') => {
             let sv = state.active_session_view_mut();
             let tab = &mut sv.tabs[sv.active_tab];
@@ -118,7 +118,7 @@ pub(crate) async fn handle_prefix_key(state: &mut AppState, code: KeyCode) -> Pr
             }
         }
 
-        // Copy last block stdout to clipboard (Ctrl-B y)
+        // Copy last block stdout to clipboard (Ctrl-Space y)
         KeyCode::Char('y') => {
             let sv = &state.sessions[state.active_session];
             let tab = &sv.tabs[sv.active_tab];
@@ -157,7 +157,7 @@ pub(crate) async fn handle_prefix_key(state: &mut AppState, code: KeyCode) -> Pr
             }
         }
 
-        // Close focused pane (Ctrl-B x)
+        // Close focused pane (Ctrl-Space x)
         KeyCode::Char('x') => {
             close_focused_pane(state);
             // If all sessions are gone, exit the TUI loop.
@@ -166,7 +166,7 @@ pub(crate) async fn handle_prefix_key(state: &mut AppState, code: KeyCode) -> Pr
             }
         }
 
-        // Toggle sidebar (Ctrl-B s)
+        // Toggle sidebar (Ctrl-Space s)
         KeyCode::Char('s') => {
             state.sidebar_open = !state.sidebar_open;
             if state.sidebar_open {
@@ -177,7 +177,7 @@ pub(crate) async fn handle_prefix_key(state: &mut AppState, code: KeyCode) -> Pr
             }
         }
 
-        // New session (Ctrl-B S — uppercase to avoid collision with Ctrl-B s sidebar)
+        // New session (Ctrl-Space S — uppercase to avoid collision with Ctrl-Space s sidebar)
         KeyCode::Char('S') => {
             state.prompt = Some(NamePrompt {
                 kind: PromptKind::NewSession,
@@ -185,7 +185,7 @@ pub(crate) async fn handle_prefix_key(state: &mut AppState, code: KeyCode) -> Pr
             });
         }
 
-        // Theme picker (Ctrl-B T — uppercase to avoid collision with lower-t)
+        // Theme picker (Ctrl-Space T — uppercase to avoid collision with lower-t)
         KeyCode::Char('T') => {
             let reg = Registry::builtin();
             let names: Vec<&'static str> = reg.list().iter().map(|t| t.name).collect();
@@ -203,7 +203,7 @@ pub(crate) async fn handle_prefix_key(state: &mut AppState, code: KeyCode) -> Pr
             });
         }
 
-        // Rename active session (Ctrl-B , — mirrors tmux rename-session)
+        // Rename active session (Ctrl-Space , — mirrors tmux rename-session)
         KeyCode::Char(',') => {
             let sv = &state.sessions[state.active_session];
             let current_name = sv.name.clone();
@@ -214,7 +214,7 @@ pub(crate) async fn handle_prefix_key(state: &mut AppState, code: KeyCode) -> Pr
             });
         }
 
-        // Toggle toast notifications (Ctrl-B N)
+        // Toggle toast notifications (Ctrl-Space N)
         KeyCode::Char('N') => {
             state.toast_deck.enabled = !state.toast_deck.enabled;
             let label = if state.toast_deck.enabled {

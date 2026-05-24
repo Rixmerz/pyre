@@ -15,7 +15,7 @@ Daemon-owned terminal multiplexer with block-level history, full-text search, an
 - **Full-text search** — Tantivy indexes all block output; `pyrec search <query>` returns ranked hits with snippets in milliseconds.
 - **Agent state monitoring** — a dedicated state tracker classifies each pane as idle, running, waiting for input, or error; exposed via the MCP server.
 - **MCP server (`pyre-mcp`)** — seven tools: `session_spawn`, `session_close`, `pane_open`, `pane_send_keys`, `pane_capture`, `pane_set_state`, `block_search`. Sessions, panes, and blocks are also exposed as MCP resources.
-- **Mouse-first TUI** — ratatui + crossterm, mouse click-to-focus, scroll wheel. Ships with 18 built-in palettes via the `pyre-themes` registry; switch live with `Ctrl-B T`.
+- **Mouse-first TUI** — ratatui + crossterm, mouse click-to-focus, scroll wheel. Ships with 18 built-in palettes via the `pyre-themes` registry; switch live with `Ctrl-Space T`.
 - **Pyre fire motion** — startup splash and in-TUI accents use a shared procedural fire engine (`fire_motion.rs`): no animation libraries, no sprite packs. Blocked agents pulse like embers on the same palette as the launch animation.
 - **tmux-compatible CLI** — `pyrec` accepts `list-sessions`, `new-session`, `kill-session`, `send-keys`, `split-window`, and more.
 - **Clipboard integration** — `pyrec capture-pane --copy` copies output to the system clipboard via `wl-copy` (Wayland) or `xclip` (X11).
@@ -88,27 +88,27 @@ See [docs/adr/0003-render-backend.md](docs/adr/0003-render-backend.md).
 
 ## Key bindings (pyre)
 
-Prefix: `Ctrl-B`
+Prefix: `Ctrl-Space`
 
 | Keys | Action |
 |------|--------|
-| `Ctrl-B q` | Quit / detach |
-| `Ctrl-B c` | New pane in current session |
-| `Ctrl-B x` | Close current pane |
-| `Ctrl-B n` | Next tab |
-| `Ctrl-B p` | Previous tab |
-| `Ctrl-B "` | Horizontal split |
-| `Ctrl-B %` | Vertical split |
+| `Ctrl-Space q` | Quit / detach |
+| `Ctrl-Space c` | New pane in current session |
+| `Ctrl-Space x` | Close current pane |
+| `Ctrl-Space n` | Next tab |
+| `Ctrl-Space p` | Previous tab |
+| `Ctrl-Space "` | Horizontal split |
+| `Ctrl-Space %` | Vertical split |
 | Arrow keys | Move focus between panes |
-| `Ctrl-B [` | Enter scrollback mode |
-| `Ctrl-B ]` | Exit scrollback mode |
-| `Ctrl-B /` | Search blocks (Tantivy query dialog) |
-| `Ctrl-B z` | Zoom (toggle fullscreen) current pane |
-| `Ctrl-B y` | Copy last block stdout to clipboard |
-| `Ctrl-B s` | Toggle sidebar |
-| `Ctrl-B S` | New session |
-| `Ctrl-B T` | Open theme picker overlay (live switch across 18 palettes) |
-| `Ctrl-B N` | Toggle toast notifications on/off |
+| `Ctrl-Space [` | Enter scrollback mode |
+| `Ctrl-Space ]` | Exit scrollback mode |
+| `Ctrl-Space /` | Search blocks (Tantivy query dialog) |
+| `Ctrl-Space z` | Zoom (toggle fullscreen) current pane |
+| `Ctrl-Space y` | Copy last block stdout to clipboard |
+| `Ctrl-Space s` | Toggle sidebar |
+| `Ctrl-Space S` | New session |
+| `Ctrl-Space T` | Open theme picker overlay (live switch across 18 palettes) |
+| `Ctrl-Space N` | Toggle toast notifications on/off |
 | `PgUp` / `PgDn` | Scroll in scrollback mode |
 | Mouse click | Focus pane under cursor |
 | Mouse wheel | Scroll output |
@@ -120,13 +120,13 @@ Assumes binaries are built and `pyred` is not already running.
 
 1. `pyred &` — start the daemon in single-process mode (default). Use `pyred --config <path>` with `process_model = "hybrid"` for the supervisor model.
 2. `pyre` — launch the TUI; a fresh session opens automatically (the daemon spawns a default pane).
-3. `Ctrl-B "` — horizontal split; a second pane appears below the first.
+3. `Ctrl-Space "` — horizontal split; a second pane appears below the first.
 4. Type `echo hello && sleep 1 && echo done` in the lower pane and press Enter; wait for the block to finish (exit badge `b<id>` appears in the ribbon).
-5. `Ctrl-B [` — enter block ribbon mode on the focused pane; `←`/`→` (or `h`/`l`) move the cursor between recent blocks.
+5. `Ctrl-Space [` — enter block ribbon mode on the focused pane; `←`/`→` (or `h`/`l`) move the cursor between recent blocks.
 6. Press `Enter` on a block — the modal pager opens showing the full stdout. `↑`/`↓` or `PgUp`/`PgDn` scroll; `q` or `Esc` closes.
 7. In a second terminal: `pyrec search "hello"` — confirm the block is indexed (output includes a snippet line).
-8. Back in the TUI: `Ctrl-B /` — open the search overlay; type `hello`; `↑`/`↓` navigate hits; `Enter` jumps focus to the source pane and highlights the block in the ribbon.
-9. `Ctrl-B y` — copy the last block's stdout to the clipboard (requires `wl-copy` on Wayland or `xclip` on X11).
+8. Back in the TUI: `Ctrl-Space /` — open the search overlay; type `hello`; `↑`/`↓` navigate hits; `Enter` jumps focus to the source pane and highlights the block in the ribbon.
+9. `Ctrl-Space y` — copy the last block's stdout to the clipboard (requires `wl-copy` on Wayland or `xclip` on X11).
 10. `pyrec kill-session <session-id>` (UUID prefix accepted) — close the session cleanly; `pyrec sessions` should return an empty list.
 
 Note: `pyrec wait-pane --pane <pane-id> --state waiting` can be used in step 5 instead of watching the TUI — it returns as soon as the pane transitions to `WaitingInput` (or the shell prompt reappears with OSC 133 integration installed).
@@ -169,7 +169,7 @@ palettes ship today:
 `solarized-light`, `kanagawa`, `rose-pine`, `rose-pine-dawn`, `vesper`, `nord`,
 `dracula`, `terminal`, `ember`.
 
-- Open the live picker with `Ctrl-B T` in `pyre` — `↑`/`↓` (or `j`/`k`) navigate,
+- Open the live picker with `Ctrl-Space T` in `pyre` — `↑`/`↓` (or `j`/`k`) navigate,
   `Enter` applies and persists, `Esc` cancels.
 - Set the startup default in `$XDG_CONFIG_HOME/pyre/config.toml`:
 
@@ -189,7 +189,7 @@ Pane lifecycle events (spawn, close, state change to `WaitingInput` / `Done` /
 `Crashed`) surface as toast cards rendered bottom-right of the TUI. Idle and
 running transitions are suppressed to avoid spam.
 
-- Toggle on/off at runtime with `Ctrl-B N`.
+- Toggle on/off at runtime with `Ctrl-Space N`.
 - Configure defaults under `[ui.notifications]` in `config.toml` (see
   [docs/CONFIG.md](docs/CONFIG.md)).
 

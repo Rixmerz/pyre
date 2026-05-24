@@ -356,8 +356,12 @@ pub(crate) async fn handle_key(
         return KeyAction::Continue;
     }
 
-    // Detect Ctrl-B prefix.
-    if !*prefix_active && mods.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('b'))
+    // Detect Ctrl-Space prefix.
+    // Crossterm canonically delivers Ctrl-Space as Char(' ') + CONTROL, but
+    // some terminals send it as KeyCode::Null + CONTROL — accept both.
+    if !*prefix_active
+        && mods.contains(KeyModifiers::CONTROL)
+        && (matches!(code, KeyCode::Char(' ')) || matches!(code, KeyCode::Null))
     {
         *prefix_active = true;
         return KeyAction::Continue;
