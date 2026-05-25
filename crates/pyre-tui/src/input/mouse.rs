@@ -483,7 +483,11 @@ pub(crate) fn handle_mouse(
 
                     // ── Multi-click text selection ─────────────────────────────
                     if let Some(slot) = state.slots[slot_idx].as_ref() {
-                        let content = slot.last_screen_rect;
+                        let content = if slot.last_screen_rect.area() > 0 {
+                            slot.last_screen_rect
+                        } else {
+                            rect
+                        };
                         if rect_contains(content, col, row) {
                             let sel_row = row.saturating_sub(content.y);
                             let sel_col = col.saturating_sub(content.x);
