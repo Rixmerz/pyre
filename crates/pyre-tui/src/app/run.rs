@@ -253,6 +253,9 @@ pub(crate) async fn run_tui(
     let mut loop_bytes_processed: u64 = 0;
     let mut loop_stats_at = Instant::now();
 
+    let init_size = terminal.size()?;
+    let mut last_known_size: (u16, u16) = (init_size.width, init_size.height);
+
     loop {
         // Drain pane output into parsers and scrollback buffers.
         let mut closed_slots: Vec<(usize, u64)> = Vec::new();
@@ -990,8 +993,13 @@ pub(crate) async fn run_tui(
             }
 
             Event::Resize(new_cols, new_rows) => {
-                terminal.clear()?;
-                tracing::debug!("terminal resized to {new_cols}x{new_rows}");
+                if (new_cols, new_rows) != last_known_size {
+                    last_known_size = (new_cols, new_rows);
+                    terminal.clear()?;
+                    tracing::debug!(new_cols, new_rows, "terminal genuinely resized; cleared");
+                } else {
+                    tracing::trace!(new_cols, new_rows, "spurious resize event (same size); skip clear");
+                }
             }
 
             _ => {}
