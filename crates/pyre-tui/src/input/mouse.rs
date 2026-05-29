@@ -483,10 +483,22 @@ pub(crate) fn handle_mouse(
 
                     // ── Multi-click text selection ─────────────────────────────
                     if let Some(slot) = state.slots[slot_idx].as_ref() {
+                        // `last_screen_rect` is the content area AFTER the render pass
+                        // applies border inset (1 cell each side) and removes the ribbon
+                        // row (1 row from the bottom).  When the pane has not yet been
+                        // rendered (area == 0), derive the equivalent rect from the leaf
+                        // `rect` which still includes the border.  This keeps first-click
+                        // coordinates consistent with post-render clicks.
                         let content = if slot.last_screen_rect.area() > 0 {
                             slot.last_screen_rect
                         } else {
-                            rect
+                            // Border inset: x+1, y+1, width-2; ribbon row: height-3 total.
+                            Rect::new(
+                                rect.x.saturating_add(1),
+                                rect.y.saturating_add(1),
+                                rect.width.saturating_sub(2),
+                                rect.height.saturating_sub(3),
+                            )
                         };
                         if rect_contains(content, col, row) {
                             let sel_row = row.saturating_sub(content.y);
@@ -601,7 +613,38 @@ pub(crate) fn handle_mouse(
             if let Some(ref mut sel) = state.selection {
                 if sel.dragging {
                     if let Some(slot) = state.slots[sel.pane_idx].as_ref() {
-                        let content = slot.last_screen_rect;
+                        // Use last_screen_rect when available.  For panes that have not
+                        // yet been rendered (area == 0), fall back to the leaf rect with
+                        // the same border+ribbon inset used in the down-handler (fix #1).
+                        // This avoids producing garbage coordinates on the very first drag
+                        // event before the first render frame completes.
+                        let content = if slot.last_screen_rect.area() > 0 {
+                            slot.last_screen_rect
+                        } else {
+                            // Locate the leaf rect for this pane by scanning the active
+                            // tab layout, then apply the same border+ribbon inset.
+                            let pane_id = slot.pane_id;
+                            let sv = &state.sessions[state.active_session];
+                            let mut leaf_rects: Vec<(pyre_proto::PaneId, Rect)> = Vec::new();
+                            collect_leaf_rects(
+                                &sv.tabs[sv.active_tab].root,
+                                body_area,
+                                &mut leaf_rects,
+                            );
+                            if let Some((_, leaf_rect)) =
+                                leaf_rects.iter().find(|(pid, _)| *pid == pane_id)
+                            {
+                                Rect::new(
+                                    leaf_rect.x.saturating_add(1),
+                                    leaf_rect.y.saturating_add(1),
+                                    leaf_rect.width.saturating_sub(2),
+                                    leaf_rect.height.saturating_sub(3),
+                                )
+                            } else {
+                                // Pane not in current layout; skip this motion event.
+                                return true;
+                            }
+                        };
                         let new_row = if row < content.y {
                             if let Some(s) = state.slots[sel.pane_idx].as_mut() {
                                 s.scroll_offset = (s.scroll_offset + 1).min(s.scrollback_capacity);
@@ -651,6 +694,11 @@ pub(crate) fn handle_mouse(
                             if grid_row > r0 {
                                 text.push('\n');
                             }
+                            // Line indexing must match render/pane.rs:285:
+                            //   display_line = TermLine(row as i32 - grid.display_offset() as i32)
+                            // where display_offset == scroll_offset (set via
+                            // scroll_display(Scroll::Delta(scroll_offset as i32))).
+                            // So: line_idx = grid_row - scroll_offset is equivalent.
                             let line_idx = grid_row as i32 - scroll_offset as i32;
                             let col_start = if grid_row == r0 { c0 as usize } else { 0usize };
                             let col_end = if grid_row == r1 {
@@ -808,4 +856,111 @@ mod tests {
         assert_eq!(out[0], 60, "left pane must grow by delta_pct");
         assert_eq!(out[1], 40, "right pane must shrink by delta_pct");
     }
+
+    // ── Coordinate translation tests (fix #1 and fix #2) ─────────────────────
+
+    /// Helper that mirrors the border+ribbon inset applied in fix #1 / fix #2.
+    /// `rect` is the border-inclusive leaf rect from `collect_leaf_rects`.
+    fn border_inset(rect: Rect) -> Rect {
+        Rect::new(
+            rect.x.saturating_add(1),
+            rect.y.saturating_add(1),
+            rect.width.saturating_sub(2),
+            rect.height.saturating_sub(3),
+        )
+    }
+
+    /// Helper that mirrors the coordinate translation applied in the down-handler
+    /// and drag-handler: given `content` (inner rect) and a global (col, row),
+    /// compute (sel_row, sel_col).
+    fn to_sel_coords(content: Rect, col: u16, row: u16) -> (u16, u16) {
+        let sel_row = row.saturating_sub(content.y);
+        let sel_col = col.saturating_sub(content.x);
+        (sel_row, sel_col)
+    }
+
+    /// Fix #1: the border-inset fallback must produce the same (sel_row, sel_col)
+    /// as using `last_screen_rect` directly for a geometrically equivalent rect.
+    ///
+    /// Scenario: leaf rect at (5, 3) with width=20, height=10.
+    /// Expected last_screen_rect: x=6, y=4, width=18, height=7.
+    /// A click at global (10, 6) should yield (sel_row=2, sel_col=4) in both cases.
+    #[test]
+    fn test_border_inset_fallback_matches_last_screen_rect() {
+        let leaf_rect = Rect::new(5, 3, 20, 10);
+
+        // Simulate what render_pane stores as last_screen_rect:
+        //   inner = border_block.inner(leaf_rect) => x+1, y+1, w-2, h-2 = (6,4,18,8)
+        //   content_area = split[0] from [Min(1), Length(1)] => height = inner.height - 1 = 7
+        let simulated_last_screen_rect = Rect::new(6, 4, 18, 7);
+
+        let fallback = border_inset(leaf_rect);
+
+        assert_eq!(
+            fallback, simulated_last_screen_rect,
+            "border_inset fallback must match simulated last_screen_rect"
+        );
+
+        // Verify coordinate translation is identical for both.
+        let global_col: u16 = 10;
+        let global_row: u16 = 6;
+
+        let coords_via_lsr = to_sel_coords(simulated_last_screen_rect, global_col, global_row);
+        let coords_via_fallback = to_sel_coords(fallback, global_col, global_row);
+
+        assert_eq!(
+            coords_via_lsr, coords_via_fallback,
+            "sel coords must be identical whether using last_screen_rect or border-inset fallback"
+        );
+        assert_eq!(
+            coords_via_lsr,
+            (2, 4),
+            "click at global (10,6) on rect at (6,4) must yield (sel_row=2, sel_col=4)"
+        );
+    }
+
+    /// Fix #1: the old fallback `rect` (border-inclusive) produces coordinates
+    /// off by 1 in both axes compared to `last_screen_rect`.
+    #[test]
+    fn test_old_rect_fallback_was_off_by_one() {
+        let leaf_rect = Rect::new(5, 3, 20, 10);
+        let correct_inner = border_inset(leaf_rect); // (6, 4, 18, 7)
+
+        let global_col: u16 = 10;
+        let global_row: u16 = 6;
+
+        // Using the (now-fixed) inner rect: sel_col = 10-6 = 4, sel_row = 6-4 = 2
+        let (row_correct, col_correct) = to_sel_coords(correct_inner, global_col, global_row);
+
+        // Old code used border-inclusive `rect`: sel_col = 10-5 = 5, sel_row = 6-3 = 3
+        let (row_old, col_old) = to_sel_coords(leaf_rect, global_col, global_row);
+
+        assert_eq!(
+            (row_correct, col_correct),
+            (2, 4),
+            "fixed path must yield (2, 4)"
+        );
+        assert_eq!((row_old, col_old), (3, 5), "old path yields (3, 5) — off by one");
+        assert_ne!(
+            (row_correct, col_correct),
+            (row_old, col_old),
+            "old and new must differ, confirming the bug was real"
+        );
+    }
+
+    // NOTE: the scrollback line_idx↔render-formula invariant is:
+    //   line_idx = grid_row as i32 - scroll_offset as i32
+    // This mirrors render/pane.rs:285:
+    //   display_line = TermLine(row as i32 - grid.display_offset() as i32)
+    // where display_offset == scroll_offset (set via
+    //   scroll_display(Scroll::Delta(scroll_offset as i32))).
+    //
+    // The formula is a single inlined arithmetic expression in the MouseUp
+    // handler — there is no extracted function to call in isolation.
+    // A unit test would be forced to repeat the same expression on both sides
+    // of the assertion, making it tautological and unable to catch regressions.
+    // The invariant is instead enforced by code review: if the extraction formula
+    // in handle_mouse (MouseUp branch, ~line 702) and the render formula in
+    // render/pane.rs ever diverge, text-selection on a scrolled terminal will
+    // silently extract the wrong lines.
 }

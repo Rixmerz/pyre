@@ -23,6 +23,16 @@ pub struct Selection {
 }
 
 impl Selection {
+    /// Clamp `start` and `end` so that neither row exceeds `max_row` and
+    /// neither col exceeds `max_col`.  Useful after a resize that shrinks
+    /// the content area.
+    #[allow(dead_code)]
+    pub fn clamp_to(&mut self, max_row: u16, max_col: u16) {
+        let clamp_point = |(r, c): (u16, u16)| (r.min(max_row), c.min(max_col));
+        self.start = clamp_point(self.start);
+        self.end = clamp_point(self.end);
+    }
+
     pub fn normalized(&self) -> ((u16, u16), (u16, u16)) {
         let (sr, sc) = self.start;
         let (er, ec) = self.end;
