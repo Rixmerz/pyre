@@ -167,3 +167,21 @@ fn dispatch_zombie_detection_condition_silent_for_split_close() {
          new_focus={new_focus:?} leaves={leaves:?}"
     );
 }
+
+// NOTE: PTY-stream-close panics on last pane (regression guard)
+//
+// The fix in app/run.rs adds an `if state.sessions.is_empty() { break; }` guard
+// immediately after the `for (slot_idx, frames_received) in closed_slots` loop.
+// Without it, when the last shell exits via `PaneEvent::Closed`, the iteration
+// continues to the session-lost detection block which indexes
+// `state.sessions[state.active_session]` on an empty Vec — an index-out-of-bounds
+// panic.
+//
+// This path cannot be covered here because it requires a live daemon socket and
+// a running PTY.  The closest unit-level coverage is
+// `app::pane_ops::tests::close_last_pane_removes_tab_and_session`, which proves
+// that `close_pane_by_slot_idx` empties `state.sessions` when the last pane is
+// closed.  The new guard in run.rs fires immediately after that function returns,
+// before any code that indexes the now-empty Vec.  To verify end-to-end: launch
+// pyre, open a single pane, type `exit`, and confirm the TUI exits cleanly
+// instead of panicking.

@@ -126,16 +126,36 @@ pub struct AppState {
     pub toast_rx: mpsc::Receiver<Toast>,
     /// Deferred async action queued by the (sync) mouse handler and drained in the event loop.
     pub pending_menu_action: Option<PendingMenuAction>,
+    /// Timestamp of the most recent `split_active` call.
+    /// Used by the 5s layout-resync to skip clobbering focus immediately after a split.
+    pub last_split_at: Option<Instant>,
 }
 
 impl AppState {
     /// Convenience: active session's session id.
+    ///
+    /// # Panics
+    /// Panics if `sessions` is empty or `active_session` is out of bounds.
+    /// Callers must check `sessions.is_empty()` before calling this.
     pub fn active_session_id(&self) -> SessionId {
-        self.sessions[self.active_session].id
+        self.sessions
+            .get(self.active_session)
+            .expect(
+                "active_session out of bounds — caller must check sessions.is_empty() before this",
+            )
+            .id
     }
 
     /// Convenience: active session view (mutable).
+    ///
+    /// # Panics
+    /// Panics if `sessions` is empty or `active_session` is out of bounds.
+    /// Callers must check `sessions.is_empty()` before calling this.
     pub fn active_session_view_mut(&mut self) -> &mut SessionView {
-        &mut self.sessions[self.active_session]
+        self.sessions
+            .get_mut(self.active_session)
+            .expect(
+                "active_session out of bounds — caller must check sessions.is_empty() before this",
+            )
     }
 }

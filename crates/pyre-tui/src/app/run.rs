@@ -107,6 +107,7 @@ pub(crate) fn initial_app_state(
         toast_rx,
         pending_menu_action: None,
         session_lost: false,
+        last_split_at: None,
     }
 }
 
@@ -289,6 +290,15 @@ pub(crate) async fn run_tui(
                 close_pane_by_slot_idx(&mut state, slot_idx);
             }
         }
+        // Guard: closing the last pane via PTY stream-close empties sessions on
+        // this same iteration.  The 1s-gated session-list block (which has its
+        // own `sessions.is_empty()` check) does NOT run every tick, so without
+        // this guard the code below that indexes `state.sessions[active_session]`
+        // would panic with an index-out-of-bounds on the very iteration where
+        // the last shell exited.
+        if state.sessions.is_empty() {
+            break;
+        }
 
         // Drain latest block snapshot (non-blocking).
         if state.blocks_rx.has_changed().unwrap_or(false) {
@@ -452,6 +462,16 @@ pub(crate) async fn run_tui(
                             crate::rpc::layout::get_session_layout(&state.control, info.id).await;
 
                         for pane_info in &new_panes {
+                            // Guard against double-attach: `split_active` may have already
+                            // attached a slot for this pane id before the 1s poll fires.
+                            // Attaching twice creates two competing output streams → flicker.
+                            if pane_to_slot_idx(&state.slots, pane_info.id).is_some() {
+                                tracing::debug!(
+                                    "pane-sync: slot for pane {} already exists, skipping attach",
+                                    pane_info.id,
+                                );
+                                continue;
+                            }
                             let (pc, pr) = {
                                 let (tc, tr) = term_size();
                                 compute_pane_inner_size(tc, tr)
@@ -601,8 +621,14 @@ pub(crate) async fn run_tui(
                 }
                 let old_leaves = pane_leaves_in_order(&state.sessions[si].tabs[at].root);
                 let new_leaves = pane_leaves_in_order(&fresh_layout);
-                if old_leaves != new_leaves {
+                let recently_split = state
+                    .last_split_at
+                    .map(|t| t.elapsed() < Duration::from_secs(2))
+                    .unwrap_or(false);
+                if old_leaves != new_leaves && !recently_split {
                     let old_focus = state.sessions[si].tabs[at].focus_pane;
+                    // Only reassign focus when the current focus is no longer a valid leaf.
+                    // This preserves user focus when it is still present in the new layout.
                     let focus = if new_leaves.contains(&old_focus) {
                         old_focus
                     } else {
@@ -885,7 +911,9 @@ pub(crate) async fn run_tui(
                             }
                         }
                         PendingMenuAction::ContextMenuCommit => {
-                            let sv = &state.sessions[state.active_session];
+                            let Some(sv) = state.sessions.get(state.active_session) else {
+                                continue;
+                            };
                             let tab = &sv.tabs[sv.active_tab];
                             if let Some(slot_idx) = focused_slot_idx(tab.focus_pane, &state.slots) {
                                 if let Some(slot) = state.slots[slot_idx].as_ref() {

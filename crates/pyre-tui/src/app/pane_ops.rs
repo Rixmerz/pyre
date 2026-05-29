@@ -4,6 +4,7 @@
 //! the common pane lifecycle: attach, split, open, close, focus.
 
 use std::path::Path;
+use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
@@ -252,13 +253,31 @@ pub(crate) async fn split_active(state: &mut AppState, horizontal: bool) -> Resu
         .context("rpc transport")?
         .map_err(|e| anyhow!("daemon open_pane_split: {e}"))?;
 
-    let slot = attach_pane(&state.socket, session_id, new_pane_id, cols, rows).await?;
+    // Attach at half the terminal size so the first frame's Term dimensions are
+    // already close to the post-split rect. `resize_if_needed` will still queue
+    // a corrective resize after the first draw, but the initial mismatch (and the
+    // render-frequency flicker it causes) is eliminated.
+    //
+    // Orient::Horizontal = HSplit (top/bottom) → full width, half height.
+    // Orient::Vertical   = VSplit (left/right) → half width, full height.
+    let half_cols = (cols / 2).max(1);
+    let half_rows = (rows / 2).max(1);
+    let (sc, sr) = if horizontal {
+        (cols, half_rows)
+    } else {
+        (half_cols, rows)
+    };
+    let slot = attach_pane(&state.socket, session_id, new_pane_id, sc, sr).await?;
     state.slots.push(Some(slot));
 
     let sv = state.active_session_view_mut();
     let tab = &mut sv.tabs[sv.active_tab];
     tab.root.split_focused(&focused_pane, new_pane_id, orient);
     tab.focus_pane = new_pane_id;
+
+    // Record the split timestamp so the layout-resync grace window can avoid
+    // clobbering the optimistically set focus_pane within the next 2 seconds.
+    state.last_split_at = Some(Instant::now());
 
     Ok(())
 }
@@ -825,6 +844,7 @@ mod tests {
             toast_deck: ToastDeck::new(false, 3000, 3),
             toast_rx,
             pending_menu_action: None,
+            last_split_at: None,
         }
     }
 
