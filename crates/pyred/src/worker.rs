@@ -620,12 +620,20 @@ impl WorkerControl for WorkerControlImpl {
         rows: u16,
     ) -> Result<(), RpcError> {
         tracing::debug!(slot_idx, cols, rows, "resize_pane: PTY resize");
-        let panes = self.state.panes.read().await;
-        let handle = panes
-            .get(&slot_idx)
-            .ok_or(RpcError::UnknownSlot(slot_idx))?;
-        handle
-            .master
+        // Clone the Arc<Mutex<MasterPty>> out before releasing the panes read
+        // guard.  Holding a tokio RwLock read guard across an .await on a
+        // *different* lock starves any pending writer (write-preferring tokio
+        // RwLock) — the root cause of the SPLIT deadlock (same bug class as
+        // commit 6046eea).
+        let master = {
+            let panes = self.state.panes.read().await;
+            panes
+                .get(&slot_idx)
+                .ok_or(RpcError::UnknownSlot(slot_idx))?
+                .master
+                .clone()
+        }; // panes read guard dropped here
+        master
             .lock()
             .await
             .resize(PtySize {
@@ -644,12 +652,18 @@ impl WorkerControl for WorkerControlImpl {
         slot_idx: u32,
         bytes: Vec<u8>,
     ) -> Result<(), RpcError> {
-        let panes = self.state.panes.read().await;
-        let handle = panes
-            .get(&slot_idx)
-            .ok_or(RpcError::UnknownSlot(slot_idx))?;
-        handle
-            .input_tx
+        // Clone the mpsc::Sender (cheap) before releasing the read guard.
+        // Holding the RwLock read guard across input_tx.send().await would
+        // starve any pending panes.write() — the split/open_pane writer.
+        let input_tx = {
+            let panes = self.state.panes.read().await;
+            panes
+                .get(&slot_idx)
+                .ok_or(RpcError::UnknownSlot(slot_idx))?
+                .input_tx
+                .clone()
+        }; // panes read guard dropped here
+        input_tx
             .send(bytes)
             .await
             .map_err(|_| RpcError::Internal("input_tx closed".into()))?;
@@ -693,13 +707,18 @@ impl WorkerControl for WorkerControlImpl {
         });
 
         // Read from the in-memory ring buffer of the live pane.
-        let raw = {
+        // Clone the Arc<Mutex<RingBuf>> out before releasing the panes read
+        // guard, then await the ring_buf lock separately.  Holding the RwLock
+        // read guard across ring_buf.lock().await would starve panes.write()
+        // (open_pane during a SPLIT).
+        let ring_buf = {
             let panes = self.state.panes.read().await;
             match panes.get(&slot_idx) {
-                Some(h) => h.ring_buf.lock().await.snapshot().to_vec(),
+                Some(h) => h.ring_buf.clone(),
                 None => return Err(RpcError::UnknownSlot(slot_idx)),
             }
-        };
+        }; // panes read guard dropped here
+        let raw = ring_buf.lock().await.snapshot().to_vec();
 
         let lossy = String::from_utf8_lossy(&raw);
         let stripped = re.replace_all(&lossy, "");
@@ -789,15 +808,15 @@ async fn handle_stream_conn(mut sock: UnixStream, state: Arc<WorkerState>) {
         SessionId(uuid)
     };
 
-    // Grab input_tx, ring-buffer snapshot, and a broadcast subscriber.
+    // Grab input_tx, broadcast subscriber, and the ring_buf Arc — then
+    // release the panes read guard BEFORE awaiting the ring_buf lock.
     //
-    // We no longer call try_clone_reader() here.  The single pty-reader thread
-    // owns the only fd on the PTY master; it fans out chunks via broadcast.
-    // Subscribing after taking the snapshot means we may receive some duplicate
-    // bytes that were already in the snapshot, but the client deduplicates by
-    // seq number and the worst case is a handful of re-sent bytes at connect
-    // time — far better than the previous race where most chunks were lost.
-    let (input_tx, mut sub, snap) = {
+    // Holding the RwLock read guard across ring_buf.lock().await would
+    // starve any concurrent panes.write() (e.g. open_pane during a SPLIT)
+    // because tokio's RwLock is write-preferring: a pending writer blocks all
+    // new readers.  Pattern: clone cheap handles (Arc / Sender) out, drop the
+    // guard, then await.
+    let (input_tx, mut sub, ring_buf) = {
         let panes = state.panes.read().await;
         let handle = match panes.get(&slot_idx) {
             Some(h) => h,
@@ -807,14 +826,17 @@ async fn handle_stream_conn(mut sock: UnixStream, state: Arc<WorkerState>) {
                 return;
             }
         };
-
-        let snap = handle.ring_buf.lock().await.snapshot().to_vec();
-        // Subscribe *after* the snapshot so we don't miss bytes that arrive
-        // between the snapshot and the first recv() — mirroring stream.rs.
+        // Clone the three cheap handles we need after the guard drops.
+        let input_tx = handle.input_tx.clone();
         let sub = handle.output_tx.subscribe();
+        let ring_buf = handle.ring_buf.clone(); // Arc<Mutex<RingBuf>>
+        (input_tx, sub, ring_buf)
+    }; // panes read guard dropped here — open_pane writers can now proceed
 
-        (handle.input_tx.clone(), sub, snap)
-    };
+    // Take the ring-buffer snapshot with the panes guard released.
+    // Subscribe *after* the snapshot so we don't miss bytes that arrive
+    // between the snapshot and the first recv() — mirroring stream.rs.
+    let snap = ring_buf.lock().await.snapshot().to_vec();
 
     // Split socket into framed read/write halves — must match single-mode wire
     // format: length-delimited bincode OutputFrame (daemon→client) and
