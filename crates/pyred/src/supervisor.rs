@@ -2048,61 +2048,123 @@ pub async fn run(
         });
     }
 
-    // Re-attach persisted sessions: query SQLite for all known sessions and spawn
-    // a worker for each.  Workers can't restore PTYs (the old processes are gone)
-    // but they will appear in list_sessions and their shard state is intact.
-    // Workers that had panes will re-open shells via WorkerShard::load_panes.
-    {
-        let persisted = store.list_session_ids().await.unwrap_or_else(|e| {
-            tracing::warn!("reattach: list_session_ids: {e:#}");
-            vec![]
-        });
-        let count = persisted.len();
-        if count > 0 {
-            tracing::info!(count, "reattaching persisted sessions");
-        }
-        for sid in persisted {
-            let session_id_str = sid.0.to_string();
-            // Insert a oneshot so spawn_worker can await registration.
-            let (reg_tx, reg_rx) = oneshot::channel::<()>();
-            pending_registrations
-                .lock()
-                .await
-                .insert(session_id_str.clone(), reg_tx);
-
-            if let Err(e) = supervisor_impl.spawn_worker(&session_id_str).await {
-                tracing::warn!(session_id = session_id_str, "reattach: spawn_worker: {e:#}");
-                pending_registrations.lock().await.remove(&session_id_str);
-                continue;
-            }
-
-            // Await registration with a 5 s timeout — same window as spawn RPC.
-            match tokio::time::timeout(Duration::from_secs(5), reg_rx).await {
-                Ok(Ok(())) => {
-                    tracing::info!(session_id = session_id_str, "reattached persisted session");
-                }
-                Ok(Err(_)) => {
-                    tracing::warn!(
-                        session_id = session_id_str,
-                        "reattach: registration channel closed"
-                    );
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        session_id = session_id_str,
-                        "reattach: worker did not register within 5 s"
-                    );
-                    pending_registrations.lock().await.remove(&session_id_str);
-                }
-            }
-        }
-    }
-
-    // Public socket accept loop (PyreDaemon trait — same tag protocol as single mode).
+    // Bind the public socket BEFORE reattach so clients can connect immediately
+    // and a `spawn` RPC never starves while reattach runs. Reattach is then
+    // spawned as a background task; the accept loop below can serve requests
+    // while persisted sessions are still being restored (the desired behavior —
+    // a fresh `spawn` no longer waits behind hundreds of reattaching shards).
     let listener = UnixListener::bind(&public_sock)
         .with_context(|| format!("bind {}", public_sock.display()))?;
     std::fs::set_permissions(&public_sock, std::fs::Permissions::from_mode(0o700))?;
     tracing::info!("supervisor public socket at {}", public_sock.display());
+
+    // Re-attach persisted sessions: query SQLite for all known sessions, then
+    // spawn a worker only for the LIVE ones (≥1 pane in their shard). Workers
+    // can't restore the old PTY processes, but a session whose shard still has
+    // panes will re-open shells via WorkerShard::load_panes and appear in
+    // list_sessions. A session whose shard has 0 panes is STALE (invariants
+    // I-4 / I-5): reattaching it produces a 0-PTY ghost that the TUI then
+    // treats as a lost session. Such shards are skipped and GC'd here.
+    {
+        let reattach_store = store.clone();
+        let reattach_impl = supervisor_impl.clone();
+        let reattach_pending = pending_registrations.clone();
+        tokio::spawn(async move {
+            let persisted = reattach_store.list_session_ids().await.unwrap_or_else(|e| {
+                tracing::warn!("reattach: list_session_ids: {e:#}");
+                vec![]
+            });
+
+            // Partition persisted sessions into live (≥1 pane) and stale (0).
+            // The shard's `panes` table — not the supervisor store, which is
+            // empty in hybrid mode — is the source of truth for liveness.
+            let mut live: Vec<SessionId> = Vec::new();
+            let mut stale: Vec<SessionId> = Vec::new();
+            for sid in persisted {
+                let session_id_str = sid.0.to_string();
+                match crate::shard::shard_pane_count(&session_id_str).await {
+                    Ok(0) => stale.push(sid),
+                    Ok(_) => live.push(sid),
+                    Err(e) => {
+                        // A shard we cannot introspect is left alone (neither
+                        // reattached nor deleted) — never GC on uncertainty.
+                        tracing::warn!(
+                            session_id = session_id_str,
+                            "reattach: shard pane-count failed, skipping (no GC): {e:#}"
+                        );
+                    }
+                }
+            }
+
+            // Startup GC: prune the stale shard dirs. Defensive — only dirs we
+            // just confirmed have 0 panes, and never a session that is already
+            // live/registered (stale sessions have no worker yet by definition).
+            let mut pruned = 0usize;
+            for sid in &stale {
+                let session_id_str = sid.0.to_string();
+                if reattach_impl
+                    .registry
+                    .get_ctrl_client(&session_id_str)
+                    .await
+                    .is_some()
+                {
+                    // Race guard: a client spawned into this id between the
+                    // pane-count read and now. Leave it.
+                    continue;
+                }
+                match crate::shard::remove_shard_dir(&session_id_str) {
+                    Ok(()) => pruned += 1,
+                    Err(e) => tracing::warn!(
+                        session_id = session_id_str,
+                        "reattach GC: remove shard dir failed: {e:#}"
+                    ),
+                }
+            }
+            if pruned > 0 {
+                tracing::info!(pruned, stale = stale.len(), "pruned stale (0-pane) shards");
+            }
+
+            let count = live.len();
+            if count > 0 {
+                tracing::info!(count, "reattaching persisted sessions");
+            }
+            for sid in live {
+                let session_id_str = sid.0.to_string();
+                // Insert a oneshot so spawn_worker can await registration.
+                let (reg_tx, reg_rx) = oneshot::channel::<()>();
+                reattach_pending
+                    .lock()
+                    .await
+                    .insert(session_id_str.clone(), reg_tx);
+
+                if let Err(e) = reattach_impl.spawn_worker(&session_id_str).await {
+                    tracing::warn!(session_id = session_id_str, "reattach: spawn_worker: {e:#}");
+                    reattach_pending.lock().await.remove(&session_id_str);
+                    continue;
+                }
+
+                // Await registration with a 5 s timeout — same window as spawn RPC.
+                match tokio::time::timeout(Duration::from_secs(5), reg_rx).await {
+                    Ok(Ok(())) => {
+                        tracing::info!(session_id = session_id_str, "reattached persisted session");
+                    }
+                    Ok(Err(_)) => {
+                        tracing::warn!(
+                            session_id = session_id_str,
+                            "reattach: registration channel closed"
+                        );
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            session_id = session_id_str,
+                            "reattach: worker did not register within 5 s"
+                        );
+                        reattach_pending.lock().await.remove(&session_id_str);
+                    }
+                }
+            }
+        });
+    }
 
     let shutdown_public = public_sock.clone();
     let shutdown_sv = supervisor_sock.clone();

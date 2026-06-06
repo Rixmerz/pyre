@@ -216,6 +216,13 @@ pub(crate) async fn run_tui(
             if info.id == session {
                 continue;
             }
+            // I-4 / I-5: a session with pane_count == 0 is stale (its worker has
+            // no live PTY). Skip it before opening a stream — mirrors
+            // `pick_attach_session`. Attaching anyway yields an immediate EOF
+            // (0-frame Closed) that the loop misreads as a lost session.
+            if info.pane_count == 0 {
+                continue;
+            }
             if let Ok(Ok(panes)) = state
                 .control
                 .list_panes(tarpc::context::current(), info.id)
@@ -397,6 +404,12 @@ pub(crate) async fn run_tui(
                 let prev_active_id = state.sessions.get(state.active_session).map(|sv| sv.id);
                 let known_ids: Vec<SessionId> = state.sessions.iter().map(|s| s.id).collect();
                 for info in &daemon_sessions {
+                    // I-4 / I-5: never adopt a stale (0-pane) session during the
+                    // sync poll. Skipping before the list_panes RPC also avoids a
+                    // wasted round-trip per stale session.
+                    if info.pane_count == 0 {
+                        continue;
+                    }
                     if !known_ids.contains(&info.id) {
                         match state
                             .control
@@ -998,7 +1011,11 @@ pub(crate) async fn run_tui(
                     terminal.clear()?;
                     tracing::debug!(new_cols, new_rows, "terminal genuinely resized; cleared");
                 } else {
-                    tracing::trace!(new_cols, new_rows, "spurious resize event (same size); skip clear");
+                    tracing::trace!(
+                        new_cols,
+                        new_rows,
+                        "spurious resize event (same size); skip clear"
+                    );
                 }
             }
 

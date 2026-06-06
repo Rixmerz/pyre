@@ -35,6 +35,7 @@ mod ringbuf;
 mod search_filter;
 mod server;
 mod session;
+mod shard;
 mod state;
 mod store;
 mod stream;

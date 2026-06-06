@@ -351,10 +351,17 @@ mod tests {
     use tempfile::TempDir;
     use uuid::Uuid;
 
+    // These tests mutate the process-global `PYRE_DATA_DIR`. Serialize them
+    // (shared crate-wide with the shard/migration tests that mutate
+    // `XDG_STATE_HOME`) so a parallel test run can never read another test's
+    // env value mid-`Store::open`. See `crate::shard::ENV_TEST_LOCK`.
+    use crate::shard::ENV_TEST_LOCK as ENV_LOCK;
+
     #[tokio::test]
     async fn open_and_roundtrip_block() -> Result<()> {
+        let _g = ENV_LOCK.lock().await;
         let tmp = TempDir::new()?;
-        // SAFETY: test-only env mutation; tests run single-threaded per process.
+        // SAFETY: test-only env mutation, serialized by ENV_LOCK.
         unsafe {
             std::env::set_var("PYRE_DATA_DIR", tmp.path());
         }
@@ -398,6 +405,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_blocks_for_pane_filters_by_pane_and_respects_limit() -> Result<()> {
+        let _g = ENV_LOCK.lock().await;
         let tmp = TempDir::new()?;
         unsafe {
             std::env::set_var("PYRE_DATA_DIR", tmp.path());
@@ -466,6 +474,7 @@ mod tests {
 
     #[tokio::test]
     async fn layout_roundtrip() -> Result<()> {
+        let _g = ENV_LOCK.lock().await;
         let tmp = TempDir::new()?;
         unsafe {
             std::env::set_var("PYRE_DATA_DIR", tmp.path());
@@ -499,6 +508,7 @@ mod tests {
     async fn migration_idempotent() -> Result<()> {
         // Running Store::open() twice on the same DB must not fail (the migration
         // is guarded by sqlx::migrate! which checks applied migrations).
+        let _g = ENV_LOCK.lock().await;
         let tmp = TempDir::new()?;
         unsafe {
             std::env::set_var("PYRE_DATA_DIR", tmp.path());

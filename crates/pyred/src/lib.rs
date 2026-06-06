@@ -9,4 +9,5 @@
 pub mod config;
 pub mod index;
 pub mod migration;
+pub mod shard;
 pub mod store;

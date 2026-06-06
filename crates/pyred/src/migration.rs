@@ -570,10 +570,11 @@ fn tantivy_has_exit_code_field(path: &std::path::Path) -> Result<bool> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
-    use tokio::sync::Mutex;
 
-    /// Serialize tests that mutate `XDG_STATE_HOME`.
-    static ENV_LOCK: Mutex<()> = Mutex::const_new(());
+    // Serialize tests that mutate `XDG_STATE_HOME`. Shared crate-wide with the
+    // `shard` tests (which also mutate it) so cross-module runs never race —
+    // see `crate::shard::ENV_TEST_LOCK`.
+    use crate::shard::ENV_TEST_LOCK as ENV_LOCK;
 
     fn setup_env(tmp: &TempDir) {
         std::env::set_var("XDG_STATE_HOME", tmp.path());
