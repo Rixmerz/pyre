@@ -67,6 +67,55 @@ fn word_bounds(
     (c0 as u16, c1 as u16)
 }
 
+/// Extract the text under a NORMALIZED selection span from an alacritty grid.
+///
+/// `(r0, c0)` and `(r1, c1)` are viewport-relative, normalized so that
+/// `(r0, c0) <= (r1, c1)` (callers pass `Selection::normalized()`).
+/// `scroll_offset` is the LIVE display offset on screen — the row→grid-line
+/// mapping `line_idx = row - scroll_offset` mirrors the render formula in
+/// `render/pane.rs` (`display_line = row - display_offset`, where
+/// `display_offset == scroll_offset`). Cells holding the null char render as a
+/// space; each line is right-trimmed and joined with `\n`.
+///
+/// This is the single source of truth for selection extraction: the MouseUp
+/// copy path calls it, and the regression test drives a real grid through it so
+/// forward/reverse selections are compared against production logic — not a
+/// restated copy of it.
+fn extract_selection_text(
+    grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>,
+    (r0, c0): (u16, u16),
+    (r1, c1): (u16, u16),
+    scroll_offset: usize,
+) -> String {
+    let num_cols = grid.columns();
+    let mut text = String::new();
+    for grid_row in r0..=r1 {
+        if grid_row > r0 {
+            text.push('\n');
+        }
+        let line_idx = grid_row as i32 - scroll_offset as i32;
+        let col_start = if grid_row == r0 { c0 as usize } else { 0usize };
+        let col_end = if grid_row == r1 {
+            c1 as usize
+        } else {
+            num_cols.saturating_sub(1)
+        };
+        for c in col_start..=col_end {
+            let pt = TermPoint::new(TermLine(line_idx), TermColumn(c));
+            let ch = grid[pt].c;
+            if ch == '\0' {
+                text.push(' ');
+            } else {
+                text.push(ch);
+            }
+        }
+    }
+    text.lines()
+        .map(|l| l.trim_end())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Resize helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -645,15 +694,20 @@ pub(crate) fn handle_mouse(
                                 return true;
                             }
                         };
+                        // Clamp the drag row to the visible content area in BOTH
+                        // directions (fix #3, option B). We deliberately do NOT
+                        // mutate `scroll_offset` here: the old code bumped it on an
+                        // upward drag past the top edge but no-op'd on a downward
+                        // drag from offset 0, an asymmetry that broke bottom→top
+                        // selection (highlight vanished, copy extracted shifted/empty
+                        // text). Keeping `scroll_offset` constant for the whole drag
+                        // means the viewport-relative `start`/`end` coords stay valid
+                        // and `sel.base` always matches the live offset, so highlight
+                        // and copy agree. Drag-past-edge auto-scroll is dropped; the
+                        // common in-viewport selection is now correct in both axes.
                         let new_row = if row < content.y {
-                            if let Some(s) = state.slots[sel.pane_idx].as_mut() {
-                                s.scroll_offset = (s.scroll_offset + 1).min(s.scrollback_capacity);
-                            }
                             0u16
                         } else if row >= content.y + content.height {
-                            if let Some(s) = state.slots[sel.pane_idx].as_mut() {
-                                s.scroll_offset = s.scroll_offset.saturating_sub(1);
-                            }
                             content.height.saturating_sub(1)
                         } else {
                             row.saturating_sub(content.y)
@@ -682,45 +736,21 @@ pub(crate) fn handle_mouse(
                     sel.dragging = false;
                     let pane_idx = sel.pane_idx;
                     let ((r0, c0), (r1, c1)) = sel.normalized();
-                    let scroll_offset = match &sel.base {
-                        SelectionBase::Scrollback(off) => *off,
-                        SelectionBase::Live => 0,
-                    };
                     if let Some(slot) = state.slots[pane_idx].as_ref() {
-                        let grid = slot.term.grid();
-                        let num_cols = grid.columns();
-                        let mut text = String::new();
-                        for grid_row in r0..=r1 {
-                            if grid_row > r0 {
-                                text.push('\n');
-                            }
-                            // Line indexing must match render/pane.rs:285:
-                            //   display_line = TermLine(row as i32 - grid.display_offset() as i32)
-                            // where display_offset == scroll_offset (set via
-                            // scroll_display(Scroll::Delta(scroll_offset as i32))).
-                            // So: line_idx = grid_row - scroll_offset is equivalent.
-                            let line_idx = grid_row as i32 - scroll_offset as i32;
-                            let col_start = if grid_row == r0 { c0 as usize } else { 0usize };
-                            let col_end = if grid_row == r1 {
-                                c1 as usize
-                            } else {
-                                num_cols.saturating_sub(1)
-                            };
-                            for c in col_start..=col_end {
-                                let pt = TermPoint::new(TermLine(line_idx), TermColumn(c));
-                                let ch = grid[pt].c;
-                                if ch == '\0' {
-                                    text.push(' ');
-                                } else {
-                                    text.push(ch);
-                                }
-                            }
-                        }
-                        let trimmed: String = text
-                            .lines()
-                            .map(|l| l.trim_end())
-                            .collect::<Vec<_>>()
-                            .join("\n");
+                        // Use the LIVE scroll offset, not the stale `sel.base`
+                        // snapshot (fix #2). The viewport-relative selection rows
+                        // are mapped to grid lines through whatever offset is on
+                        // screen RIGHT NOW, exactly as the render formula does.
+                        // Since fix #3 keeps scroll_offset constant during a drag
+                        // this equals `sel.base`, but reading the live value is
+                        // strictly correct and keeps highlight and copy in
+                        // lock-step.
+                        let trimmed = extract_selection_text(
+                            slot.term.grid(),
+                            (r0, c0),
+                            (r1, c1),
+                            slot.scroll_offset,
+                        );
                         if !trimmed.is_empty() {
                             if let Err(e) = crate::clipboard::copy_to_clipboard(&trimmed) {
                                 tracing::warn!("clipboard copy failed: {e}");
@@ -940,7 +970,11 @@ mod tests {
             (2, 4),
             "fixed path must yield (2, 4)"
         );
-        assert_eq!((row_old, col_old), (3, 5), "old path yields (3, 5) — off by one");
+        assert_eq!(
+            (row_old, col_old),
+            (3, 5),
+            "old path yields (3, 5) — off by one"
+        );
         assert_ne!(
             (row_correct, col_correct),
             (row_old, col_old),
@@ -948,19 +982,125 @@ mod tests {
         );
     }
 
+    // ── Reverse-drag selection regression (the bottom→top bug) ───────────────
+
+    use alacritty_terminal::term::cell::Cell;
+    use alacritty_terminal::term::Config as TermConfig;
+    use alacritty_terminal::vte::ansi::Processor as AnsiProcessor;
+    use alacritty_terminal::Term;
+
+    use crate::model::pane::EventProxy;
+    use crate::model::selection::{Selection, SelectionBase};
+    use crate::render::pane::TermSize;
+
+    /// Build a real alacritty grid pre-filled with `lines`, one per row,
+    /// at the live offset (no scrollback). Returns a `Term` whose grid the
+    /// production `extract_selection_text` can read.
+    fn grid_with_lines(lines: &[&str], cols: usize) -> Term<EventProxy> {
+        let rows = lines.len();
+        let mut term = Term::new(
+            TermConfig::default(),
+            &TermSize::new(cols, rows),
+            EventProxy::new(),
+        );
+        // The `processor` field on PaneSlot resolves to the default Timeout
+        // handler (StdSyncHandler); a standalone `let` cannot infer that, so
+        // name it explicitly here.
+        let mut processor: AnsiProcessor = AnsiProcessor::new();
+        // CRLF between rows so the cursor lands at column 0 of the next line.
+        let payload = lines.join("\r\n");
+        processor.advance(&mut term, payload.as_bytes());
+        term
+    }
+
+    /// Run the FULL production selection pipeline (`Selection::normalized()` →
+    /// `extract_selection_text`) for a given anchor/head. Mirrors exactly what
+    /// the MouseUp copy handler does, so the assertion exercises real logic.
+    fn copy_via_pipeline(
+        grid: &alacritty_terminal::grid::Grid<Cell>,
+        anchor: (u16, u16),
+        head: (u16, u16),
+    ) -> String {
+        let sel = Selection {
+            pane_idx: 0,
+            start: anchor,
+            end: head,
+            dragging: false,
+            base: SelectionBase::Live,
+        };
+        let (lo, hi) = sel.normalized();
+        // Live view ⇒ scroll_offset 0, matching an in-viewport drag.
+        extract_selection_text(grid, lo, hi, 0)
+    }
+
+    /// The core regression: a REVERSE (bottom→top) drag over a region must
+    /// produce byte-identical copied text to the FORWARD (top→bottom) drag over
+    /// the SAME region. Before the fix the reverse path bumped `scroll_offset`
+    /// and de-synced normalization vs extraction; here we pin them equal.
+    ///
+    /// Non-tautological: both directions flow through the real
+    /// `Selection::normalized()` + `extract_selection_text`, against a live
+    /// alacritty grid — not a re-statement of the formula.
+    #[test]
+    fn test_reverse_drag_copy_matches_forward_drag() {
+        let lines = ["alpha", "bravo", "charlie"];
+        let term = grid_with_lines(&lines, 16);
+        let grid = term.grid();
+
+        // Region: from (row 0, col 1) to (row 2, col 4) inclusive.
+        let top = (0u16, 1u16);
+        let bottom = (2u16, 4u16);
+
+        // Forward: anchor=top, head=bottom (drag down).
+        let forward = copy_via_pipeline(grid, top, bottom);
+        // Reverse: anchor=bottom, head=top (drag up) — same visual region.
+        let reverse = copy_via_pipeline(grid, bottom, top);
+
+        assert_eq!(
+            forward, reverse,
+            "reverse (bottom→top) drag must copy the same text as forward (top→bottom)"
+        );
+
+        // And the content must be the actual selected span, not empty/shifted:
+        //   row0 cols 1..=15 = "lpha" (rest blank, trimmed)
+        //   row1 full        = "bravo"
+        //   row2 cols 0..=4  = "charl"
+        assert_eq!(
+            forward, "lpha\nbravo\ncharl",
+            "extracted text must match the real grid contents under the span"
+        );
+    }
+
+    /// Reverse selection confined to a SINGLE row (head left of anchor) must
+    /// also normalize+extract identically to its forward twin. Guards the
+    /// column-swap leg of `normalized()` independently of the row-swap leg.
+    #[test]
+    fn test_reverse_single_row_selection_matches_forward() {
+        let lines = ["hello world"];
+        let term = grid_with_lines(&lines, 16);
+        let grid = term.grid();
+
+        let left = (0u16, 2u16);
+        let right = (0u16, 8u16);
+
+        let forward = copy_via_pipeline(grid, left, right); // drag right
+        let reverse = copy_via_pipeline(grid, right, left); // drag left
+
+        assert_eq!(
+            forward, reverse,
+            "right→left drag must copy the same text as left→right on one row"
+        );
+        assert_eq!(forward, "llo wor", "single-row span must extract exactly");
+    }
+
     // NOTE: the scrollback line_idx↔render-formula invariant is:
     //   line_idx = grid_row as i32 - scroll_offset as i32
-    // This mirrors render/pane.rs:285:
+    // This mirrors render/pane.rs:
     //   display_line = TermLine(row as i32 - grid.display_offset() as i32)
     // where display_offset == scroll_offset (set via
     //   scroll_display(Scroll::Delta(scroll_offset as i32))).
-    //
-    // The formula is a single inlined arithmetic expression in the MouseUp
-    // handler — there is no extracted function to call in isolation.
-    // A unit test would be forced to repeat the same expression on both sides
-    // of the assertion, making it tautological and unable to catch regressions.
-    // The invariant is instead enforced by code review: if the extraction formula
-    // in handle_mouse (MouseUp branch, ~line 702) and the render formula in
-    // render/pane.rs ever diverge, text-selection on a scrolled terminal will
-    // silently extract the wrong lines.
+    // `extract_selection_text` is now the single home for that formula, and the
+    // tests above drive it through a live grid. If the highlight mapping in
+    // render/pane.rs and this formula ever diverge, the visible highlight and
+    // the copied text will disagree on a scrolled terminal.
 }

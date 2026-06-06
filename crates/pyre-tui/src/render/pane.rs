@@ -339,28 +339,43 @@ pub(crate) fn render_pane(
         frame.render_widget(Paragraph::new(lines), text_area);
     }
 
-    // Overlay selection highlight on live view.
-    if slot.scroll_offset == 0 {
-        if let Some(sel) = selection {
-            if sel.pane_idx == slot_idx {
-                if let SelectionBase::Live = sel.base {
-                    let ((r0, c0), (r1, c1)) = sel.normalized();
-                    for row in r0..=r1.min(text_area.height.saturating_sub(1)) {
-                        let col_start = if row == r0 { c0 } else { 0 };
-                        let col_end = if row == r1 {
-                            c1.min(text_area.width.saturating_sub(1))
-                        } else {
-                            text_area.width.saturating_sub(1)
-                        };
-                        for col in col_start..=col_end {
-                            let sx = text_area.x + col;
-                            let sy = text_area.y + row;
-                            if sx < text_area.x + text_area.width
-                                && sy < text_area.y + text_area.height
-                            {
-                                if let Some(cell) = frame.buffer_mut().cell_mut((sx, sy)) {
-                                    cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
-                                }
+    // Overlay selection highlight.
+    //
+    // The selection's `start`/`end` are viewport-relative to the scroll offset
+    // captured in `sel.base` at MouseDown. We render the highlight whenever that
+    // base offset still matches the CURRENT `slot.scroll_offset` — i.e. the
+    // viewport has not scrolled away from where the selection lives. This is the
+    // same coordinate contract the copy path uses (mouse.rs MouseUp), so the
+    // visible highlight and the eventually-copied text always agree.
+    //
+    // Previously this was gated on `scroll_offset == 0 && SelectionBase::Live`,
+    // which hid the highlight the instant any scroll occurred. With drag no
+    // longer mutating scroll_offset (fix #3), base and live offset stay equal for
+    // an in-viewport drag in BOTH directions, so reverse (bottom→top) selections
+    // now highlight correctly; scrolled-back selections (base == Scrollback(N))
+    // also highlight while their content remains on screen.
+    if let Some(sel) = selection {
+        if sel.pane_idx == slot_idx {
+            let base_offset = match sel.base {
+                SelectionBase::Live => 0,
+                SelectionBase::Scrollback(off) => off,
+            };
+            if base_offset == slot.scroll_offset {
+                let ((r0, c0), (r1, c1)) = sel.normalized();
+                for row in r0..=r1.min(text_area.height.saturating_sub(1)) {
+                    let col_start = if row == r0 { c0 } else { 0 };
+                    let col_end = if row == r1 {
+                        c1.min(text_area.width.saturating_sub(1))
+                    } else {
+                        text_area.width.saturating_sub(1)
+                    };
+                    for col in col_start..=col_end {
+                        let sx = text_area.x + col;
+                        let sy = text_area.y + row;
+                        if sx < text_area.x + text_area.width && sy < text_area.y + text_area.height
+                        {
+                            if let Some(cell) = frame.buffer_mut().cell_mut((sx, sy)) {
+                                cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
                             }
                         }
                     }

@@ -152,10 +152,8 @@ impl AppState {
     /// Panics if `sessions` is empty or `active_session` is out of bounds.
     /// Callers must check `sessions.is_empty()` before calling this.
     pub fn active_session_view_mut(&mut self) -> &mut SessionView {
-        self.sessions
-            .get_mut(self.active_session)
-            .expect(
-                "active_session out of bounds — caller must check sessions.is_empty() before this",
-            )
+        self.sessions.get_mut(self.active_session).expect(
+            "active_session out of bounds — caller must check sessions.is_empty() before this",
+        )
     }
 }
