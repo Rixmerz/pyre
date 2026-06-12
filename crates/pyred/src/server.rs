@@ -187,7 +187,10 @@ impl pyre_proto::service::PyreDaemon for DaemonImpl {
             .await
             .ok_or(PyreError::NoSuchPane(pane))?;
         let snapshot = {
-            let rb = pane_state.ringbuf.lock().expect("ringbuf poisoned");
+            let rb = pane_state.ringbuf.lock().unwrap_or_else(|e| {
+                tracing::error!("ringbuf lock poisoned in replay; recovering guard: {e}");
+                e.into_inner()
+            });
             rb.snapshot()
         };
         let recent = self
@@ -216,14 +219,6 @@ impl pyre_proto::service::PyreDaemon for DaemonImpl {
         pane: PaneId,
         lines: u32,
     ) -> Result<Vec<u8>, PyreError> {
-        use regex::Regex;
-        use std::sync::OnceLock;
-
-        static ANSI_RE: OnceLock<Regex> = OnceLock::new();
-        let re = ANSI_RE.get_or_init(|| {
-            Regex::new(r"\x1b\[[\x20-\x3f]*[\x40-\x7e]").expect("static regex is valid")
-        });
-
         let (_session, pane_state) = self
             .registry
             .get_pane(pane)
@@ -231,12 +226,15 @@ impl pyre_proto::service::PyreDaemon for DaemonImpl {
             .ok_or(PyreError::NoSuchPane(pane))?;
 
         let snapshot = {
-            let rb = pane_state.ringbuf.lock().expect("ringbuf poisoned");
+            let rb = pane_state.ringbuf.lock().unwrap_or_else(|e| {
+                tracing::error!("ringbuf lock poisoned in capture_pane; recovering guard: {e}");
+                e.into_inner()
+            });
             rb.snapshot()
         };
 
         let lossy = String::from_utf8_lossy(&snapshot);
-        let stripped = re.replace_all(&lossy, "");
+        let stripped = crate::ansi::ANSI_CSI_RE.replace_all(&lossy, "");
         let all_lines: Vec<&str> = stripped.split('\n').collect();
         let take = (lines as usize).min(all_lines.len());
         let tail_lines = &all_lines[all_lines.len().saturating_sub(take)..];

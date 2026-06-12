@@ -56,7 +56,10 @@ impl RingBuf {
     }
 
     /// Return a linearized copy of the buffer contents, oldest→newest.
-    #[allow(dead_code)] // used in S4 reattach replay
+    // dead_code: snapshot() is called today by server.rs (replay/capture_pane)
+    // and worker.rs (capture_pane); the attribute suppresses the lint only for
+    // targets that don't see those call sites (e.g. lib.rs integration tests).
+    #[allow(dead_code)]
     pub fn snapshot(&self) -> Bytes {
         if self.len == 0 {
             return Bytes::new();
@@ -72,18 +75,23 @@ impl RingBuf {
     }
 
     /// Number of bytes currently stored.
-    #[allow(dead_code)] // used in tests and future S4 replay
+    // dead_code: used in unit tests below; the attribute is needed because
+    // the lib target and non-test binary builds do not see the test call site.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.len
     }
 
     /// Returns `true` if the buffer contains no bytes.
+    // dead_code: utility predicate; used in tests. Kept for future callers
+    // that need an emptiness check without calling snapshot().
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     /// Maximum capacity in bytes.
+    // dead_code: diagnostic / test helper; no production caller yet.
     #[allow(dead_code)]
     pub fn cap(&self) -> usize {
         self.cap

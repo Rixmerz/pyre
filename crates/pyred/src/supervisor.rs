@@ -83,13 +83,17 @@ impl PaneEventBus {
             agent: None,
         };
         {
-            let mut ring = self.ring.lock().expect("PaneEventBus ring poisoned");
+            let mut ring = self.ring.lock().unwrap_or_else(|e| {
+                tracing::error!("PaneEventBus ring lock poisoned; recovering guard: {e}");
+                e.into_inner()
+            });
             if ring.len() >= SUPERVISOR_EVENT_RING_CAP {
                 ring.pop_front();
             }
             ring.push_back(ev.clone());
         }
-        // Ignore lagged-receiver errors — slow subscribers catch up via ring.
+        // IGNORED: broadcast::send error means no active receivers; slow subscribers
+        // catch up via the ring buffer on their next call to events_after.
         let _ = self.tx.send(ev);
     }
 
@@ -100,7 +104,12 @@ impl PaneEventBus {
         let history: Vec<PaneEvent> = self
             .ring
             .lock()
-            .expect("PaneEventBus ring poisoned")
+            .unwrap_or_else(|e| {
+                tracing::error!(
+                    "PaneEventBus ring lock poisoned in events_after; recovering guard: {e}"
+                );
+                e.into_inner()
+            })
             .iter()
             .filter(|e| e.seq > after_seq)
             .cloned()
@@ -118,6 +127,10 @@ pub struct WorkerHandle {
     /// OS PID of the worker.
     pub pid: u32,
     /// Path to the worker's `WorkerControl` UDS (used for reconnect in S2).
+    // dead_code: sock_path is stored so the supervisor can reconnect to a
+    // worker after a crash (S2 reconnect feature). No reconnect logic exists
+    // yet; keep the field so the registration wire format doesn't change when
+    // that work lands.
     #[allow(dead_code)]
     pub sock_path: PathBuf,
     /// Path to the worker's raw-stream UDS for bidirectional PTY byte proxying.
@@ -445,6 +458,11 @@ pub struct SupervisorImpl {
     pub block_index: Arc<BlockIndex>,
     /// Sender for raw BlockEvents coming from workers (batched → Tantivy).
     /// Kept on the struct so `Clone` propagates it; read path active in S2.
+    // dead_code: event_tx is used in SupervisorWorker::block_event (the
+    // receive side drives the block-event batcher task). The field must stay
+    // on the struct so Clone propagates the sender to every tarpc handler
+    // clone; the lint fires because the field is never read back from the
+    // struct after construction.
     #[allow(dead_code)]
     pub event_tx: mpsc::Sender<BlockEvent>,
     /// Path to the supervisor's callback socket, passed to spawned workers.
@@ -1499,6 +1517,9 @@ impl SupervisorWorker for SupervisorWorkerImpl {
 
         // Unblock any spawn() RPC that is waiting for this worker to register.
         if let Some(tx) = self.pending_registrations.lock().await.remove(&session_id) {
+            // IGNORED: oneshot::send error means the receiver in spawn() already
+            // timed out and dropped its half; the registration still succeeds —
+            // the session is now live even if the original spawn() returned an error.
             let _ = tx.send(());
         }
 
@@ -1720,7 +1741,14 @@ async fn process_raw_event(
             None => return, // slot is dead — discard event
         }
     }
-    let pane_id = state.pane_id.expect("pane_id set above");
+    let Some(pane_id) = state.pane_id else {
+        tracing::error!(
+            session_id = raw.session_id,
+            slot_idx = raw.slot_idx,
+            "process_raw_event: pane_id unexpectedly None after allocation; skipping event"
+        );
+        return;
+    };
 
     // Feed bytes through the VTE parser.
     let mut parsed_events: Vec<ParsedEvent> = Vec::new();
@@ -1832,6 +1860,8 @@ async fn finalize_open_blocks(
                 let stdout_len = tokio::task::spawn_blocking(move || bw.close().unwrap_or(0))
                     .await
                     .unwrap_or(0);
+                // IGNORED: finalize_block error on shutdown drain is best-effort;
+                // acceptable data loss during process teardown.
                 let _ = store
                     .finalize_block(block, Utc::now(), None, stdout_len)
                     .await;
@@ -1844,6 +1874,8 @@ async fn finalize_open_blocks(
             if let Some(meta) = state.block_meta.remove(&block) {
                 let idx = block_index.clone();
                 tokio::task::spawn_blocking(move || {
+                    // IGNORED: Tantivy index error on shutdown drain is best-effort;
+                    // the block is already persisted in SQLite.
                     let _ = idx.add_block(&meta, &stdout_text);
                 });
             }
@@ -1958,6 +1990,8 @@ pub async fn run(
 
     let supervisor_sock = rt_pyre.join("supervisor.sock");
     if supervisor_sock.exists() {
+        // IGNORED: stale socket cleanup failure is non-fatal; UnixListener::bind
+        // will fail with a clear error if the file truly cannot be replaced.
         let _ = std::fs::remove_file(&supervisor_sock);
     }
 
@@ -2177,6 +2211,8 @@ pub async fn run(
             _ = sigterm.recv() => tracing::info!("supervisor: SIGTERM"),
             _ = sigint.recv()  => tracing::info!("supervisor: SIGINT"),
         }
+        // IGNORED: socket cleanup on shutdown; if removal fails the next
+        // startup will retry removal before binding (see supervisor_sock cleanup above).
         let _ = std::fs::remove_file(&shutdown_public);
         let _ = std::fs::remove_file(&shutdown_sv);
     };
@@ -2249,6 +2285,7 @@ async fn proxy_stream_to_worker(
         Some((_, s)) => s,
         None => {
             tracing::warn!(%pane_uuid, "MODE_STREAM: unknown pane uuid");
+            // IGNORED: shutdown error on an already-closing connection is harmless.
             let _ = client_sock.shutdown().await;
             return Ok(());
         }
@@ -2259,6 +2296,7 @@ async fn proxy_stream_to_worker(
         Some(p) => p,
         None => {
             tracing::warn!(session_id, "MODE_STREAM: no worker registered for session");
+            // IGNORED: shutdown error on an already-closing connection is harmless.
             let _ = client_sock.shutdown().await;
             return Ok(());
         }
@@ -2274,6 +2312,7 @@ async fn proxy_stream_to_worker(
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(%pane_uuid, "MODE_STREAM: connect worker stream sock: {e}");
+                // IGNORED: shutdown error on an already-closing connection is harmless.
                 let _ = client_sock.shutdown().await;
                 return Ok(());
             }
@@ -2332,8 +2371,9 @@ async fn proxy_stream_to_worker(
                                 *snap = Bytes::from(v[drop_n..].to_vec());
                             }
                         }
-                        // Ignore send errors — all subscribers may have disconnected
-                        // temporarily but the hub stays alive.
+                        // IGNORED: broadcast::send error means all subscribers have
+                        // temporarily disconnected; the hub stays alive and new
+                        // subscribers will receive output from the ring snapshot.
                         let _ = out_tx.send(f.data);
                     }
                     Err(e) => {
@@ -2445,6 +2485,9 @@ async fn proxy_stream_to_worker(
         }
     });
 
+    // IGNORED: JoinHandle results from out_task/in_task; both tasks log their
+    // own errors and a task panic here is unrecoverable per-connection only —
+    // the supervisor process itself continues serving other connections.
     let _ = tokio::join!(out_task, in_task);
     Ok(())
 }

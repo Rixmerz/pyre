@@ -199,14 +199,18 @@ impl SessionRegistry {
             agent,
         };
         {
-            let mut ring = self.event_ring.lock().expect("event_ring poisoned");
+            let mut ring = self.event_ring.lock().unwrap_or_else(|e| {
+                tracing::error!("event_ring lock poisoned; recovering guard: {e}");
+                e.into_inner()
+            });
             if ring.len() >= EVENT_RING_CAP {
                 ring.pop_front();
             }
             ring.push_back(ev.clone());
         }
-        // Ignore lagged-receiver errors — they just mean a slow subscriber
-        // missed some events and will get them from the ring on reconnect.
+        // IGNORED: broadcast::send error (no receivers or lagged) — slow
+        // subscribers catch up from the event_ring on their next call to
+        // events_after; no event is permanently lost.
         let _ = self.event_tx.send(ev);
     }
 
@@ -220,7 +224,10 @@ impl SessionRegistry {
         let history: Vec<PaneEvent> = self
             .event_ring
             .lock()
-            .expect("event_ring poisoned")
+            .unwrap_or_else(|e| {
+                tracing::error!("event_ring lock poisoned in events_after; recovering guard: {e}");
+                e.into_inner()
+            })
             .iter()
             .filter(|e| e.seq > after_seq)
             .cloned()
@@ -652,7 +659,13 @@ impl SessionRegistry {
 /// Build a `PaneInfo` from a live `PaneState`, reading the tracker under lock.
 fn pane_info_from_state(p: &Arc<PaneState>) -> PaneInfo {
     let (state, reason, last_activity, foreground_cmd, root_pid, agent, seen) = {
-        let t = p.state_tracker.lock().expect("tracker poisoned");
+        let t = p.state_tracker.lock().unwrap_or_else(|e| {
+            tracing::error!(
+                pane = ?p.id,
+                "state_tracker lock poisoned in pane_info_from_state; recovering guard: {e}"
+            );
+            e.into_inner()
+        });
         let last_activity = chrono::Utc::now()
             - chrono::Duration::from_std(t.last_output_at.elapsed())
                 .unwrap_or(chrono::Duration::zero());

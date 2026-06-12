@@ -99,7 +99,14 @@ pub async fn spawn_pty(
                     }
                     Ok(n) => {
                         {
-                            let mut rb = ringbuf_thread.lock().expect("ringbuf poisoned");
+                            let mut rb = ringbuf_thread
+                                .lock()
+                                .unwrap_or_else(|e| {
+                                    tracing::error!(
+                                        "ringbuf lock poisoned in pty reader thread; recovering guard: {e}"
+                                    );
+                                    e.into_inner()
+                                });
                             rb.push(&buf[..n]);
                         }
                         // Update last_output_at on the state tracker.
@@ -107,7 +114,12 @@ pub async fn spawn_pty(
                             t.touch_output();
                         }
                         let chunk = Bytes::copy_from_slice(&buf[..n]);
+                        // IGNORED: broadcast::send error means no active subscribers;
+                        // the ring buffer above already captured the bytes for replay.
                         let _ = out_tx.send(chunk.clone());
+                        // IGNORED: unbounded mpsc::send only fails if the receiver is
+                        // dropped (parser task exited), which means parsing is already
+                        // shutting down — safe to drop remaining chunks.
                         let _ = parse_tx.send(chunk);
                     }
                     Err(e) => {
@@ -132,6 +144,8 @@ pub async fn spawn_pty(
                     tracing::warn!("pty write: {e}");
                     break;
                 }
+                // IGNORED: flush error on a PTY is non-fatal; the kernel will
+                // drain the write buffer on the next write or on close.
                 let _ = std::io::Write::flush(&mut writer);
             }
         })
@@ -221,6 +235,9 @@ pub async fn spawn_pty(
             events.clear();
             parser.feed(&chunk, &mut events);
             for ev in events.drain(..) {
+                // IGNORED: broadcast::send error means no active block-event
+                // subscribers; the store persist path below is independent of
+                // whether any subscriber receives the event.
                 let _ = events_tx_clone.send(ev.clone());
 
                 // Push OSC 133 markers into the state tracker.
@@ -296,6 +313,10 @@ pub async fn spawn_pty(
                         if let Some(mut bw) = writers.remove(&block) {
                             let bytes_vec = data.to_vec();
                             let result = tokio::task::spawn_blocking(move || {
+                                // IGNORED: BlobWriter::write error is logged by
+                                // the caller if spawn_blocking itself fails; a
+                                // write error here means the block output is
+                                // truncated but the daemon stays live.
                                 let _ = bw.write(&bytes_vec);
                                 bw
                             })
@@ -342,6 +363,9 @@ pub async fn spawn_pty(
             let stdout_len = tokio::task::spawn_blocking(move || bw.close().unwrap_or(0))
                 .await
                 .unwrap_or(0);
+            // IGNORED: finalize_block error on shutdown drain is best-effort;
+            // a failure here only means the block's end timestamp / exit code
+            // won't be stored, which is acceptable during process teardown.
             let _ = store_clone
                 .finalize_block(block, Utc::now(), None, stdout_len)
                 .await;

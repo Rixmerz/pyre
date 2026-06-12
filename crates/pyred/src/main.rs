@@ -24,6 +24,7 @@
 //! config). `--mode worker`: run as a worker process (spawned by supervisor).
 
 mod agent_detect;
+mod ansi;
 mod config;
 mod hooks;
 mod index;

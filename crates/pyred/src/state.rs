@@ -20,6 +20,9 @@ use pyre_proto::{AgentKind, PaneStateKind};
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Shell-integration marker values from OSC 133.
+// dead_code: variant B is defined for completeness (OSC 133 spec) but
+// currently only A, C, and D are emitted by the parser in parser.rs.
+// Keep B so the enum matches the full OSC 133 alphabet without gaps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum Osc133Marker {
@@ -310,7 +313,13 @@ pub fn spawn_state_engine(
             let pane_trackers = registry.all_trackers().await;
             for (session_id, pane_id, tracker_arc) in pane_trackers {
                 let (changed, new_state, reason) = {
-                    let mut t = tracker_arc.lock().expect("tracker poisoned");
+                    let mut t = tracker_arc.lock().unwrap_or_else(|e| {
+                        tracing::error!(
+                            pane = ?pane_id,
+                            "state_tracker lock poisoned in state engine tick; recovering guard: {e}"
+                        );
+                        e.into_inner()
+                    });
                     t.foreground_cmd = foreground_of(t.root_pid);
                     if let Some(ref cmd) = t.foreground_cmd {
                         t.agent = crate::agent_detect::classify_foreground(cmd);

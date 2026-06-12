@@ -90,6 +90,10 @@ impl WorkerEnv {
 
 struct PaneHandle {
     shell: String,
+    // dead_code: cwd is stored at pane creation so get_pane_info can return
+    // it in PaneInfo without a round-trip through the store. The field is not
+    // read in any current code path but will be wired to PaneInfo::cwd when
+    // that proto field is populated in S3.
     #[allow(dead_code)]
     cwd: String,
     cols: u16,
@@ -698,14 +702,6 @@ impl WorkerControl for WorkerControlImpl {
         slot_idx: u32,
         lines: u32,
     ) -> Result<Vec<u8>, RpcError> {
-        use regex::Regex;
-        use std::sync::OnceLock;
-
-        static ANSI_RE: OnceLock<Regex> = OnceLock::new();
-        let re = ANSI_RE.get_or_init(|| {
-            Regex::new(r"\x1b\[[\x20-\x3f]*[\x40-\x7e]").expect("static regex is valid")
-        });
-
         // Read from the in-memory ring buffer of the live pane.
         // Clone the Arc<Mutex<RingBuf>> out before releasing the panes read
         // guard, then await the ring_buf lock separately.  Holding the RwLock
@@ -721,7 +717,7 @@ impl WorkerControl for WorkerControlImpl {
         let raw = ring_buf.lock().await.snapshot().to_vec();
 
         let lossy = String::from_utf8_lossy(&raw);
-        let stripped = re.replace_all(&lossy, "");
+        let stripped = crate::ansi::ANSI_CSI_RE.replace_all(&lossy, "");
         let all_lines: Vec<&str> = stripped.split('\n').collect();
         let take = (lines as usize).min(all_lines.len());
         let tail = &all_lines[all_lines.len().saturating_sub(take)..];

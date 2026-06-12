@@ -97,6 +97,9 @@ impl Store {
     }
 
     /// Return `(SessionId, layout_json)` for all sessions that have a layout column.
+    // dead_code: planned for supervisor startup layout-restore (S3 reattach);
+    // not yet called from any code path but kept to avoid re-implementing the
+    // query when that work lands.
     #[allow(dead_code)]
     pub async fn list_session_layouts(&self) -> Result<Vec<(SessionId, Option<String>)>> {
         let rows = sqlx::query("SELECT id, layout FROM sessions ORDER BY created_at ASC")
