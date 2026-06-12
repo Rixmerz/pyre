@@ -69,7 +69,6 @@ pub struct Rect {
 
 impl Rect {
     /// Returns `true` if the pixel `(px, py)` falls inside this rectangle.
-    #[allow(dead_code)] // useful for drag-resize hit-testing
     pub fn contains_pt(&self, px: u32, py: u32) -> bool {
         px >= self.x && px < self.x + self.w && py >= self.y && py < self.y + self.h
     }

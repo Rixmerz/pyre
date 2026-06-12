@@ -6,6 +6,7 @@ pub mod layout;
 pub mod paths;
 pub mod service;
 pub mod sessions;
+pub mod socket;
 pub mod supervisor;
 pub use blocks::{BlockEvent, BlockHit, ListBlocksReq, SearchBlocksReq};
 pub use handshake::{
@@ -21,6 +22,7 @@ pub use sessions::{
     AgentKind, OpenPaneReq, PaneInfo, PaneStateKind, ReplayBlocks, ResizePaneReq, ResizePaneRes,
     SessionInfo, SpawnResp,
 };
+pub use socket::{attach_stream, connect_control, default_socket};
 pub use supervisor::{
     BlockEvent as SupervisorBlockEvent, BlockKind, RegisterAck, RpcError as SupervisorRpcError,
     SupervisorWorkerClient, WorkerControlClient,

@@ -32,7 +32,7 @@ mod term;
 mod toast;
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -45,16 +45,13 @@ use futures::{SinkExt, StreamExt};
 use layout::{Dir, LayoutNode, Orient, Rect};
 use paint::Painter;
 use pyre_proto::{
-    write_control_client, InputFrame, OpenPaneSplitReq, OutputFrame, PaneEventKind, PaneId,
-    PaneSize, PyreDaemonClient, ResizePaneReq, SessionId, SpawnReq, SpawnResp, MODE_STREAM,
+    attach_stream, connect_control, default_socket, InputFrame, OpenPaneSplitReq, OutputFrame,
+    PaneEventKind, PaneId, PaneSize, PyreDaemonClient, ResizePaneReq, SessionId, SpawnReq,
+    SpawnResp,
 };
 use softbuffer::{Context as SbContext, Surface};
-use tarpc::client;
-use tarpc::tokio_serde::formats::Bincode;
 use term::{collect_grid, TermView};
 use toast::{ContextMenu, ToastDeck};
-use tokio::io::AsyncWriteExt;
-use tokio::net::UnixStream;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_serde::formats::SymmetricalBincode;
@@ -219,6 +216,7 @@ struct App {
     /// Shell override from `--shell` CLI flag.  Retained for future use when
     /// `open_pane_split` gains an optional cmd override; not consumed by the
     /// current M7-F path which inherits shell from the parent pane.
+    // dead_code: retained for the planned cmd-override path in open_pane_split (M7-F follow-up).
     #[allow(dead_code)]
     shell: Option<String>,
     modifiers: ModifiersState,
@@ -833,6 +831,7 @@ impl App {
     // ── M4: mouse handlers ────────────────────────────────────────────────────
 
     /// Pixel position converted to cell (col, row) in the full grid.
+    // dead_code: used by the planned clipboard-copy path (px_to_cell_in_pane uses it indirectly).
     #[allow(dead_code)]
     fn px_to_cell(&self, px: f64, py: f64) -> (usize, usize) {
         let col = (px as usize) / atlas::CELL_W;
@@ -1309,13 +1308,7 @@ async fn stream_bridge(
     input_rx: &mut mpsc::UnboundedReceiver<Bytes>,
     mut cancel: watch::Receiver<()>,
 ) -> Result<()> {
-    let mut stream_sock = UnixStream::connect(&socket)
-        .await
-        .with_context(|| format!("connect {}", socket.display()))?;
-    stream_sock.write_all(&[MODE_STREAM]).await?;
-    stream_sock.write_all(session.0.as_bytes()).await?;
-    stream_sock.write_all(pane.0.as_bytes()).await?;
-
+    let stream_sock = attach_stream(&socket, session, pane).await?;
     let (rd, wr) = stream_sock.into_split();
     let mut output_frames = tokio_serde::SymmetricallyFramed::new(
         FramedRead::new(rd, LengthDelimitedCodec::new()),
@@ -1422,28 +1415,11 @@ fn rect_to_cells(rect: Rect) -> (usize, usize) {
     (cols, rows)
 }
 
-fn default_socket() -> PathBuf {
-    if let Ok(p) = std::env::var("PYRE_SOCKET") {
-        return PathBuf::from(p);
-    }
-    if let Ok(rt) = std::env::var("XDG_RUNTIME_DIR") {
-        return PathBuf::from(rt).join("pyre.sock");
-    }
-    let uid = unsafe { libc::getuid() };
-    PathBuf::from(format!("/tmp/pyre-{uid}.sock"))
-}
-
-async fn control_client(socket: &Path) -> Result<PyreDaemonClient> {
-    let mut sock = UnixStream::connect(socket)
-        .await
-        .with_context(|| format!("connect {}", socket.display()))?;
-    write_control_client(&mut sock).await?;
-    let transport = tarpc::serde_transport::new(
-        tokio_util::codec::Framed::new(sock, LengthDelimitedCodec::new()),
-        Bincode::default(),
-    );
-    Ok(PyreDaemonClient::new(client::Config::default(), transport).spawn())
-}
+// default_socket() and connect_control() are provided by pyre_proto.
+//
+// Note: pyre-gpu previously checked $PYRE_SOCKET inside default_socket().
+// That override is now handled at the call site in main() where $PYRE_SOCK /
+// $PYRE_SOCKET can be applied before passing the resolved path to the helpers.
 
 async fn resolve_session(client: &PyreDaemonClient, prefix: &str) -> Result<SessionId> {
     let sessions = client
@@ -1532,7 +1508,13 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let socket = cli.socket.unwrap_or_else(default_socket);
+    // Priority: --socket CLI arg > $PYRE_SOCKET env > default_socket() (XDG / /tmp).
+    // The old local default_socket() checked $PYRE_SOCKET internally; we apply
+    // the same precedence here at the call site so the canonical helper stays clean.
+    let socket = cli
+        .socket
+        .or_else(|| std::env::var("PYRE_SOCKET").ok().map(PathBuf::from))
+        .unwrap_or_else(default_socket);
     let painter = Painter::from_system().context("init painter")?;
 
     // Load active theme from config; fall back to built-in default.
@@ -1551,7 +1533,7 @@ async fn main() -> Result<()> {
                 .clone()
         });
 
-    let client = control_client(&socket).await?;
+    let client = connect_control(&socket).await?;
     let (session, pane) = if let Some(ref sess_prefix) = cli.session {
         let session = resolve_session(&client, sess_prefix).await?;
         let pane = match &cli.pane {
@@ -1621,19 +1603,7 @@ async fn main() -> Result<()> {
             loop {
                 // Each iteration needs a fresh control connection; reuse the
                 // same helper used by the main path.
-                let poll_client = match async {
-                    let mut sock = UnixStream::connect(&push_socket).await?;
-                    write_control_client(&mut sock).await?;
-                    let transport = tarpc::serde_transport::new(
-                        tokio_util::codec::Framed::new(sock, LengthDelimitedCodec::new()),
-                        Bincode::default(),
-                    );
-                    anyhow::Ok(
-                        PyreDaemonClient::new(tarpc::client::Config::default(), transport).spawn(),
-                    )
-                }
-                .await
-                {
+                let poll_client = match connect_control(&push_socket).await {
                     Ok(c) => c,
                     Err(_) => {
                         tokio::time::sleep(backoff).await;

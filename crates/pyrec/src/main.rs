@@ -28,14 +28,11 @@ use bytes::Bytes;
 use clap::Parser;
 use futures::{SinkExt, StreamExt};
 use pyre_proto::{
-    write_control_client, BlockHit, InputFrame, ListBlocksReq, OpenPaneReq, OutputFrame, PaneId,
-    PaneStateKind, PyreDaemonClient, SearchBlocksReq, SessionId, SpawnReq, SpawnResp, MODE_STREAM,
-    PROTO_VERSION,
+    attach_stream, connect_control, default_socket, BlockHit, InputFrame, ListBlocksReq,
+    OpenPaneReq, OutputFrame, PaneId, PaneStateKind, PyreDaemonClient, SearchBlocksReq, SessionId,
+    SpawnReq, SpawnResp, PROTO_VERSION,
 };
-use tarpc::client;
-use tarpc::tokio_serde::formats::Bincode;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
 use tokio_serde::formats::SymmetricalBincode;
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 use tracing_subscriber::EnvFilter;
@@ -334,14 +331,7 @@ enum IntegrationCmd {
 // Helpers
 // ──────────────────────────────────────────────────────────────────────────────
 
-fn default_socket() -> PathBuf {
-    if let Ok(rt) = std::env::var("XDG_RUNTIME_DIR") {
-        return PathBuf::from(rt).join("pyre.sock");
-    }
-    // SAFETY: getuid() is always safe to call.
-    let uid = unsafe { libc::getuid() };
-    PathBuf::from(format!("/tmp/pyre-{uid}.sock"))
-}
+// default_socket() is provided by pyre_proto::default_socket.
 
 fn term_size() -> (u16, u16) {
     use std::os::fd::AsRawFd;
@@ -354,19 +344,7 @@ fn term_size() -> (u16, u16) {
     }
 }
 
-/// Open a control connection and return a tarpc client.
-async fn control_client(socket: &Path) -> Result<PyreDaemonClient> {
-    let mut sock = UnixStream::connect(socket)
-        .await
-        .with_context(|| format!("connect {}", socket.display()))?;
-    write_control_client(&mut sock).await?;
-
-    let transport = tarpc::serde_transport::new(
-        tokio_util::codec::Framed::new(sock, LengthDelimitedCodec::new()),
-        Bincode::default(),
-    );
-    Ok(PyreDaemonClient::new(client::Config::default(), transport).spawn())
-}
+// connect_control() is provided by pyre_proto::connect_control.
 
 /// Resolve a session id from a full uuid string or a ≥8-char prefix.
 async fn resolve_session(client: &PyreDaemonClient, prefix: &str) -> Result<SessionId> {
@@ -509,13 +487,7 @@ impl Drop for RawGuard {
 
 /// Open a stream connection and bridge PTY I/O between the terminal and daemon.
 async fn run_attach(socket: &Path, session: SessionId, pane: PaneId) -> Result<()> {
-    let mut stream_sock = UnixStream::connect(socket)
-        .await
-        .with_context(|| format!("connect stream {}", socket.display()))?;
-    stream_sock.write_all(&[MODE_STREAM]).await?;
-    stream_sock.write_all(session.0.as_bytes()).await?;
-    stream_sock.write_all(pane.0.as_bytes()).await?;
-
+    let stream_sock = attach_stream(socket, session, pane).await?;
     let (rd, wr) = stream_sock.into_split();
 
     let frame_read = FramedRead::new(rd, LengthDelimitedCodec::new());
@@ -568,7 +540,7 @@ async fn run_attach(socket: &Path, session: SessionId, pane: PaneId) -> Result<(
     let socket_clone = socket.to_owned();
     let signal_task = tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
-            if let Ok(ctrl) = control_client(&socket_clone).await {
+            if let Ok(ctrl) = connect_control(&socket_clone).await {
                 let _ = ctrl.kill(tarpc::context::current(), session).await;
             }
         }
@@ -583,7 +555,7 @@ async fn run_attach(socket: &Path, session: SessionId, pane: PaneId) -> Result<(
 }
 
 async fn run_default(socket: PathBuf, shell: Option<String>) -> Result<()> {
-    let client = control_client(&socket).await?;
+    let client = connect_control(&socket).await?;
 
     let (cols, rows) = term_size();
     let shell_resolved = shell.or_else(|| std::env::var("SHELL").ok()).or_else(|| {
@@ -612,7 +584,7 @@ async fn run_default(socket: PathBuf, shell: Option<String>) -> Result<()> {
 }
 
 async fn run_sessions(socket: PathBuf) -> Result<()> {
-    let client = control_client(&socket).await?;
+    let client = connect_control(&socket).await?;
     let sessions = client
         .list_sessions(tarpc::context::current())
         .await
@@ -632,7 +604,7 @@ async fn run_sessions(socket: PathBuf) -> Result<()> {
 }
 
 async fn run_panes(socket: PathBuf, session_prefix: String) -> Result<()> {
-    let client = control_client(&socket).await?;
+    let client = connect_control(&socket).await?;
     let session = resolve_session(&client, &session_prefix).await?;
     let panes = client
         .list_panes(tarpc::context::current(), session)
@@ -662,7 +634,7 @@ async fn run_attach_cmd(
     session_prefix: String,
     pane_prefix: Option<String>,
 ) -> Result<()> {
-    let client = control_client(&socket).await?;
+    let client = connect_control(&socket).await?;
     let session = resolve_session(&client, &session_prefix).await?;
     let pane = match pane_prefix {
         Some(ref prefix) => resolve_pane(&client, session, prefix).await?,
@@ -678,7 +650,7 @@ async fn run_new_pane(
     cols: u16,
     rows: u16,
 ) -> Result<()> {
-    let client = control_client(&socket).await?;
+    let client = connect_control(&socket).await?;
     let session = resolve_session(&client, &session_prefix).await?;
     let req = OpenPaneReq {
         session,
@@ -700,7 +672,7 @@ async fn run_new_pane(
 }
 
 async fn run_list(socket: PathBuf, limit: u32) -> Result<()> {
-    let client = control_client(&socket).await?;
+    let client = connect_control(&socket).await?;
     let blocks = client
         .list_blocks(
             tarpc::context::current(),
@@ -727,7 +699,7 @@ async fn run_list(socket: PathBuf, limit: u32) -> Result<()> {
 }
 
 async fn run_search(socket: PathBuf, query: String, limit: u32, failures: bool) -> Result<()> {
-    let client = control_client(&socket).await?;
+    let client = connect_control(&socket).await?;
     let hits: Vec<BlockHit> = client
         .search_blocks(
             tarpc::context::current(),
@@ -758,7 +730,7 @@ async fn run_capture_pane(
     lines: u32,
     _pipe: bool,
 ) -> Result<()> {
-    let client = control_client(&socket).await?;
+    let client = connect_control(&socket).await?;
 
     // Resolve the pane id. If a session prefix is given we search that session's
     // panes; otherwise we scan all sessions for a matching pane.
@@ -807,7 +779,7 @@ async fn run_capture_pane(
 async fn run_status(socket: PathBuf, waiting: bool, json: bool) -> Result<()> {
     use std::io::IsTerminal;
 
-    let client = control_client(&socket).await?;
+    let client = connect_control(&socket).await?;
     let panes = client
         .list_all_panes(tarpc::context::current())
         .await
@@ -900,7 +872,7 @@ async fn run_status(socket: PathBuf, waiting: bool, json: bool) -> Result<()> {
 }
 
 async fn run_kill_session(socket: PathBuf, target: String) -> Result<()> {
-    let client = control_client(&socket).await?;
+    let client = connect_control(&socket).await?;
     let session = resolve_session(&client, &target).await?;
     client
         .close_session(tarpc::context::current(), session)
@@ -915,7 +887,7 @@ async fn run_send_keys(
     keys: Vec<String>,
     append_enter: bool,
 ) -> Result<()> {
-    let client = control_client(&socket).await?;
+    let client = connect_control(&socket).await?;
 
     // Resolve pane by scanning all sessions.
     let sessions = client
@@ -958,7 +930,7 @@ async fn run_wait_pane(
     state: String,
     timeout: u32,
 ) -> Result<()> {
-    let client = control_client(&socket).await?;
+    let client = connect_control(&socket).await?;
     let pane = resolve_pane_global(&client, &pane_prefix).await?;
     let kind = parse_pane_state(&state)?;
     let reached = client
@@ -986,7 +958,7 @@ async fn run_pane_read(
     lines: u32,
     source: &str,
 ) -> Result<()> {
-    let client = control_client(&socket).await?;
+    let client = connect_control(&socket).await?;
     let pane = if let Some(sess) = session {
         resolve_pane(
             &client,
@@ -1033,7 +1005,7 @@ async fn run_pane_run(socket: PathBuf, session_prefix: String, command: Vec<Stri
     if command.is_empty() {
         return Err(anyhow!("pane-run requires a command"));
     }
-    let client = control_client(&socket).await?;
+    let client = connect_control(&socket).await?;
     let session = resolve_session(&client, &session_prefix).await?;
     let pane = first_pane(&client, session).await?;
     let mut text = command.join(" ");
@@ -1054,7 +1026,7 @@ async fn run_session_new(
     shell: Option<String>,
     detach: bool,
 ) -> Result<()> {
-    let client = control_client(&socket).await?;
+    let client = connect_control(&socket).await?;
     let (cols, rows) = term_size();
     let req = SpawnReq {
         shell: shell.or_else(|| std::env::var("SHELL").ok()),
@@ -1166,7 +1138,7 @@ async fn run_doctor(socket: PathBuf) -> Result<()> {
         mark_fail(&format!("socket missing ({})", socket.display()));
     }
 
-    match control_client(&socket).await {
+    match connect_control(&socket).await {
         Ok(client) => {
             mark_ok(&format!("RPC handshake (proto_version={PROTO_VERSION})"));
             match client.list_sessions(tarpc::context::current()).await {
@@ -1292,7 +1264,7 @@ fn run_remote(
 }
 
 async fn run_split_window(socket: PathBuf, session_prefix: String) -> Result<()> {
-    let client = control_client(&socket).await?;
+    let client = connect_control(&socket).await?;
     let session = resolve_session(&client, &session_prefix).await?;
     let (cols, rows) = term_size();
     let req = OpenPaneReq {
@@ -1314,7 +1286,7 @@ async fn run_split_window(socket: PathBuf, session_prefix: String) -> Result<()>
 }
 
 async fn run_select_pane(sock_path: PathBuf, target: String) -> Result<()> {
-    let client = control_client(&sock_path).await?;
+    let client = connect_control(&sock_path).await?;
     let pane = resolve_pane_global(&client, &target).await?;
     client
         .request_focus(tarpc::context::current(), pane)
@@ -1372,7 +1344,7 @@ async fn main() -> Result<()> {
             pipe,
         }) => run_capture_pane(sock_path, pane, session, lines, pipe).await,
         Some(Sub::NewSession { name: _, detach }) => {
-            let client = control_client(&sock_path).await?;
+            let client = connect_control(&sock_path).await?;
             let (cols, rows) = term_size();
             let shell = cli
                 .shell

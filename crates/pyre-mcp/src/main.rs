@@ -8,23 +8,19 @@
 //! Adequate for v0.1; can be upgraded to true tarpc event pushing later.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use pyre_proto::{
-    write_control_client, ListBlocksReq, OpenPaneReq, OpenPaneSplitReq, Orient, PaneStateKind,
-    PyreDaemonClient, SearchBlocksReq, SessionId, SpawnReq,
+    connect_control, default_socket, ListBlocksReq, OpenPaneReq, OpenPaneSplitReq, Orient,
+    PaneStateKind, PyreDaemonClient, SearchBlocksReq, SessionId, SpawnReq,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tarpc::client;
-use tarpc::tokio_serde::formats::Bincode;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
-use tokio_util::codec::LengthDelimitedCodec;
 use tracing::{debug, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -34,6 +30,7 @@ use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Deserialize)]
 struct Request {
+    // dead_code: JSON-RPC 2.0 spec requires this field but we only validate via serde.
     #[allow(dead_code)]
     jsonrpc: String,
     /// None for notifications.
@@ -91,31 +88,7 @@ impl Response {
     }
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Socket helpers (mirrors pyrec pattern)
-// ──────────────────────────────────────────────────────────────────────────────
-
-fn default_socket() -> PathBuf {
-    if let Ok(rt) = std::env::var("XDG_RUNTIME_DIR") {
-        return PathBuf::from(rt).join("pyre.sock");
-    }
-    // SAFETY: getuid() is always safe to call.
-    let uid = unsafe { libc::getuid() };
-    PathBuf::from(format!("/tmp/pyre-{uid}.sock"))
-}
-
-async fn control_client(socket: &Path) -> Result<PyreDaemonClient> {
-    let mut sock = UnixStream::connect(socket)
-        .await
-        .with_context(|| format!("connect {}", socket.display()))?;
-    write_control_client(&mut sock).await?;
-
-    let transport = tarpc::serde_transport::new(
-        tokio_util::codec::Framed::new(sock, LengthDelimitedCodec::new()),
-        Bincode::default(),
-    );
-    Ok(PyreDaemonClient::new(client::Config::default(), transport).spawn())
-}
+// Socket helpers are provided by pyre_proto::{connect_control, default_socket}.
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Server state
@@ -140,7 +113,7 @@ impl Server {
     }
 
     async fn client(&self) -> Result<PyreDaemonClient> {
-        control_client(&self.socket).await
+        connect_control(&self.socket).await
     }
 
     async fn send_line(&self, value: &Value) -> Result<()> {
@@ -407,7 +380,7 @@ impl Server {
             let mut backoff = std::time::Duration::from_millis(100);
 
             loop {
-                let client = match control_client(&socket).await {
+                let client = match connect_control(&socket).await {
                     Ok(c) => c,
                     Err(_) => {
                         tokio::time::sleep(backoff).await;
