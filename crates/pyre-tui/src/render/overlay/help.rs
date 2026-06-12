@@ -166,3 +166,95 @@ pub fn render_help_overlay(frame: &mut ratatui::Frame, t: &theme::LegacyTheme) {
         }
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests — help overlay render (TestBackend, no daemon required)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    use super::{render_help_overlay, CATEGORIES};
+    use crate::theme::EMBER;
+
+    fn test_terminal() -> Terminal<TestBackend> {
+        // 120×40 is wide enough to display the full help overlay without clipping.
+        let backend = TestBackend::new(120, 40);
+        Terminal::new(backend).expect("TestBackend terminal must construct without error")
+    }
+
+    fn buffer_string(term: &Terminal<TestBackend>) -> String {
+        term.backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+    }
+
+    /// The help overlay must render without panicking on a standard terminal size.
+    ///
+    /// Verifies that all the geometry calculations (centering, clamping, row
+    /// iteration) stay in-bounds and that `frame.render_widget` is reached for
+    /// every path through the renderer.
+    #[test]
+    fn render_help_overlay_does_not_panic() {
+        let mut term = test_terminal();
+        term.draw(|frame| render_help_overlay(frame, &EMBER))
+            .expect("draw must succeed with TestBackend");
+    }
+
+    /// The rendered buffer must contain the overlay title text.
+    ///
+    /// The title `" key bindings  q / Esc to close "` is the canonical way to
+    /// identify the overlay in the buffer; if it disappears the binding is gone.
+    #[test]
+    fn help_overlay_buffer_contains_title_text() {
+        let mut term = test_terminal();
+        term.draw(|frame| render_help_overlay(frame, &EMBER))
+            .expect("draw must succeed");
+        let buf = buffer_string(&term);
+        assert!(
+            buf.contains("key bindings"),
+            "buffer must contain overlay title 'key bindings'; got first 200 chars: {:?}",
+            &buf[..200.min(buf.len())]
+        );
+    }
+
+    /// The rendered buffer must contain the word "detach" (case-insensitive),
+    /// confirming the detach binding entry is displayed.
+    ///
+    /// "Detach (leave daemon running)" lives in the Sessions category.
+    /// If the entry is removed the test fails, pinning the binding's presence.
+    #[test]
+    fn help_overlay_buffer_contains_detach_entry() {
+        let mut term = test_terminal();
+        term.draw(|frame| render_help_overlay(frame, &EMBER))
+            .expect("draw must succeed");
+        let buf = buffer_string(&term).to_lowercase();
+        assert!(
+            buf.contains("detach"),
+            "buffer must contain 'detach' from the Sessions category"
+        );
+    }
+
+    /// CATEGORIES must contain at least one category with at least one entry.
+    ///
+    /// Pure data guard: if someone accidentally empties the binding table the
+    /// overlay would render as an empty box with no content, silently hiding all
+    /// key bindings from users.
+    #[test]
+    fn categories_table_is_non_empty() {
+        assert!(
+            !CATEGORIES.is_empty(),
+            "CATEGORIES must have at least one entry; got empty slice"
+        );
+        let total_entries: usize = CATEGORIES.iter().map(|(_, entries)| entries.len()).sum();
+        assert!(
+            total_entries > 0,
+            "CATEGORIES must define at least one binding entry; got {total_entries}"
+        );
+    }
+}

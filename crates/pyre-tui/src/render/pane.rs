@@ -112,17 +112,7 @@ pub(crate) fn render_pane(
         .unwrap_or_else(|| format!(" pane {short8} "));
     // Append state indicators: [ZOOM] when pane is zoomed, SCROLL when scrolled
     // into history. Both can coexist (zoomed pane scrolled into scrollback).
-    let pane_title: String = {
-        let mut t = if slot.scroll_offset > 0 {
-            format!("{base_title}  SCROLL ")
-        } else {
-            base_title
-        };
-        if is_zoomed {
-            t.push_str(" [ZOOM]");
-        }
-        t
-    };
+    let pane_title: String = build_pane_title(&base_title, slot.scroll_offset, is_zoomed);
     let border_block = if focused {
         // Zoomed pane: use `theme.info` (ANSI-blue proxy) so the border is
         // clearly distinct from the normal focus color (`theme.border_focus` /
@@ -629,5 +619,89 @@ pub(crate) fn render_layout(
                 current_path.pop();
             }
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pure helpers — extracted for unit-testability
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Build the border title string for a pane, appending state indicators.
+///
+/// - When `scroll_offset > 0` the title gains a ` SCROLL ` suffix so the user
+///   can see they are scrolled into scrollback history.
+/// - When `is_zoomed` the title gains a ` [ZOOM]` suffix.
+/// - Both indicators can coexist (zoomed pane scrolled into scrollback).
+pub(crate) fn build_pane_title(base_title: &str, scroll_offset: usize, is_zoomed: bool) -> String {
+    let mut t = if scroll_offset > 0 {
+        format!("{base_title}  SCROLL ")
+    } else {
+        base_title.to_owned()
+    };
+    if is_zoomed {
+        t.push_str(" [ZOOM]");
+    }
+    t
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BASE: &str = " pane abc12345 ";
+
+    /// A live pane (not zoomed, not scrolled) must produce the base title unchanged.
+    #[test]
+    fn build_pane_title_live_pane_no_indicators() {
+        let title = build_pane_title(BASE, 0, false);
+        assert_eq!(title, BASE, "live pane must have no indicators appended");
+    }
+
+    /// A zoomed pane must include \"[ZOOM]\" in the title.
+    #[test]
+    fn build_pane_title_zoomed_includes_zoom_marker() {
+        let title = build_pane_title(BASE, 0, true);
+        assert!(
+            title.contains("[ZOOM]"),
+            "zoomed pane title must contain \"[ZOOM]\"; got: {title:?}"
+        );
+    }
+
+    /// A pane scrolled into scrollback (scroll_offset > 0) must include \"SCROLL\".
+    #[test]
+    fn build_pane_title_scrolled_includes_scroll_marker() {
+        let title = build_pane_title(BASE, 3, false);
+        assert!(
+            title.contains("SCROLL"),
+            "scrolled pane title must contain \"SCROLL\"; got: {title:?}"
+        );
+    }
+
+    /// Both indicators must coexist when the pane is zoomed AND scrolled.
+    #[test]
+    fn build_pane_title_zoomed_and_scrolled_has_both_markers() {
+        let title = build_pane_title(BASE, 5, true);
+        assert!(
+            title.contains("SCROLL"),
+            "title must contain \"SCROLL\" when scrolled; got: {title:?}"
+        );
+        assert!(
+            title.contains("[ZOOM]"),
+            "title must contain \"[ZOOM]\" when zoomed; got: {title:?}"
+        );
+    }
+
+    /// scroll_offset == 0 must never produce a \"SCROLL\" marker.
+    #[test]
+    fn build_pane_title_zero_offset_no_scroll_marker() {
+        let title = build_pane_title(BASE, 0, false);
+        assert!(
+            !title.contains("SCROLL"),
+            "title must not contain \"SCROLL\" when offset is 0; got: {title:?}"
+        );
     }
 }

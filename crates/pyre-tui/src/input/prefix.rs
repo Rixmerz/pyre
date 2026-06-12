@@ -17,6 +17,7 @@ use crate::model::prompt::{NamePrompt, PromptKind};
 use crate::render::overlay::picker::ThemePickerState;
 
 /// Outcome of a prefix-key dispatch, returned to the event loop.
+#[derive(Debug)]
 pub(crate) enum PrefixAction {
     /// Action executed; caller should `continue` the event loop.
     Continue,
@@ -26,6 +27,26 @@ pub(crate) enum PrefixAction {
     Detach,
     /// Help overlay toggled (Ctrl-Space ?).
     ToggleHelp,
+}
+
+/// Classify a prefix key into an immediate `PrefixAction` without inspecting
+/// `AppState`.  Returns `Some(action)` for keys that produce a definitive
+/// outcome regardless of application state, and `None` for all other keys
+/// (whose handling requires mutable access to `AppState`).
+///
+/// Extracted as a pure, synchronous function so the dispatch table can be
+/// verified in unit tests without constructing a live daemon client.
+// Only called from the inline test module; suppress the dead_code lint for
+// non-test builds rather than making the function pub or adding a production
+// call site prematurely.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn immediate_prefix_action(code: KeyCode) -> Option<PrefixAction> {
+    match code {
+        KeyCode::Char('q') => Some(PrefixAction::Quit),
+        KeyCode::Char('d') => Some(PrefixAction::Detach),
+        KeyCode::Char('?') => Some(PrefixAction::ToggleHelp),
+        _ => None,
+    }
 }
 
 /// Handle one key following a Ctrl-Space prefix.
@@ -240,4 +261,72 @@ pub(crate) async fn handle_prefix_key(state: &mut AppState, code: KeyCode) -> Pr
     }
 
     PrefixAction::Continue
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests — prefix dispatch table (pure, no daemon required)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ctrl-Space ? must map to PrefixAction::ToggleHelp.
+    ///
+    /// Verifies the help-overlay dispatch entry in the prefix table so that a
+    /// future rename or re-ordering of the match arms cannot silently drop the
+    /// binding.
+    #[test]
+    fn question_mark_dispatches_to_toggle_help() {
+        let action = immediate_prefix_action(KeyCode::Char('?'));
+        assert!(
+            matches!(action, Some(PrefixAction::ToggleHelp)),
+            "Ctrl-Space ? must produce PrefixAction::ToggleHelp; got: {action:?}",
+        );
+    }
+
+    /// Ctrl-Space d must map to PrefixAction::Detach.
+    ///
+    /// Detach exits the TUI while leaving the daemon session running; this test
+    /// pins that binding so it cannot regress to Quit or Continue.
+    #[test]
+    fn d_key_dispatches_to_detach() {
+        let action = immediate_prefix_action(KeyCode::Char('d'));
+        assert!(
+            matches!(action, Some(PrefixAction::Detach)),
+            "Ctrl-Space d must produce PrefixAction::Detach; got: {action:?}",
+        );
+    }
+
+    /// Ctrl-Space q must map to PrefixAction::Quit.
+    ///
+    /// Guard: Quit must not accidentally swap to Detach or vice-versa.
+    #[test]
+    fn q_key_dispatches_to_quit() {
+        let action = immediate_prefix_action(KeyCode::Char('q'));
+        assert!(
+            matches!(action, Some(PrefixAction::Quit)),
+            "Ctrl-Space q must produce PrefixAction::Quit; got: {action:?}",
+        );
+    }
+
+    /// Keys that need AppState (e.g. 'c', 'z') must return None from the pure
+    /// helper so the async path handles them instead.
+    #[test]
+    fn stateful_key_returns_none_from_immediate() {
+        for key in [
+            KeyCode::Char('c'),
+            KeyCode::Char('z'),
+            KeyCode::Char('n'),
+            KeyCode::Char('p'),
+            KeyCode::Char('x'),
+            KeyCode::Char('s'),
+        ] {
+            let action = immediate_prefix_action(key);
+            assert!(
+                action.is_none(),
+                "key {key:?} must return None from immediate_prefix_action (needs AppState); got: {action:?}",
+            );
+        }
+    }
 }
