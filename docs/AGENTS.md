@@ -62,7 +62,7 @@ Pane and session IDs are UUIDs. Eight-character prefixes are accepted by all
 ## MCP tools reference (`pyre-mcp`)
 
 Point any MCP client at `pyre-mcp` (stdio JSON-RPC 2.0). The server exposes
-19 tools and MCP resources (`pane://`, `session://`, `block://`,
+17 tools and MCP resources (`pane://`, `session://`, `block://`,
 `state://panes`).
 
 Mutating tools require `[mcp].allow_mutations = true` in the daemon config.
@@ -224,7 +224,7 @@ honest picture as of v0.4 sprint:
   session in its own worker process. One claude OOM kills its worker,
   not the multiplexer or the other agents. herdr has no published
   process boundary between agents.
-- **MCP-first orchestration.** Any MCP client can drive pyre via 19
+- **MCP-first orchestration.** Any MCP client can drive pyre via 17
   tools: `session_spawn`, `pane_run_command`, `pane_capture`,
   `wait_pane_state`, `block_search`, plus `pane://` and `block://`
   resources. herdr ships a single bundled chat UI; external agents
