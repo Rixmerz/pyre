@@ -3232,7 +3232,6 @@ dependencies = [
  "crossterm",
  "futures",
  "insta",
- "libc",
  "pyre-proto",
  "pyre-themes",
  "ratatui",

@@ -155,15 +155,6 @@ fn resolve_shell(shell_arg: Option<String>) -> Option<String> {
         })
 }
 
-fn default_socket() -> PathBuf {
-    if let Ok(rt) = std::env::var("XDG_RUNTIME_DIR") {
-        return PathBuf::from(rt).join("pyre.sock");
-    }
-    // SAFETY: getuid() is always safe to call.
-    let uid = unsafe { libc::getuid() };
-    PathBuf::from(format!("/tmp/pyre-{uid}.sock"))
-}
-
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let log_file = std::fs::OpenOptions::new()
@@ -204,7 +195,9 @@ async fn main() -> Result<()> {
         splash::SplashColors::from_palette(&theme.palette)
     };
     splash::play_splash(cli.no_splash, Some(splash_colors));
-    let socket = cli.socket.unwrap_or_else(default_socket);
+    let socket = cli
+        .socket
+        .unwrap_or_else(pyre_proto::socket::default_socket);
     let shell = resolve_shell(cli.shell);
 
     match cli.command {

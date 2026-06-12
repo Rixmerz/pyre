@@ -6,12 +6,8 @@ use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
 };
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
-use pyre_proto::{write_control_client, PaneId, PyreDaemonClient, SessionId};
-use tarpc::client;
-use tarpc::tokio_serde::formats::Bincode;
-use tokio::net::UnixStream;
+use pyre_proto::{PaneId, PyreDaemonClient, SessionId};
 use tokio::process::Command as TokioCommand;
-use tokio_util::codec::LengthDelimitedCodec;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Terminal restore guard
@@ -116,18 +112,9 @@ pub async fn control_client(socket: &Path) -> Result<PyreDaemonClient> {
     })
 }
 
-/// Single non-retrying connect attempt; wraps the mode-byte handshake.
+/// Single non-retrying connect attempt; delegates to `pyre_proto::socket::connect_control`.
 pub async fn try_connect_control(socket: &Path) -> Result<PyreDaemonClient> {
-    let mut sock = UnixStream::connect(socket)
-        .await
-        .with_context(|| format!("connect {}", socket.display()))?;
-    write_control_client(&mut sock).await?;
-
-    let transport = tarpc::serde_transport::new(
-        tokio_util::codec::Framed::new(sock, LengthDelimitedCodec::new()),
-        Bincode::default(),
-    );
-    Ok(PyreDaemonClient::new(client::Config::default(), transport).spawn())
+    pyre_proto::socket::connect_control(socket).await
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

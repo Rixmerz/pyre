@@ -13,11 +13,8 @@ use futures::StreamExt;
 use pyre_proto::{
     layout::{LayoutNode, Orient},
     InputFrame, OpenPaneReq, OpenPaneSplitReq, OutputFrame, PaneId, SessionId, SpawnReq, SpawnResp,
-    MODE_STREAM,
 };
 use ratatui::layout::Rect;
-use tokio::io::AsyncWriteExt;
-use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tokio_serde::formats::SymmetricalBincode;
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
@@ -61,13 +58,7 @@ pub(crate) async fn attach_pane(
 ) -> Result<PaneSlot> {
     tracing::debug!(cols, rows, pane_id = %pane_id.0, "attach_pane: entry");
 
-    let mut stream_sock = UnixStream::connect(socket)
-        .await
-        .with_context(|| format!("connect stream {}", socket.display()))?;
-    stream_sock.write_all(&[MODE_STREAM]).await?;
-    stream_sock.write_all(session.0.as_bytes()).await?;
-    stream_sock.write_all(pane_id.0.as_bytes()).await?;
-
+    let stream_sock = pyre_proto::socket::attach_stream(socket, session, pane_id).await?;
     let (rd, wr) = stream_sock.into_split();
     let frame_read = FramedRead::new(rd, LengthDelimitedCodec::new());
     let frame_write = FramedWrite::new(wr, LengthDelimitedCodec::new());
@@ -845,6 +836,7 @@ mod tests {
             toast_rx,
             pending_menu_action: None,
             last_split_at: None,
+            help_open: false,
         }
     }
 
