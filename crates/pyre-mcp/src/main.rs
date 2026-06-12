@@ -55,7 +55,90 @@ struct Response {
 struct RpcError {
     code: i32,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<Value>,
 }
+
+/// Machine-readable error detail carried in the `data` field of every RPC
+/// error response. Agents can branch on `code` without parsing the human
+/// message.
+#[derive(Debug, Serialize)]
+struct RpcErrorData {
+    /// Short snake_case code for programmatic handling by agents.
+    code: &'static str,
+    /// Actionable next step the agent should take.
+    hint: String,
+}
+
+impl RpcErrorData {
+    fn no_such_pane(prefix: &str) -> Self {
+        Self {
+            code: "no_such_pane",
+            hint: format!(
+                "No pane matches prefix '{prefix}'. Call list_panes to see active pane IDs."
+            ),
+        }
+    }
+
+    fn ambiguous_pane_id(prefix: &str, count: usize) -> Self {
+        Self {
+            code: "ambiguous_pane_id",
+            hint: format!(
+                "{count} panes match prefix '{prefix}'. Provide a longer prefix (≥12 chars)."
+            ),
+        }
+    }
+
+    fn no_such_session(prefix: &str) -> Self {
+        Self {
+            code: "no_such_session",
+            hint: format!(
+                "No session matches prefix '{prefix}'. Call list_sessions to see active session IDs."
+            ),
+        }
+    }
+
+    fn ambiguous_session_id(prefix: &str, count: usize) -> Self {
+        Self {
+            code: "ambiguous_session_id",
+            hint: format!(
+                "{count} sessions match prefix '{prefix}'. Provide a longer prefix (≥12 chars)."
+            ),
+        }
+    }
+
+    fn daemon_unreachable() -> Self {
+        Self {
+            code: "daemon_unreachable",
+            hint: "Cannot connect to pyred. Start the daemon with `pyred` or check PYRE_SOCK."
+                .to_owned(),
+        }
+    }
+}
+
+/// An error that carries structured data for agent consumption.
+#[derive(Debug)]
+struct StructuredError {
+    message: String,
+    data: RpcErrorData,
+}
+
+impl StructuredError {
+    fn new(message: impl Into<String>, data: RpcErrorData) -> Self {
+        Self {
+            message: message.into(),
+            data,
+        }
+    }
+}
+
+impl std::fmt::Display for StructuredError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for StructuredError {}
 
 impl Response {
     fn ok(id: Option<Value>, result: Value) -> Self {
@@ -75,6 +158,7 @@ impl Response {
             error: Some(RpcError {
                 code,
                 message: message.into(),
+                data: None,
             }),
         }
     }
@@ -113,7 +197,15 @@ impl Server {
     }
 
     async fn client(&self) -> Result<PyreDaemonClient> {
-        connect_control(&self.socket).await
+        connect_control(&self.socket).await.map_err(|e| {
+            // Wrap connection errors with structured data so the top-level
+            // handler can produce a machine-readable response.
+            let structured = StructuredError::new(
+                format!("daemon connection failed: {e}"),
+                RpcErrorData::daemon_unreachable(),
+            );
+            anyhow::Error::new(structured)
+        })
     }
 
     async fn send_line(&self, value: &Value) -> Result<()> {
@@ -132,7 +224,24 @@ impl Server {
         match result {
             Ok(Some(val)) => Some(Response::ok(id, val)),
             Ok(None) => None, // notification sent inline
-            Err(e) => Some(Response::err(id, -32000, e.to_string())),
+            Err(e) => {
+                // Check if this is a StructuredError and include data field.
+                if let Some(se) = e.downcast_ref::<StructuredError>() {
+                    let data_val = serde_json::to_value(&se.data).ok();
+                    Some(Response {
+                        jsonrpc: "2.0",
+                        id,
+                        result: None,
+                        error: Some(RpcError {
+                            code: -32000,
+                            message: se.message.clone(),
+                            data: data_val,
+                        }),
+                    })
+                } else {
+                    Some(Response::err(id, -32000, e.to_string()))
+                }
+            }
         }
     }
 
@@ -487,13 +596,29 @@ impl Server {
                 },
                 {
                     "name": "block_search",
-                    "description": "Full-text search across all blocks (stdout history).",
+                    "description": "Full-text search across all blocks (stdout history). Optionally scoped to a session, pane, or exact exit code.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "query": { "type": "string" },
-                            "limit": { "type": "integer", "default": 20 },
-                            "failures_only": { "type": "boolean", "default": false, "description": "Only blocks with non-zero exit code" }
+                            "query": { "type": "string", "description": "Full-text search query against block stdout." },
+                            "limit": { "type": "integer", "default": 20, "description": "Maximum number of hits to return." },
+                            "failures_only": {
+                                "type": "boolean",
+                                "default": false,
+                                "description": "When true, restrict to blocks with non-zero exit code. Ignored when exit_code is set."
+                            },
+                            "session": {
+                                "type": "string",
+                                "description": "Optional session UUID prefix (≥8 chars) — restrict results to this session."
+                            },
+                            "pane": {
+                                "type": "string",
+                                "description": "Optional pane UUID prefix (≥8 chars) — restrict results to this pane."
+                            },
+                            "exit_code": {
+                                "type": "integer",
+                                "description": "Optional exact exit code filter. When set, failures_only is ignored."
+                            }
                         },
                         "required": ["query"]
                     }
@@ -654,6 +779,53 @@ impl Server {
                         },
                         "required": ["parent_pane_id", "orient"]
                     }
+                },
+                {
+                    "name": "pane_last_block",
+                    "description": "Return metadata for the most recently finalized block (command) on a pane.\n\nUse this when you need the exit code, duration, or cwd of the last command that ran in a pane. Returns null when no block has been recorded yet (e.g. the shell is at a fresh prompt and OSC 133 integration has not fired).\n\nWhen include_output is true the response includes the block's stdout, truncated to the last 8 KB with a truncation marker when the full output is larger.\n\nErrors: no_such_pane when the prefix does not match any live pane; ambiguous_pane_id when multiple panes match.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "pane": {
+                                "type": "string",
+                                "description": "Pane UUID or ≥8-char prefix."
+                            },
+                            "include_output": {
+                                "type": "boolean",
+                                "default": false,
+                                "description": "When true, fetch and include the block's stdout (truncated to 8 KB)."
+                            }
+                        },
+                        "required": ["pane"]
+                    }
+                },
+                {
+                    "name": "pane_run_command",
+                    "description": "Send a shell command to a pane and wait for it to finish, returning the exit code and output in one call.\n\nThis is the preferred tool for running a command and observing its result. It replaces the pane_send_keys → sleep → pane_capture antipattern.\n\nBehavior:\n1. Records the current last block id for the pane.\n2. Sends `command` followed by Enter.\n3. Polls every 150 ms until a NEW finalized block appears (exit code set) or timeout_secs elapses.\n4. Returns {completed, exit_code, duration_ms, cwd, command, output, block_id}.\n\nWhen completed is false the command either timed out or no block was detected. If block_id is absent it means no new block formed — this usually indicates OSC 133 shell integration is not active. Run `pyrec shell-init` in the shell to enable it.\n\noutput is included when include_output is true (default). Output is truncated to 8 KB; the truncation marker shows the full byte size.\n\nErrors: no_such_pane, ambiguous_pane_id, daemon_unreachable.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "pane": {
+                                "type": "string",
+                                "description": "Pane UUID or ≥8-char prefix."
+                            },
+                            "command": {
+                                "type": "string",
+                                "description": "Shell command to run (Enter is appended automatically)."
+                            },
+                            "timeout_secs": {
+                                "type": "integer",
+                                "default": 30,
+                                "description": "Seconds to wait for the command to finish. Returns completed=false on timeout."
+                            },
+                            "include_output": {
+                                "type": "boolean",
+                                "default": true,
+                                "description": "When true (default), include stdout in the response (truncated to 8 KB)."
+                            }
+                        },
+                        "required": ["pane", "command"]
+                    }
                 }
             ]
         })
@@ -683,6 +855,8 @@ impl Server {
             "set_pane_weight" => self.tool_set_pane_weight(args).await?,
             "get_session_layout" => self.tool_get_session_layout(args).await?,
             "open_pane_split" => self.tool_open_pane_split(args).await?,
+            "pane_last_block" => self.tool_pane_last_block(args).await?,
+            "pane_run_command" => self.tool_pane_run_command(args).await?,
             other => return Err(anyhow!("unknown tool: {other}")),
         };
 
@@ -709,12 +883,15 @@ impl Server {
             .collect();
 
         match matches.len() {
-            0 => Err(anyhow!("no pane matches prefix '{prefix}'")),
+            0 => Err(anyhow::Error::new(StructuredError::new(
+                format!("no pane matches prefix '{prefix}'"),
+                RpcErrorData::no_such_pane(prefix),
+            ))),
             1 => Ok(matches[0].id),
-            _ => Err(anyhow!(
-                "{} panes match prefix '{prefix}'; provide a longer prefix",
-                matches.len()
-            )),
+            n => Err(anyhow::Error::new(StructuredError::new(
+                format!("{n} panes match prefix '{prefix}'; provide a longer prefix"),
+                RpcErrorData::ambiguous_pane_id(prefix, n),
+            ))),
         }
     }
 
@@ -735,12 +912,15 @@ impl Server {
             .collect();
 
         match matches.len() {
-            0 => Err(anyhow!("no session matches prefix '{prefix}'")),
+            0 => Err(anyhow::Error::new(StructuredError::new(
+                format!("no session matches prefix '{prefix}'"),
+                RpcErrorData::no_such_session(prefix),
+            ))),
             1 => Ok(matches[0].id),
-            _ => Err(anyhow!(
-                "{} sessions match prefix '{prefix}'; provide a longer prefix",
-                matches.len()
-            )),
+            n => Err(anyhow::Error::new(StructuredError::new(
+                format!("{n} sessions match prefix '{prefix}'; provide a longer prefix"),
+                RpcErrorData::ambiguous_session_id(prefix, n),
+            ))),
         }
     }
 
@@ -888,7 +1068,23 @@ impl Server {
         let limit = args["limit"].as_u64().unwrap_or(20) as u32;
         let failures_only = args["failures_only"].as_bool().unwrap_or(false);
 
+        // Resolve optional session filter by prefix.
         let client = self.client().await?;
+        let session = if let Some(s) = args["session"].as_str() {
+            Some(self.resolve_session_id(&client, s).await?)
+        } else {
+            None
+        };
+
+        // Resolve optional pane filter by prefix.
+        let pane = if let Some(p) = args["pane"].as_str() {
+            Some(self.resolve_pane_id(&client, p).await?)
+        } else {
+            None
+        };
+
+        let exit_code = args["exit_code"].as_i64().map(|v| v as i32);
+
         let hits = client
             .search_blocks(
                 tarpc::context::current(),
@@ -896,9 +1092,9 @@ impl Server {
                     query,
                     limit,
                     failures_only,
-                    session: None,
-                    pane: None,
-                    exit_code: None,
+                    session,
+                    pane,
+                    exit_code,
                 },
             )
             .await
@@ -1384,6 +1580,208 @@ impl Server {
         Ok(serde_json::to_string(&serde_json::json!({
             "pane_id": new_pane_id.0.to_string()
         }))?)
+    }
+
+    // ── pane_last_block ───────────────────────────────────────────────────────
+
+    async fn tool_pane_last_block(&self, args: &Value) -> Result<String> {
+        let pane_prefix = args["pane"]
+            .as_str()
+            .ok_or_else(|| anyhow!("missing pane"))?;
+        let include_output = args["include_output"].as_bool().unwrap_or(false);
+
+        let client = self.client().await?;
+        let pane_id = self.resolve_pane_id(&client, pane_prefix).await?;
+
+        let block = client
+            .last_block_for_pane(tarpc::context::current(), pane_id)
+            .await
+            .context("rpc last_block_for_pane")?
+            .map_err(|e| anyhow!("{e}"))?;
+
+        let Some(block) = block else {
+            return Ok(serde_json::to_string_pretty(&json!({
+                "block": null,
+                "hint": "No block recorded yet. The shell may be at a fresh prompt or OSC 133 integration is not active. Run `pyrec shell-init` to enable shell integration."
+            }))?);
+        };
+
+        let mut result = json!({
+            "block_id": block.id.0.to_string(),
+            "command": block.command,
+            "exit_code": block.exit_code,
+            "duration_ms": block.duration_ms(),
+            "cwd": block.cwd,
+            "started_at": block.started_at.to_rfc3339(),
+            "ended_at": block.ended_at.map(|t| t.to_rfc3339()),
+            "stdout_len": block.stdout_len,
+        });
+
+        if include_output {
+            let raw = client
+                .get_block_stdout(tarpc::context::current(), block.id)
+                .await
+                .context("rpc get_block_stdout")?
+                .map_err(|e| anyhow!("{e}"))?;
+
+            let (output_text, truncated) = truncate_output(&raw);
+            result["output"] = json!(output_text);
+            if truncated {
+                result["output_truncated"] = json!(true);
+                result["output_full_bytes"] = json!(raw.len());
+            }
+        }
+
+        Ok(serde_json::to_string_pretty(&result)?)
+    }
+
+    // ── pane_run_command ──────────────────────────────────────────────────────
+
+    async fn tool_pane_run_command(&self, args: &Value) -> Result<String> {
+        let pane_prefix = args["pane"]
+            .as_str()
+            .ok_or_else(|| anyhow!("missing pane"))?;
+        let command = args["command"]
+            .as_str()
+            .ok_or_else(|| anyhow!("missing command"))?
+            .to_owned();
+        let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(30);
+        let include_output = args["include_output"].as_bool().unwrap_or(true);
+
+        let client = self.client().await?;
+        let pane_id = self.resolve_pane_id(&client, pane_prefix).await?;
+
+        // 1. Snapshot the current last block id so we can detect when a new one appears.
+        let baseline_block_id = client
+            .last_block_for_pane(tarpc::context::current(), pane_id)
+            .await
+            .context("rpc last_block_for_pane (baseline)")?
+            .map_err(|e| anyhow!("{e}"))?
+            .map(|b| b.id);
+
+        // 2. Send the command with a trailing newline (Enter).
+        let payload = format!("{command}\n").into_bytes();
+        client
+            .send_keys(tarpc::context::current(), pane_id, payload)
+            .await
+            .context("rpc send_keys")?
+            .map_err(|e| anyhow!("{e}"))?;
+
+        // 3. Poll until a new finalized block appears or timeout expires.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+        let poll_interval = std::time::Duration::from_millis(150);
+
+        let mut new_block: Option<pyre_proto::Block> = None;
+
+        loop {
+            tokio::time::sleep(poll_interval).await;
+
+            let latest = client
+                .last_block_for_pane(tarpc::context::current(), pane_id)
+                .await
+                .context("rpc last_block_for_pane (poll)")?
+                .map_err(|e| anyhow!("{e}"))?;
+
+            if let Some(block) = latest {
+                // The block must be different from our baseline and must be finalized
+                // (ended_at and exit_code are both set).
+                let is_new = match baseline_block_id {
+                    Some(bid) => block.id != bid,
+                    None => true,
+                };
+                let is_finished = block.ended_at.is_some() && block.exit_code.is_some();
+
+                if is_new && is_finished {
+                    new_block = Some(block);
+                    break;
+                }
+            }
+
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+        }
+
+        // 4. Build the response.
+        if let Some(block) = new_block {
+            let mut result = json!({
+                "completed": true,
+                "block_id": block.id.0.to_string(),
+                "command": command,
+                "exit_code": block.exit_code,
+                "duration_ms": block.duration_ms(),
+                "cwd": block.cwd,
+            });
+
+            if include_output {
+                let raw = client
+                    .get_block_stdout(tarpc::context::current(), block.id)
+                    .await
+                    .context("rpc get_block_stdout")?
+                    .map_err(|e| anyhow!("{e}"))?;
+
+                let (output_text, truncated) = truncate_output(&raw);
+                result["output"] = json!(output_text);
+                if truncated {
+                    result["output_truncated"] = json!(true);
+                    result["output_full_bytes"] = json!(raw.len());
+                }
+            }
+
+            Ok(serde_json::to_string_pretty(&result)?)
+        } else {
+            // Timeout path — gather whatever info we have.
+            let partial_block = client
+                .last_block_for_pane(tarpc::context::current(), pane_id)
+                .await
+                .context("rpc last_block_for_pane (timeout)")?
+                .map_err(|e| anyhow!("{e}"))?;
+
+            let (current_block_id, hint) = match &partial_block {
+                Some(b) if partial_block.as_ref().map(|b| b.id) != baseline_block_id => {
+                    // A new block started but didn't finish within the timeout.
+                    (Some(b.id.0.to_string()), "Command started but did not finish within timeout_secs. Increase timeout_secs or the command is long-running.".to_owned())
+                }
+                _ => {
+                    // No new block at all — shell integration probably missing.
+                    (None, "No new block detected. OSC 133 shell integration may be missing. Run `pyrec shell-init` in the shell and re-source your shell profile to enable block tracking.".to_owned())
+                }
+            };
+
+            Ok(serde_json::to_string_pretty(&json!({
+                "completed": false,
+                "command": command,
+                "exit_code": null,
+                "duration_ms": null,
+                "block_id": current_block_id,
+                "hint": hint,
+            }))?)
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Output truncation helper
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Maximum bytes of stdout to include in a response.
+const OUTPUT_MAX_BYTES: usize = 8 * 1024; // 8 KB
+
+/// Truncate raw PTY output to `OUTPUT_MAX_BYTES` (last N bytes) and decode as
+/// UTF-8 lossy. Returns `(text, was_truncated)`.
+fn truncate_output(raw: &[u8]) -> (String, bool) {
+    if raw.len() <= OUTPUT_MAX_BYTES {
+        (String::from_utf8_lossy(raw).into_owned(), false)
+    } else {
+        let start = raw.len() - OUTPUT_MAX_BYTES;
+        let truncated_bytes = &raw[start..];
+        let text = format!(
+            "[... {} bytes truncated, showing last {} bytes ...]\n{}",
+            raw.len() - OUTPUT_MAX_BYTES,
+            OUTPUT_MAX_BYTES,
+            String::from_utf8_lossy(truncated_bytes)
+        );
+        (text, true)
     }
 }
 

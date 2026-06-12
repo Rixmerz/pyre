@@ -132,10 +132,11 @@ fn test_tools_list() {
 
     let tools = resp["result"]["tools"].as_array().expect("tools is array");
 
+    // We now have 17 tools: 15 original + pane_last_block + pane_run_command.
     assert_eq!(
         tools.len(),
-        15,
-        "expected exactly 15 tools, got {}: {:?}",
+        17,
+        "expected exactly 17 tools, got {}: {:?}",
         tools.len(),
         tools
             .iter()
@@ -161,6 +162,8 @@ fn test_tools_list() {
         "set_pane_weight",
         "get_session_layout",
         "open_pane_split",
+        "pane_last_block",
+        "pane_run_command",
     ] {
         assert!(
             names.contains(expected),
@@ -225,6 +228,68 @@ fn test_tools_list() {
     assert!(
         layout_props["panes"].is_object(),
         "session_layout.layout must have panes"
+    );
+
+    // Verify pane_last_block schema.
+    let plb = tools
+        .iter()
+        .find(|t| t["name"] == "pane_last_block")
+        .expect("pane_last_block tool");
+    let plb_props = &plb["inputSchema"]["properties"];
+    assert!(
+        plb_props["pane"].is_object(),
+        "pane_last_block must have pane property"
+    );
+    assert!(
+        plb_props["include_output"].is_object(),
+        "pane_last_block must have include_output property"
+    );
+    assert_eq!(
+        plb["inputSchema"]["required"],
+        json!(["pane"]),
+        "pane_last_block requires pane"
+    );
+
+    // Verify pane_run_command schema.
+    let prc = tools
+        .iter()
+        .find(|t| t["name"] == "pane_run_command")
+        .expect("pane_run_command tool");
+    let prc_props = &prc["inputSchema"]["properties"];
+    assert!(
+        prc_props["pane"].is_object(),
+        "pane_run_command must have pane property"
+    );
+    assert!(
+        prc_props["command"].is_object(),
+        "pane_run_command must have command property"
+    );
+    assert!(
+        prc_props["timeout_secs"].is_object(),
+        "pane_run_command must have timeout_secs property"
+    );
+    assert!(
+        prc_props["include_output"].is_object(),
+        "pane_run_command must have include_output property"
+    );
+
+    // Verify block_search now has session/pane/exit_code params.
+    let bs = tools
+        .iter()
+        .find(|t| t["name"] == "block_search")
+        .expect("block_search tool");
+    let bs_props = &bs["inputSchema"]["properties"];
+    assert!(
+        bs_props["session"].is_object(),
+        "block_search must have session filter property"
+    );
+    assert!(
+        bs_props["pane"].is_object(),
+        "block_search must have pane filter property"
+    );
+    assert!(
+        bs_props["exit_code"].is_object(),
+        "block_search must have exit_code filter property"
     );
 }
 
@@ -361,4 +426,368 @@ fn test_live_session_spawn() {
     let _ = daemon.wait();
 
     assert!(found, "expected 'hi' in pane output");
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 4: structured error for bogus pane id (no daemon required via connection error)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Call pane_last_block with a bogus pane prefix against a non-existent socket.
+/// The daemon connection failure must return a structured error with
+/// error.data.code == "daemon_unreachable".
+#[test]
+fn test_structured_error_daemon_unreachable() {
+    let bin = pyre_mcp_bin();
+    if !bin.exists() {
+        eprintln!("pyre-mcp binary not found, skipping");
+        return;
+    }
+
+    let mut child = Command::new(&bin)
+        .env("PYRE_SOCK", "/tmp/pyre-mcp-test-nonexistent-9999.sock")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn pyre-mcp");
+
+    let init = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} });
+    rpc_roundtrip(&mut child, &init);
+
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "pane_last_block",
+            "arguments": { "pane": "deadbeef" }
+        }
+    });
+    let resp = rpc_roundtrip(&mut child, &req);
+
+    child.kill().ok();
+
+    // Must be an error response.
+    assert!(
+        resp["error"].is_object(),
+        "expected error response, got: {resp}"
+    );
+
+    let error = &resp["error"];
+    let data = &error["data"];
+    assert!(
+        data.is_object(),
+        "error.data must be an object, got: {error}"
+    );
+    assert_eq!(
+        data["code"], "daemon_unreachable",
+        "error.data.code must be daemon_unreachable, got: {data}"
+    );
+    assert!(
+        data["hint"].as_str().is_some(),
+        "error.data.hint must be a string"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 5: live daemon — pane_last_block on fresh pane (no blocks yet)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Spawn a fresh session/pane; immediately call pane_last_block.
+/// Since no command has run yet, block must be null (not an error).
+#[test]
+fn test_pane_last_block_fresh_pane() {
+    use std::time::Duration;
+
+    let rt_dir = tempfile::tempdir().expect("tempdir");
+    let data_dir = rt_dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).expect("mkdir data");
+    let sock_path = rt_dir.path().join("pyre.sock");
+
+    let pyred_bin = std::env::var("CARGO_BIN_EXE_pyred").unwrap_or_else(|_| {
+        let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+        let mut p = std::path::PathBuf::from(manifest);
+        p.pop();
+        p.pop();
+        p.push("target/debug/pyred");
+        p.to_string_lossy().into_owned()
+    });
+
+    let mut daemon = Command::new(&pyred_bin)
+        .env_clear()
+        .env(
+            "HOME",
+            std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()),
+        )
+        .env("XDG_RUNTIME_DIR", rt_dir.path())
+        .env("PYRE_DATA_DIR", &data_dir)
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn pyred");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while !sock_path.exists() {
+        if std::time::Instant::now() >= deadline {
+            panic!("pyred socket never appeared at {}", sock_path.display());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let bin = pyre_mcp_bin();
+    let mut child = Command::new(&bin)
+        .env("PYRE_SOCK", &sock_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn pyre-mcp");
+
+    let init = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} });
+    rpc_roundtrip(&mut child, &init);
+
+    // Spawn a session.
+    let spawn_req = json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "session_spawn",
+            "arguments": { "shell": "/bin/sh", "cols": 80, "rows": 24 }
+        }
+    });
+    let spawn_resp = rpc_roundtrip(&mut child, &spawn_req);
+    let spawn_text = spawn_resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("spawn text");
+
+    let pane_id = spawn_text
+        .split_whitespace()
+        .find(|s| s.starts_with("pane_id="))
+        .and_then(|s| s.strip_prefix("pane_id="))
+        .expect("pane_id")
+        .to_owned();
+
+    // Immediately query pane_last_block before any command runs.
+    let plb_req = json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": {
+            "name": "pane_last_block",
+            "arguments": { "pane": &pane_id[..8] }
+        }
+    });
+    let plb_resp = rpc_roundtrip(&mut child, &plb_req);
+
+    child.kill().ok();
+    let _ = child.wait();
+    daemon.kill().ok();
+    let _ = daemon.wait();
+
+    // Must be a successful response (not an error).
+    assert!(
+        plb_resp["error"].is_null(),
+        "pane_last_block on fresh pane must not error, got: {plb_resp}"
+    );
+    assert!(
+        plb_resp["result"].is_object(),
+        "expected result object, got: {plb_resp}"
+    );
+
+    // Parse the returned text as JSON and verify block is null.
+    let text = plb_resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text content");
+    let parsed: serde_json::Value = serde_json::from_str(text).expect("parse tool output as JSON");
+
+    assert!(
+        parsed["block"].is_null(),
+        "block must be null for fresh pane with no commands, got: {parsed}"
+    );
+    // hint should be present to guide the agent.
+    assert!(
+        parsed["hint"].as_str().is_some(),
+        "hint must be present when block is null"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 6: live daemon — structured no_such_pane error
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// With a live daemon, call pane_last_block with a bogus prefix that matches no
+/// pane. Expect error.data.code == "no_such_pane".
+#[test]
+fn test_structured_error_no_such_pane() {
+    use std::time::Duration;
+
+    let rt_dir = tempfile::tempdir().expect("tempdir");
+    let data_dir = rt_dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).expect("mkdir data");
+    let sock_path = rt_dir.path().join("pyre.sock");
+
+    let pyred_bin = std::env::var("CARGO_BIN_EXE_pyred").unwrap_or_else(|_| {
+        let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+        let mut p = std::path::PathBuf::from(manifest);
+        p.pop();
+        p.pop();
+        p.push("target/debug/pyred");
+        p.to_string_lossy().into_owned()
+    });
+
+    let mut daemon = Command::new(&pyred_bin)
+        .env_clear()
+        .env(
+            "HOME",
+            std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()),
+        )
+        .env("XDG_RUNTIME_DIR", rt_dir.path())
+        .env("PYRE_DATA_DIR", &data_dir)
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn pyred");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while !sock_path.exists() {
+        if std::time::Instant::now() >= deadline {
+            panic!("pyred socket never appeared at {}", sock_path.display());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let bin = pyre_mcp_bin();
+    let mut child = Command::new(&bin)
+        .env("PYRE_SOCK", &sock_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn pyre-mcp");
+
+    let init = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} });
+    rpc_roundtrip(&mut child, &init);
+
+    // Use a prefix that definitely won't match any real pane.
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "pane_last_block",
+            "arguments": { "pane": "00000000" }
+        }
+    });
+    let resp = rpc_roundtrip(&mut child, &req);
+
+    child.kill().ok();
+    let _ = child.wait();
+    daemon.kill().ok();
+    let _ = daemon.wait();
+
+    assert!(
+        resp["error"].is_object(),
+        "expected error response, got: {resp}"
+    );
+
+    let data = &resp["error"]["data"];
+    assert!(
+        data.is_object(),
+        "error.data must be present, got: {}",
+        resp["error"]
+    );
+    assert_eq!(
+        data["code"], "no_such_pane",
+        "error.data.code must be no_such_pane, got: {data}"
+    );
+    assert!(
+        data["hint"].as_str().unwrap_or("").contains("list_panes"),
+        "hint should mention list_panes: {data}"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 7: live daemon — block_search with exit_code filter
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Verify block_search accepts the exit_code param without error (schema test).
+/// With no prior commands the result should be "no results".
+#[test]
+fn test_block_search_exit_code_filter() {
+    use std::time::Duration;
+
+    let rt_dir = tempfile::tempdir().expect("tempdir");
+    let data_dir = rt_dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).expect("mkdir data");
+    let sock_path = rt_dir.path().join("pyre.sock");
+
+    let pyred_bin = std::env::var("CARGO_BIN_EXE_pyred").unwrap_or_else(|_| {
+        let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+        let mut p = std::path::PathBuf::from(manifest);
+        p.pop();
+        p.pop();
+        p.push("target/debug/pyred");
+        p.to_string_lossy().into_owned()
+    });
+
+    let mut daemon = Command::new(&pyred_bin)
+        .env_clear()
+        .env(
+            "HOME",
+            std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()),
+        )
+        .env("XDG_RUNTIME_DIR", rt_dir.path())
+        .env("PYRE_DATA_DIR", &data_dir)
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn pyred");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while !sock_path.exists() {
+        if std::time::Instant::now() >= deadline {
+            panic!("pyred socket never appeared at {}", sock_path.display());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let bin = pyre_mcp_bin();
+    let mut child = Command::new(&bin)
+        .env("PYRE_SOCK", &sock_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn pyre-mcp");
+
+    let init = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} });
+    rpc_roundtrip(&mut child, &init);
+
+    // block_search with exit_code=0 — should return no results (no blocks yet).
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "block_search",
+            "arguments": {
+                "query": "anything",
+                "exit_code": 0
+            }
+        }
+    });
+    let resp = rpc_roundtrip(&mut child, &req);
+
+    child.kill().ok();
+    let _ = child.wait();
+    daemon.kill().ok();
+    let _ = daemon.wait();
+
+    // Must succeed (not error).
+    assert!(
+        resp["error"].is_null(),
+        "block_search with exit_code filter must not error, got: {resp}"
+    );
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text content");
+    assert_eq!(text, "no results", "expected no results on fresh daemon");
 }
