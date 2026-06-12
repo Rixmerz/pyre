@@ -1595,6 +1595,11 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serialize every test that reads or mutates `XDG_RUNTIME_DIR` so they
+    /// cannot race when cargo runs tests in parallel threads.
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     // Helper — build a deterministic path without relying on env vars.
     fn sock(p: &str) -> PathBuf {
@@ -1644,6 +1649,7 @@ mod tests {
 
     #[test]
     fn fallback_to_tmp_when_no_xdg() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         // Temporarily clear XDG_RUNTIME_DIR if it happens to be set.
         let saved = std::env::var("XDG_RUNTIME_DIR").ok();
         std::env::remove_var("XDG_RUNTIME_DIR");
@@ -1661,13 +1667,16 @@ mod tests {
             "unexpected filename: {name}"
         );
 
-        if let Some(v) = saved {
-            std::env::set_var("XDG_RUNTIME_DIR", v);
+        // Restore.
+        match saved {
+            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
         }
     }
 
     #[test]
     fn host_sanitised_in_socket_name() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         let saved = std::env::var("XDG_RUNTIME_DIR").ok();
         std::env::remove_var("XDG_RUNTIME_DIR");
 
@@ -1677,21 +1686,30 @@ mod tests {
         assert!(!name.contains('@'), "@ should be sanitised");
         assert!(!name.contains(':'), ": should be sanitised");
 
-        if let Some(v) = saved {
-            std::env::set_var("XDG_RUNTIME_DIR", v);
+        // Restore.
+        match saved {
+            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
         }
     }
 
     #[test]
     fn xdg_runtime_dir_used_when_set() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let saved = std::env::var("XDG_RUNTIME_DIR").ok();
         std::env::set_var("XDG_RUNTIME_DIR", "/run/user/9999");
+
         let result = derive_local_socket("dev.box", None);
         assert!(
             result.starts_with("/run/user/9999"),
             "expected XDG_RUNTIME_DIR prefix, got {result:?}"
         );
-        // Clean up.
-        std::env::remove_var("XDG_RUNTIME_DIR");
+
+        // Restore.
+        match saved {
+            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
     }
 
     // ── shell-init ────────────────────────────────────────────────────────────
