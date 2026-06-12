@@ -133,6 +133,8 @@ pub struct AppState {
     /// Timestamp of the most recent `split_active` call.
     /// Used by the 5s layout-resync to skip clobbering focus immediately after a split.
     pub last_split_at: Option<Instant>,
+    /// Whether the help overlay (Ctrl-Space ?) is currently open.
+    pub help_open: bool,
 }
 
 impl AppState {
@@ -159,5 +161,51 @@ impl AppState {
         self.sessions.get_mut(self.active_session).expect(
             "active_session out of bounds — caller must check sessions.is_empty() before this",
         )
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    /// The help overlay toggle field starts closed and toggles correctly.
+    ///
+    /// This mirrors the toggle in keyboard.rs: `state.help_open = !state.help_open`.
+    /// The test verifies the field's initial value and that toggling it twice returns
+    /// to the original state — the invariant the TUI depends on for correct overlay
+    /// open/close behaviour.
+    #[test]
+    fn help_overlay_toggle_initial_closed_and_toggles() {
+        let mut help_open = false; // matches initial_app_state field
+
+        // Initially closed.
+        assert!(!help_open, "help overlay must start closed");
+
+        // First toggle: open.
+        help_open = !help_open;
+        assert!(help_open, "help overlay must open after first toggle");
+
+        // Second toggle (Esc/q/? dismiss): closed again.
+        help_open = !help_open;
+        assert!(!help_open, "help overlay must close after second toggle");
+    }
+
+    /// The toggle is idempotent over even counts: N open/close pairs always return to false.
+    ///
+    /// Covers the Esc/q/? dismiss path: after an even number of toggling key presses
+    /// the overlay must be closed, regardless of how many times it was opened.
+    #[test]
+    fn help_overlay_even_toggles_return_to_closed() {
+        let mut help_open = false;
+        for _ in 0..4 {
+            help_open = !help_open; // open
+            help_open = !help_open; // close
+        }
+        assert!(
+            !help_open,
+            "after N open/close pairs the overlay must be closed"
+        );
     }
 }

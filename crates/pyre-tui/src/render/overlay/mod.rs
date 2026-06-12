@@ -1,3 +1,4 @@
+pub mod help;
 pub mod pager;
 pub mod picker;
 pub mod search;

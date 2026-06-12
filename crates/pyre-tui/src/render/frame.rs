@@ -16,6 +16,7 @@ use crate::model::context_menu::MENU_ITEMS;
 use crate::model::layout::{build_pane_slot_map, focused_slot_idx};
 use crate::model::pane::SplitBoundary;
 use crate::model::prompt::{NamePrompt, PromptKind};
+use crate::render::overlay::help::render_help_overlay;
 use crate::render::overlay::pager::render_pager;
 use crate::render::overlay::picker::render_theme_picker;
 use crate::render::overlay::search::render_search_overlay;
@@ -296,6 +297,7 @@ pub fn draw_frame(
                         attention,
                         &t,
                         panes_meta,
+                        true, // is_zoomed: this path renders the zoomed pane
                     );
                 }
             }
@@ -427,6 +429,8 @@ pub fn draw_frame(
                 // Search overlay — drawn on top of everything else and owns cursor.
                 let anim_frame = state.anim.frame();
                 render_search_overlay(frame, &mut state.search, anim_frame, &t);
+            } else if state.help_open {
+                render_help_overlay(frame, &t);
             }
         }
 
@@ -440,6 +444,7 @@ pub fn draw_frame(
             && state.theme_picker.is_none()
             && state.prompt.is_none()
             && !state.search.open
+            && !state.help_open
             && state.context_menu.is_none()
             && state.pid_inspect.is_none()
         {

@@ -79,6 +79,8 @@ pub(crate) enum KeyAction {
     Continue,
     /// TUI should quit; caller should `break` the event loop.
     Quit,
+    /// Detach: exit TUI cleanly but leave daemon session running.
+    Detach,
 }
 
 /// Dispatch one keyboard event.
@@ -92,6 +94,17 @@ pub(crate) async fn handle_key(
     prefix_active: &mut bool,
     body_area: Rect,
 ) -> KeyAction {
+    // Help overlay intercepts all keys while open; dismiss with Esc, q, or ?.
+    if state.help_open {
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => {
+                state.help_open = false;
+            }
+            _ => {}
+        }
+        return KeyAction::Continue;
+    }
+
     // Session-lost overlay intercepts all keys when active.
     // q / Esc / Ctrl-C all exit the TUI cleanly.
     if state.session_lost {
@@ -390,6 +403,11 @@ pub(crate) async fn handle_key(
         return match handle_prefix_key(state, code).await {
             PrefixAction::Continue => KeyAction::Continue,
             PrefixAction::Quit => KeyAction::Quit,
+            PrefixAction::Detach => KeyAction::Detach,
+            PrefixAction::ToggleHelp => {
+                state.help_open = !state.help_open;
+                KeyAction::Continue
+            }
         };
     }
 

@@ -108,6 +108,7 @@ pub(crate) fn initial_app_state(
         pending_menu_action: None,
         session_lost: false,
         last_split_at: None,
+        help_open: false,
     }
 }
 
@@ -255,6 +256,11 @@ pub(crate) async fn run_tui(
     }
 
     let mut prefix_active = false;
+    // Tracks whether the loop ended via Ctrl-Space d (detach) rather than a full quit.
+    let mut detach_requested = false;
+    // Tracks whether we exited because the daemon vanished (sessions list emptied
+    // due to transport failures), so we can print an actionable message after restore.
+    let mut daemon_lost = false;
 
     let mut loop_frames_drawn: u64 = 0;
     let mut loop_bytes_processed: u64 = 0;
@@ -399,202 +405,228 @@ pub(crate) async fn run_tui(
         // Session-list sync — 1 s.
         if state.session_list_last_poll.elapsed() >= Duration::from_secs(1) {
             state.session_list_last_poll = Instant::now();
-            if let Ok(Ok(daemon_sessions)) =
-                state.control.list_sessions(tarpc::context::current()).await
-            {
-                let prev_active_id = state.sessions.get(state.active_session).map(|sv| sv.id);
-                let known_ids: Vec<SessionId> = state.sessions.iter().map(|s| s.id).collect();
-                for info in &daemon_sessions {
-                    // I-4 / I-5: never adopt a stale (0-pane) session during the
-                    // sync poll. Skipping before the list_panes RPC also avoids a
-                    // wasted round-trip per stale session.
-                    if info.pane_count == 0 {
-                        continue;
+            match state.control.list_sessions(tarpc::context::current()).await {
+                Err(_transport_err) => {
+                    // Transport layer failure: pyred is unreachable.
+                    daemon_lost = true;
+                    state.toast_deck.push(
+                        "daemon unreachable".to_owned(),
+                        "restart pyred or check ~/.local/state/pyre/pyre.log".to_owned(),
+                        crate::model::toast::ToastKind::Error,
+                    );
+                }
+                Ok(Err(_rpc_err)) => {
+                    // RPC-level error (rare, non-fatal — daemon returned an Err).
+                    state.toast_deck.push(
+                        "daemon error".to_owned(),
+                        "session list RPC returned an error".to_owned(),
+                        crate::model::toast::ToastKind::Warn,
+                    );
+                }
+                Ok(Ok(daemon_sessions)) => {
+                    let prev_active_id = state.sessions.get(state.active_session).map(|sv| sv.id);
+                    let known_ids: Vec<SessionId> = state.sessions.iter().map(|s| s.id).collect();
+                    for info in &daemon_sessions {
+                        // I-4 / I-5: never adopt a stale (0-pane) session during the
+                        // sync poll. Skipping before the list_panes RPC also avoids a
+                        // wasted round-trip per stale session.
+                        if info.pane_count == 0 {
+                            continue;
+                        }
+                        if !known_ids.contains(&info.id) {
+                            match state
+                                .control
+                                .list_panes(tarpc::context::current(), info.id)
+                                .await
+                            {
+                                Ok(Ok(panes)) if !panes.is_empty() => {
+                                    let pane_id = panes[0].id;
+                                    let (sc, sr) = {
+                                        let (tc, tr) = term_size();
+                                        compute_pane_inner_size(tc, tr)
+                                    };
+                                    match attach_pane(&state.socket, info.id, pane_id, sc, sr).await
+                                    {
+                                        Ok(slot) => {
+                                            state.slots.push(Some(slot));
+                                            state.sessions.push(SessionView::new_single_pane(
+                                                info.id,
+                                                info.name.clone(),
+                                                pane_id,
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                            "session-sync: attach_pane for session {} failed: {e}",
+                                            info.id
+                                        );
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
                     }
-                    if !known_ids.contains(&info.id) {
-                        match state
+
+                    // Sync panes within existing sessions.
+                    for info in &daemon_sessions {
+                        let sv_idx = match state.sessions.iter().position(|s| s.id == info.id) {
+                            Some(i) => i,
+                            None => continue,
+                        };
+
+                        let local_pane_ids: Vec<PaneId> = {
+                            let sv = &state.sessions[sv_idx];
+                            sv.tabs
+                                .iter()
+                                .flat_map(|tab| pane_leaves_in_order(&tab.root))
+                                .collect()
+                        };
+
+                        let daemon_panes = match state
                             .control
                             .list_panes(tarpc::context::current(), info.id)
                             .await
                         {
-                            Ok(Ok(panes)) if !panes.is_empty() => {
-                                let pane_id = panes[0].id;
-                                let (sc, sr) = {
+                            Ok(Ok(p)) => p,
+                            _ => continue,
+                        };
+
+                        let new_panes: Vec<_> = daemon_panes
+                            .iter()
+                            .filter(|p| !local_pane_ids.contains(&p.id))
+                            .collect();
+
+                        if !new_panes.is_empty() {
+                            let fresh_layout =
+                                crate::rpc::layout::get_session_layout(&state.control, info.id)
+                                    .await;
+
+                            for pane_info in &new_panes {
+                                // Guard against double-attach: `split_active` may have already
+                                // attached a slot for this pane id before the 1s poll fires.
+                                // Attaching twice creates two competing output streams → flicker.
+                                if pane_to_slot_idx(&state.slots, pane_info.id).is_some() {
+                                    tracing::debug!(
+                                    "pane-sync: slot for pane {} already exists, skipping attach",
+                                    pane_info.id,
+                                );
+                                    continue;
+                                }
+                                let (pc, pr) = {
                                     let (tc, tr) = term_size();
                                     compute_pane_inner_size(tc, tr)
                                 };
-                                match attach_pane(&state.socket, info.id, pane_id, sc, sr).await {
+                                match attach_pane(&state.socket, info.id, pane_info.id, pc, pr)
+                                    .await
+                                {
                                     Ok(slot) => {
                                         state.slots.push(Some(slot));
-                                        state.sessions.push(SessionView::new_single_pane(
+                                        tracing::info!(
+                                            "pane-sync: attached slot for pane {} in session {}",
+                                            pane_info.id,
                                             info.id,
-                                            info.name.clone(),
-                                            pane_id,
-                                        ));
+                                        );
                                     }
                                     Err(e) => {
                                         tracing::warn!(
-                                            "session-sync: attach_pane for session {} failed: {e}",
-                                            info.id
+                                            "pane-sync: attach_pane for pane {} in session {} \
+                                         failed: {e}",
+                                            pane_info.id,
+                                            info.id,
                                         );
                                     }
                                 }
                             }
-                            _ => {}
-                        }
-                    }
-                }
 
-                // Sync panes within existing sessions.
-                for info in &daemon_sessions {
-                    let sv_idx = match state.sessions.iter().position(|s| s.id == info.id) {
-                        Some(i) => i,
-                        None => continue,
-                    };
-
-                    let local_pane_ids: Vec<PaneId> = {
-                        let sv = &state.sessions[sv_idx];
-                        sv.tabs
-                            .iter()
-                            .flat_map(|tab| pane_leaves_in_order(&tab.root))
-                            .collect()
-                    };
-
-                    let daemon_panes = match state
-                        .control
-                        .list_panes(tarpc::context::current(), info.id)
-                        .await
-                    {
-                        Ok(Ok(p)) => p,
-                        _ => continue,
-                    };
-
-                    let new_panes: Vec<_> = daemon_panes
-                        .iter()
-                        .filter(|p| !local_pane_ids.contains(&p.id))
-                        .collect();
-
-                    if !new_panes.is_empty() {
-                        let fresh_layout =
-                            crate::rpc::layout::get_session_layout(&state.control, info.id).await;
-
-                        for pane_info in &new_panes {
-                            // Guard against double-attach: `split_active` may have already
-                            // attached a slot for this pane id before the 1s poll fires.
-                            // Attaching twice creates two competing output streams → flicker.
-                            if pane_to_slot_idx(&state.slots, pane_info.id).is_some() {
-                                tracing::debug!(
-                                    "pane-sync: slot for pane {} already exists, skipping attach",
-                                    pane_info.id,
+                            let sv = &mut state.sessions[sv_idx];
+                            if let Some(layout) = fresh_layout {
+                                let at = sv.active_tab;
+                                let old_focus = sv.tabs[at].focus_pane;
+                                let new_leaves = pane_leaves_in_order(&layout);
+                                let focus = if new_leaves.contains(&old_focus) {
+                                    old_focus
+                                } else {
+                                    new_leaves.into_iter().next().unwrap_or(old_focus)
+                                };
+                                sv.tabs[at].root = layout;
+                                sv.tabs[at].focus_pane = focus;
+                                tracing::info!(
+                                    "pane-sync: applied daemon layout to active tab of session {}",
+                                    info.id,
                                 );
-                                continue;
-                            }
-                            let (pc, pr) = {
-                                let (tc, tr) = term_size();
-                                compute_pane_inner_size(tc, tr)
-                            };
-                            match attach_pane(&state.socket, info.id, pane_info.id, pc, pr).await {
-                                Ok(slot) => {
-                                    state.slots.push(Some(slot));
-                                    tracing::info!(
-                                        "pane-sync: attached slot for pane {} in session {}",
-                                        pane_info.id,
-                                        info.id,
-                                    );
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "pane-sync: attach_pane for pane {} in session {} \
-                                         failed: {e}",
-                                        pane_info.id,
-                                        info.id,
-                                    );
-                                }
-                            }
-                        }
-
-                        let sv = &mut state.sessions[sv_idx];
-                        if let Some(layout) = fresh_layout {
-                            let at = sv.active_tab;
-                            let old_focus = sv.tabs[at].focus_pane;
-                            let new_leaves = pane_leaves_in_order(&layout);
-                            let focus = if new_leaves.contains(&old_focus) {
-                                old_focus
                             } else {
-                                new_leaves.into_iter().next().unwrap_or(old_focus)
-                            };
-                            sv.tabs[at].root = layout;
-                            sv.tabs[at].focus_pane = focus;
-                            tracing::info!(
-                                "pane-sync: applied daemon layout to active tab of session {}",
-                                info.id,
-                            );
-                        } else {
-                            for pane_info in &new_panes {
-                                if pane_to_slot_idx(&state.slots, pane_info.id).is_some() {
-                                    let tab_n = sv.tabs.len() + 1;
-                                    sv.tabs.push(Tab {
-                                        root: LayoutNode::Leaf(pane_info.id),
-                                        focus_pane: pane_info.id,
-                                        zoomed: None,
-                                        boundaries: Vec::new(),
-                                        drag: None,
-                                    });
-                                    tracing::warn!(
-                                        "pane-sync: fallback — new pane {} added as tab-{} \
+                                for pane_info in &new_panes {
+                                    if pane_to_slot_idx(&state.slots, pane_info.id).is_some() {
+                                        let tab_n = sv.tabs.len() + 1;
+                                        sv.tabs.push(Tab {
+                                            root: LayoutNode::Leaf(pane_info.id),
+                                            focus_pane: pane_info.id,
+                                            zoomed: None,
+                                            boundaries: Vec::new(),
+                                            drag: None,
+                                        });
+                                        tracing::warn!(
+                                            "pane-sync: fallback — new pane {} added as tab-{} \
                                          (get_session_layout failed)",
-                                        pane_info.id,
-                                        tab_n,
-                                    );
-                                }
-                            }
-                        }
-                    }
-
-                    // Prune panes the daemon no longer reports.
-                    let daemon_ids_for_session: Vec<PaneId> =
-                        daemon_panes.iter().map(|p| p.id).collect();
-                    let slots_to_drop: Vec<usize> = {
-                        let sv = &state.sessions[sv_idx];
-                        let mut to_drop = Vec::new();
-                        for tab in &sv.tabs {
-                            for pid in pane_leaves_in_order(&tab.root) {
-                                if !daemon_ids_for_session.contains(&pid) {
-                                    if let Some(idx) = pane_to_slot_idx(&state.slots, pid) {
-                                        to_drop.push(idx);
+                                            pane_info.id,
+                                            tab_n,
+                                        );
                                     }
                                 }
                             }
                         }
-                        to_drop
-                    };
-                    for slot_idx in slots_to_drop {
-                        state.slots[slot_idx] = None;
+
+                        // Prune panes the daemon no longer reports.
+                        let daemon_ids_for_session: Vec<PaneId> =
+                            daemon_panes.iter().map(|p| p.id).collect();
+                        let slots_to_drop: Vec<usize> = {
+                            let sv = &state.sessions[sv_idx];
+                            let mut to_drop = Vec::new();
+                            for tab in &sv.tabs {
+                                for pid in pane_leaves_in_order(&tab.root) {
+                                    if !daemon_ids_for_session.contains(&pid) {
+                                        if let Some(idx) = pane_to_slot_idx(&state.slots, pid) {
+                                            to_drop.push(idx);
+                                        }
+                                    }
+                                }
+                            }
+                            to_drop
+                        };
+                        for slot_idx in slots_to_drop {
+                            state.slots[slot_idx] = None;
+                        }
                     }
-                }
 
-                // Prune sessions that disappeared from the daemon.
-                let daemon_ids: Vec<SessionId> = daemon_sessions.iter().map(|s| s.id).collect();
-                let to_remove: Vec<usize> = state
-                    .sessions
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, sv)| !daemon_ids.contains(&sv.id))
-                    .map(|(i, _)| i)
-                    .collect();
-                for &idx in to_remove.iter().rev() {
-                    state.sessions.remove(idx);
-                }
+                    // Prune sessions that disappeared from the daemon.
+                    let daemon_ids: Vec<SessionId> = daemon_sessions.iter().map(|s| s.id).collect();
+                    let to_remove: Vec<usize> = state
+                        .sessions
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, sv)| !daemon_ids.contains(&sv.id))
+                        .map(|(i, _)| i)
+                        .collect();
+                    for &idx in to_remove.iter().rev() {
+                        state.sessions.remove(idx);
+                    }
 
-                crate::app::active::restore_active_session(
-                    &state.sessions,
-                    &mut state.active_session,
-                    prev_active_id,
-                );
-            }
+                    crate::app::active::restore_active_session(
+                        &state.sessions,
+                        &mut state.active_session,
+                        prev_active_id,
+                    );
+                } // end Ok(Ok(daemon_sessions)) arm
+            } // end match list_sessions
         }
 
         if state.sessions.is_empty() {
+            // If the daemon vanished (transport error followed by empty session list),
+            // mark daemon_lost so we print an actionable message after terminal restore.
+            if !detach_requested {
+                daemon_lost = true;
+            }
             break;
         }
 
@@ -980,6 +1012,10 @@ pub(crate) async fn run_tui(
                 let mods = key_event.modifiers;
                 match handle_key(&mut state, code, mods, &mut prefix_active, body_area).await {
                     KeyAction::Quit => break,
+                    KeyAction::Detach => {
+                        detach_requested = true;
+                        break;
+                    }
                     KeyAction::Continue => {}
                 }
             }
@@ -1022,6 +1058,18 @@ pub(crate) async fn run_tui(
 
             _ => {}
         }
+    }
+
+    // Terminal is restored when `_guard` drops here (end of scope).
+    drop(_guard);
+
+    if detach_requested {
+        println!("detached: session keeps running — run `pyre` to reattach");
+    } else if daemon_lost {
+        eprintln!(
+            "pyre: daemon unreachable — session may be lost.\n\
+             Check logs at ~/.local/state/pyre/pyre.log or restart pyred."
+        );
     }
 
     Ok(())

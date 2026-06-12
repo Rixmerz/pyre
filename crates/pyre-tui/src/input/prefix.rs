@@ -22,6 +22,10 @@ pub(crate) enum PrefixAction {
     Continue,
     /// Quit requested (Ctrl-Space q or Ctrl-Space x with no sessions left).
     Quit,
+    /// Detach requested (Ctrl-Space d): exit TUI but leave the daemon session running.
+    Detach,
+    /// Help overlay toggled (Ctrl-Space ?).
+    ToggleHelp,
 }
 
 /// Handle one key following a Ctrl-Space prefix.
@@ -32,6 +36,12 @@ pub(crate) enum PrefixAction {
 pub(crate) async fn handle_prefix_key(state: &mut AppState, code: KeyCode) -> PrefixAction {
     match code {
         KeyCode::Char('q') => return PrefixAction::Quit,
+
+        // Detach: exit TUI, leave daemon session alive (Ctrl-Space d).
+        KeyCode::Char('d') => return PrefixAction::Detach,
+
+        // Help overlay toggle (Ctrl-Space ?).
+        KeyCode::Char('?') => return PrefixAction::ToggleHelp,
 
         KeyCode::Char('c') => {
             if let Err(e) = open_new_tab(state, None).await {

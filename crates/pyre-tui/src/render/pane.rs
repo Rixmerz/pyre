@@ -99,23 +99,44 @@ pub(crate) fn render_pane(
     attention: bool,
     theme: &theme::LegacyTheme,
     panes_meta: &[pyre_proto::PaneInfo],
+    is_zoomed: bool,
 ) {
     let short8: String = slot.pane_id.0.to_string().chars().take(8).collect();
     let seed = slot.pane_id.0.as_u128() as u32;
     // Use the user-provided name when available; fall back to short UUID prefix.
-    let pane_title: String = panes_meta
+    let base_title: String = panes_meta
         .iter()
         .find(|p| p.id == slot.pane_id)
         .and_then(|p| p.name.as_deref().filter(|s| !s.is_empty()))
         .map(|s| format!(" {s} "))
         .unwrap_or_else(|| format!(" pane {short8} "));
+    // Append state indicators: [ZOOM] when pane is zoomed, SCROLL when scrolled
+    // into history. Both can coexist (zoomed pane scrolled into scrollback).
+    let pane_title: String = {
+        let mut t = if slot.scroll_offset > 0 {
+            format!("{base_title}  SCROLL ")
+        } else {
+            base_title
+        };
+        if is_zoomed {
+            t.push_str(" [ZOOM]");
+        }
+        t
+    };
     let border_block = if focused {
-        let border_style = if attention {
+        // Zoomed pane: use `theme.info` (ANSI-blue proxy) so the border is
+        // clearly distinct from the normal focus color (`theme.border_focus` /
+        // `theme.primary`, which is orange in the Ember palette).
+        let border_style = if is_zoomed {
+            Style::default().fg(theme.info)
+        } else if attention {
             fire_motion::ember_border_style(anim_frame, seed, theme.border_focus, theme.spark)
         } else {
             theme.border_focus()
         };
-        let title_style = if attention {
+        let title_style = if is_zoomed {
+            theme.title(theme.info)
+        } else if attention {
             fire_motion::ember_title_style(anim_frame, seed, theme.primary, theme.spark)
         } else {
             theme.title(theme.primary)
@@ -523,6 +544,7 @@ pub(crate) fn render_layout(
                         attention,
                         theme,
                         panes_meta,
+                        false, // is_zoomed: layout path never zooms individual panes
                     );
                 }
             }

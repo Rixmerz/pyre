@@ -137,23 +137,50 @@ pyrec display-message "hello from script"
 
 ### Prefix: `Ctrl-Space`
 
+All bindings require pressing `Ctrl-Space` first, then the listed key.
+
+#### Panes
+
 | Binding | Action |
 |---------|--------|
-| `Ctrl-Space c` | Open new pane in current session |
-| `Ctrl-Space n` | Focus next pane |
-| `Ctrl-Space p` | Focus previous pane |
+| `Ctrl-Space c` | New pane in current session (new tab) |
 | `Ctrl-Space "` | Horizontal split (new pane below) |
 | `Ctrl-Space %` | Vertical split (new pane right) |
-| `Ctrl-Space q` | Close current pane |
-| `Ctrl-Space y` | Copy current pane scrollback to clipboard |
+| `Ctrl-Space x` | Close focused pane |
 | `Ctrl-Space z` | Toggle zoom (fullscreen) on current pane |
-| `Ctrl-Space s` | Open block search dialog (Tantivy) |
-| `Ctrl-Space [` | Enter scroll mode |
-| `Ctrl-Space ]` | Exit scroll mode |
-| `Ctrl-Space d` | Detach (leave daemon running, exit TUI) |
-| `Ctrl-Space ?` | Show key binding help overlay |
-| `Ctrl-Space T` | Open theme picker overlay (live switch, persists to config) |
+| `Ctrl-Space →` / `↓` | Focus next pane |
+| `Ctrl-Space ←` / `↑` | Focus previous pane |
+
+#### Sessions and tabs
+
+| Binding | Action |
+|---------|--------|
+| `Ctrl-Space n` | Next tab |
+| `Ctrl-Space p` | Previous tab |
+| `Ctrl-Space S` | New session (opens name prompt) |
+| `Ctrl-Space ,` | Rename active session |
+| `Ctrl-Space d` | Detach — exit TUI, leave daemon and sessions running; run `pyre` to reattach |
+| `Ctrl-Space q` | Quit TUI (exits the event loop; daemon sessions keep running) |
+
+Note: `q` and `d` are intentionally distinct. `d` prints a reattach hint to stdout after exit; `q` exits silently. Both leave the daemon running — neither kills panes.
+
+#### Scrollback / blocks
+
+| Binding | Action |
+|---------|--------|
+| `Ctrl-Space [` | Enter scrollback mode (block ribbon) |
+| `Ctrl-Space ]` | Exit scrollback mode |
+| `Ctrl-Space y` | Copy last block stdout to clipboard |
+
+#### Overlays and misc
+
+| Binding | Action |
+|---------|--------|
+| `Ctrl-Space /` | Open full-text block search (Tantivy) |
+| `Ctrl-Space s` | Toggle sidebar (pane list) |
+| `Ctrl-Space T` | Open theme picker (live preview, persists to config) |
 | `Ctrl-Space N` | Toggle toast notifications on/off |
+| `Ctrl-Space ?` | Show key binding help overlay (this list, in-TUI) |
 
 ### Scroll mode
 
