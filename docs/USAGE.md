@@ -1,5 +1,70 @@
 # pyre — Usage Guide
 
+## Shell integration (OSC 133)
+
+pyre segments terminal output into **blocks** using OSC 133 markers emitted by
+the shell. Blocks carry the command text, exit code, and stdout — they power
+`pyrec search`, `pyrec list`, exit-code badges in the TUI ribbon, and the MCP
+`pane_run_command` / `pane_last_block` tools.
+
+**Without shell integration** pyre still works as a terminal multiplexer with
+searchable scrollback, but no blocks are created: search returns no results,
+exit codes are unavailable, and `pane_run_command` cannot detect command
+completion.
+
+### One-line install
+
+```sh
+# bash — add to ~/.bashrc
+eval "$(pyrec shell-init bash)"
+
+# zsh — add to ~/.zshrc
+eval "$(pyrec shell-init zsh)"
+
+# fish — add to ~/.config/fish/config.fish
+pyrec shell-init fish | source
+```
+
+The script is idempotent: re-sourcing it (e.g. on shell reload) is safe.
+The guard variable `PYRE_SHELL_INTEGRATION=1` prevents double-registration.
+
+### What the hooks emit
+
+| Hook | Markers emitted | Parser effect |
+|------|-----------------|---------------|
+| `precmd` / `fish_prompt` | `D;<exit>` (if a prior command ran), then `A` | Close previous block with exit code; start command-text capture |
+| `preexec` / `fish_preexec` | `C` | Snapshot captured command text → open new block |
+
+The first-command guard (`PYRE_CMD_STARTED`) prevents a stray `D` on the very
+first prompt before any command has run.
+
+### What works without it
+
+| Feature | Without integration | With integration |
+|---------|---------------------|------------------|
+| PTY output / scrollback | Yes | Yes |
+| Block history (`pyrec list`) | No | Yes |
+| Full-text search (`pyrec search`) | No | Yes |
+| Exit codes in TUI ribbon | No | Yes |
+| `pane_run_command` exit code | No | Yes |
+| `pane_last_block` | No | Yes |
+
+### Troubleshooting shell integration
+
+If `pyrec list` returns no blocks after running commands:
+
+1. Confirm the hook is active: `echo $PYRE_SHELL_INTEGRATION` should print `1`.
+2. Check that `pyrec` is on your `PATH`: `which pyrec`.
+3. Verify pyre is connected to the daemon: `pyrec doctor`.
+4. Run a command and check `pyrec list` — blocks appear only after the command
+   finishes (OSC 133 D fires in `precmd`, not during execution).
+
+If you use a prompt framework (Starship, Powerlevel10k, Oh My Zsh), check
+whether it already emits OSC 133 — loading both may double-register hooks.
+Starship 1.16+ emits OSC 133 natively; in that case, skip `shell-init`.
+
+---
+
 ## pyrec subcommands
 
 All subcommands accept `--socket <path>` to override the default UDS path
@@ -255,13 +320,16 @@ pyrec search "error"
 
 ### Search returns no results
 
-Tantivy indexing happens at block-end (OSC 133 D). If the shell does not emit
-OSC 133 markers, blocks are not created and the index stays empty.
+Tantivy indexing happens at block-end (OSC 133 D marker). If the shell does
+not emit OSC 133 markers, blocks are not created and the index stays empty.
 
-Enable OSC 133 in your shell:
-- **bash**: add `source /usr/share/bash-preexec/bash-preexec.sh && precmd() { printf '\033]133;A\007'; }; preexec() { printf '\033]133;B\007'; }` to `.bashrc`.
-- **zsh**: use the `precmd`/`preexec` hooks; many zsh prompt frameworks (Starship, Powerlevel10k) emit OSC 133 automatically.
-- **fish**: add `function fish_prompt; printf '\033]133;A\007'; end` to `config.fish`.
+Install shell integration with one line — see the
+[Shell integration](#shell-integration-osc-133) section at the top of this
+document:
+
+```sh
+eval "$(pyrec shell-init bash)"   # or zsh / fish
+```
 
 ### pyre-gpu (windowed viewer)
 

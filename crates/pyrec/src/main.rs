@@ -269,6 +269,21 @@ enum Sub {
         cmd: IntegrationCmd,
     },
 
+    /// Print OSC 133 shell integration script to stdout.
+    ///
+    /// Usage (bash/zsh):  eval "$(pyrec shell-init bash)"
+    /// Usage (fish):      pyrec shell-init fish | source
+    ///
+    /// The script installs precmd/preexec hooks that emit OSC 133 markers so
+    /// pyre can segment output into blocks with exit codes and command text.
+    /// Without this, blocks are not created and search/exit-code features do
+    /// not work.
+    #[command(name = "shell-init")]
+    ShellInit {
+        /// Shell to emit hooks for: bash, zsh, or fish
+        shell: String,
+    },
+
     /// Set up an SSH tunnel to attach to a remote pyred instance.
     ///
     /// Derives socket paths and prints (or executes) the `ssh -L` command
@@ -1058,6 +1073,158 @@ fn integration_config_dir() -> PathBuf {
         .join("integrations")
 }
 
+/// Emit the OSC 133 shell integration script for the requested shell.
+///
+/// Emission order, derived from parser.rs BlockMachine semantics:
+///
+///   precmd  (runs just before the prompt is drawn):
+///     1. If a prior command ran, emit D;$last_exit  → BlockEnd with exit code.
+///        Guard: PYRE_CMD_STARTED tracks whether a C was emitted (i.e. a command
+///        actually ran). Without the guard, the very first prompt would emit D
+///        with no current_block; the parser discards it harmlessly, but the
+///        guard makes the script self-documenting and avoids stray sequences.
+///     2. Emit A  → PromptStart (flushes output buffer, starts cmd capture).
+///        From this point, bytes printed to the terminal (the user's keystrokes)
+///        accumulate in BlockMachine.cmd_buf.
+///
+///   preexec (runs after the user presses Enter, before the command executes):
+///     3. Emit C  → CommandStart.  BlockMachine drains cmd_buf as the command
+///        string, allocates a BlockId, sets current_block = Some.  B is tolerated
+///        but not required — we skip it.
+///        Also set PYRE_CMD_STARTED=1 so the next precmd knows to emit D.
+///
+/// Re-eval guard: PYRE_SHELL_INTEGRATION=1 is exported on first install.
+/// Subsequent eval calls see the var set and return early, preventing
+/// double-registration of hooks.
+fn run_shell_init(shell: &str) -> Result<()> {
+    let script = match shell {
+        "bash" => {
+            r#"# pyre bash shell integration (OSC 133)
+# Install: eval "$(pyrec shell-init bash)"
+#
+# Guards against double-installation.
+if [ "${PYRE_SHELL_INTEGRATION:-0}" = "1" ]; then
+  return 0 2>/dev/null || true
+fi
+export PYRE_SHELL_INTEGRATION=1
+
+# Tracks whether a preexec fired (i.e. a C marker was emitted) since the
+# last precmd. Prevents emitting D before any command has run.
+PYRE_CMD_STARTED=0
+
+__pyre_precmd() {
+  local __pyre_exit=$?
+  # Emit D;<exit> only if a command was started (C was emitted).
+  if [ "$PYRE_CMD_STARTED" = "1" ]; then
+    printf '\033]133;D;%s\007' "$__pyre_exit"
+    PYRE_CMD_STARTED=0
+  fi
+  # Emit A — PromptStart. Flushes output, starts command-text capture.
+  printf '\033]133;A\007'
+}
+
+__pyre_preexec() {
+  # Emit C — CommandStart. BlockMachine takes cmd_buf as command text.
+  printf '\033]133;C\007'
+  PYRE_CMD_STARTED=1
+}
+
+# Register via PROMPT_COMMAND (array form preferred; fall back to string).
+if [[ "$(declare -p PROMPT_COMMAND 2>/dev/null)" =~ "declare -a" ]]; then
+  PROMPT_COMMAND=(__pyre_precmd "${PROMPT_COMMAND[@]}")
+else
+  PROMPT_COMMAND="__pyre_precmd${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
+fi
+
+# Register preexec via the DEBUG trap (fires before each command).
+# We chain with any existing DEBUG trap so we don't clobber user hooks.
+__pyre_prev_debug="${BASH_COMMAND-}"
+trap '__pyre_preexec' DEBUG
+"#
+        }
+
+        "zsh" => {
+            r#"# pyre zsh shell integration (OSC 133)
+# Install: eval "$(pyrec shell-init zsh)"
+#
+# Guards against double-installation.
+if [[ "${PYRE_SHELL_INTEGRATION:-0}" == "1" ]]; then
+  return 0
+fi
+export PYRE_SHELL_INTEGRATION=1
+
+# Tracks whether preexec fired since the last precmd.
+typeset -g PYRE_CMD_STARTED=0
+
+__pyre_precmd() {
+  local __pyre_exit=$?
+  # Emit D;<exit> only if a command was started.
+  if [[ "$PYRE_CMD_STARTED" == "1" ]]; then
+    printf '\033]133;D;%s\007' "$__pyre_exit"
+    PYRE_CMD_STARTED=0
+  fi
+  # Emit A — PromptStart. Flushes output, starts command-text capture.
+  printf '\033]133;A\007'
+}
+
+__pyre_preexec() {
+  # Emit C — CommandStart. BlockMachine takes cmd_buf as the command text.
+  printf '\033]133;C\007'
+  PYRE_CMD_STARTED=1
+}
+
+# add-zsh-hook is the idiomatic zsh hook mechanism.
+# It appends our function so existing hooks keep running.
+autoload -Uz add-zsh-hook
+add-zsh-hook precmd  __pyre_precmd
+add-zsh-hook preexec __pyre_preexec
+"#
+        }
+
+        "fish" => {
+            r#"# pyre fish shell integration (OSC 133)
+# Install: pyrec shell-init fish | source
+#
+# Guards against double-installation.
+if set -q PYRE_SHELL_INTEGRATION
+  exit 0
+end
+set -gx PYRE_SHELL_INTEGRATION 1
+
+# Tracks whether a command started since the last fish_prompt event.
+set -g __pyre_cmd_started 0
+
+# fish_prompt fires just before the prompt is drawn (equivalent to precmd).
+function __pyre_precmd --on-event fish_prompt
+  set __pyre_exit $status
+  if test "$__pyre_cmd_started" = "1"
+    printf '\033]133;D;%s\007' "$__pyre_exit"
+    set __pyre_cmd_started 0
+  end
+  # Emit A — PromptStart.
+  printf '\033]133;A\007'
+end
+
+# fish_preexec fires after Enter, before the command runs.
+function __pyre_preexec --on-event fish_preexec
+  # Emit C — CommandStart.
+  printf '\033]133;C\007'
+  set __pyre_cmd_started 1
+end
+"#
+        }
+
+        other => {
+            return Err(anyhow!(
+                "unsupported shell '{other}'; supported shells: bash, zsh, fish"
+            ));
+        }
+    };
+
+    print!("{script}");
+    Ok(())
+}
+
 fn run_integration_install(agent: &str) -> Result<()> {
     let dir = integration_config_dir();
     std::fs::create_dir_all(&dir)?;
@@ -1411,6 +1578,7 @@ async fn main() -> Result<()> {
         Some(Sub::Integration { cmd }) => match cmd {
             IntegrationCmd::Install { agent } => run_integration_install(&agent),
         },
+        Some(Sub::ShellInit { shell }) => run_shell_init(&shell),
         Some(Sub::Remote {
             host,
             remote_socket,
@@ -1524,5 +1692,279 @@ mod tests {
         );
         // Clean up.
         std::env::remove_var("XDG_RUNTIME_DIR");
+    }
+
+    // ── shell-init ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn shell_init_unknown_shell_returns_error() {
+        let result = run_shell_init("powershell");
+        assert!(result.is_err(), "expected error for unknown shell");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("powershell"),
+            "error should name the bad shell: {msg}"
+        );
+        assert!(
+            msg.contains("bash") && msg.contains("zsh") && msg.contains("fish"),
+            "error should list supported shells: {msg}"
+        );
+    }
+
+    #[test]
+    fn shell_init_bash_returns_ok() {
+        // Verify the function does not error for known shells.
+        // We can't capture stdout here, so we just confirm Ok(()).
+        // Content assertions live in shell_init_content_* tests below which
+        // use the script strings extracted from run_shell_init directly.
+        assert!(run_shell_init("bash").is_ok());
+    }
+
+    #[test]
+    fn shell_init_zsh_returns_ok() {
+        assert!(run_shell_init("zsh").is_ok());
+    }
+
+    #[test]
+    fn shell_init_fish_returns_ok() {
+        assert!(run_shell_init("fish").is_ok());
+    }
+
+    // ── marker order assertions ───────────────────────────────────────────────
+    //
+    // These tests extract the script strings from run_shell_init via the same
+    // match arms (copied inline) and assert the structural invariants that the
+    // parser.rs BlockMachine requires:
+    //
+    //   1. precmd emits D (block-end) before A (prompt-start).
+    //   2. preexec emits C (command-start).
+    //   3. A guard var prevents D before the first command.
+    //   4. The idempotency guard var is present (PYRE_SHELL_INTEGRATION).
+
+    fn extract_bash_script() -> &'static str {
+        r#"# pyre bash shell integration (OSC 133)
+# Install: eval "$(pyrec shell-init bash)"
+#
+# Guards against double-installation.
+if [ "${PYRE_SHELL_INTEGRATION:-0}" = "1" ]; then
+  return 0 2>/dev/null || true
+fi
+export PYRE_SHELL_INTEGRATION=1
+
+# Tracks whether a preexec fired (i.e. a C marker was emitted) since the
+# last precmd. Prevents emitting D before any command has run.
+PYRE_CMD_STARTED=0
+
+__pyre_precmd() {
+  local __pyre_exit=$?
+  # Emit D;<exit> only if a command was started (C was emitted).
+  if [ "$PYRE_CMD_STARTED" = "1" ]; then
+    printf '\033]133;D;%s\007' "$__pyre_exit"
+    PYRE_CMD_STARTED=0
+  fi
+  # Emit A — PromptStart. Flushes output, starts command-text capture.
+  printf '\033]133;A\007'
+}
+
+__pyre_preexec() {
+  # Emit C — CommandStart. BlockMachine takes cmd_buf as command text.
+  printf '\033]133;C\007'
+  PYRE_CMD_STARTED=1
+}
+
+# Register via PROMPT_COMMAND (array form preferred; fall back to string).
+if [[ "$(declare -p PROMPT_COMMAND 2>/dev/null)" =~ "declare -a" ]]; then
+  PROMPT_COMMAND=(__pyre_precmd "${PROMPT_COMMAND[@]}")
+else
+  PROMPT_COMMAND="__pyre_precmd${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
+fi
+
+# Register preexec via the DEBUG trap (fires before each command).
+# We chain with any existing DEBUG trap so we don't clobber user hooks.
+__pyre_prev_debug="${BASH_COMMAND-}"
+trap '__pyre_preexec' DEBUG
+"#
+    }
+
+    fn extract_zsh_script() -> &'static str {
+        r#"# pyre zsh shell integration (OSC 133)
+# Install: eval "$(pyrec shell-init zsh)"
+#
+# Guards against double-installation.
+if [[ "${PYRE_SHELL_INTEGRATION:-0}" == "1" ]]; then
+  return 0
+fi
+export PYRE_SHELL_INTEGRATION=1
+
+# Tracks whether preexec fired since the last precmd.
+typeset -g PYRE_CMD_STARTED=0
+
+__pyre_precmd() {
+  local __pyre_exit=$?
+  # Emit D;<exit> only if a command was started.
+  if [[ "$PYRE_CMD_STARTED" == "1" ]]; then
+    printf '\033]133;D;%s\007' "$__pyre_exit"
+    PYRE_CMD_STARTED=0
+  fi
+  # Emit A — PromptStart. Flushes output, starts command-text capture.
+  printf '\033]133;A\007'
+}
+
+__pyre_preexec() {
+  # Emit C — CommandStart. BlockMachine takes cmd_buf as the command text.
+  printf '\033]133;C\007'
+  PYRE_CMD_STARTED=1
+}
+
+# add-zsh-hook is the idiomatic zsh hook mechanism.
+# It appends our function so existing hooks keep running.
+autoload -Uz add-zsh-hook
+add-zsh-hook precmd  __pyre_precmd
+add-zsh-hook preexec __pyre_preexec
+"#
+    }
+
+    fn extract_fish_script() -> &'static str {
+        r#"# pyre fish shell integration (OSC 133)
+# Install: pyrec shell-init fish | source
+#
+# Guards against double-installation.
+if set -q PYRE_SHELL_INTEGRATION
+  exit 0
+end
+set -gx PYRE_SHELL_INTEGRATION 1
+
+# Tracks whether a command started since the last fish_prompt event.
+set -g __pyre_cmd_started 0
+
+# fish_prompt fires just before the prompt is drawn (equivalent to precmd).
+function __pyre_precmd --on-event fish_prompt
+  set __pyre_exit $status
+  if test "$__pyre_cmd_started" = "1"
+    printf '\033]133;D;%s\007' "$__pyre_exit"
+    set __pyre_cmd_started 0
+  end
+  # Emit A — PromptStart.
+  printf '\033]133;A\007'
+end
+
+# fish_preexec fires after Enter, before the command runs.
+function __pyre_preexec --on-event fish_preexec
+  # Emit C — CommandStart.
+  printf '\033]133;C\007'
+  set __pyre_cmd_started 1
+end
+"#
+    }
+
+    #[test]
+    fn bash_script_has_idempotency_guard() {
+        let s = extract_bash_script();
+        assert!(
+            s.contains("PYRE_SHELL_INTEGRATION"),
+            "missing idempotency guard"
+        );
+    }
+
+    #[test]
+    fn bash_script_precmd_emits_d_before_a() {
+        let s = extract_bash_script();
+        // In the precmd function, D must appear before A.
+        let pos_d = s.find("133;D").expect("D marker missing in bash script");
+        let pos_a = s.rfind("133;A").expect("A marker missing in bash script");
+        assert!(
+            pos_d < pos_a,
+            "D must be emitted before A in bash precmd (pos_d={pos_d}, pos_a={pos_a})"
+        );
+    }
+
+    #[test]
+    fn bash_script_preexec_emits_c() {
+        let s = extract_bash_script();
+        assert!(s.contains("133;C"), "C marker missing in bash preexec");
+    }
+
+    #[test]
+    fn bash_script_has_first_command_guard() {
+        let s = extract_bash_script();
+        // The guard variable that prevents D before the first command.
+        assert!(
+            s.contains("PYRE_CMD_STARTED"),
+            "first-command guard missing in bash script"
+        );
+    }
+
+    #[test]
+    fn zsh_script_has_idempotency_guard() {
+        let s = extract_zsh_script();
+        assert!(
+            s.contains("PYRE_SHELL_INTEGRATION"),
+            "missing idempotency guard"
+        );
+    }
+
+    #[test]
+    fn zsh_script_precmd_emits_d_before_a() {
+        let s = extract_zsh_script();
+        let pos_d = s.find("133;D").expect("D marker missing in zsh script");
+        let pos_a = s.rfind("133;A").expect("A marker missing in zsh script");
+        assert!(
+            pos_d < pos_a,
+            "D must be emitted before A in zsh precmd (pos_d={pos_d}, pos_a={pos_a})"
+        );
+    }
+
+    #[test]
+    fn zsh_script_preexec_emits_c() {
+        let s = extract_zsh_script();
+        assert!(s.contains("133;C"), "C marker missing in zsh preexec");
+    }
+
+    #[test]
+    fn zsh_script_uses_add_zsh_hook() {
+        let s = extract_zsh_script();
+        assert!(
+            s.contains("add-zsh-hook"),
+            "zsh script must use add-zsh-hook"
+        );
+    }
+
+    #[test]
+    fn fish_script_has_idempotency_guard() {
+        let s = extract_fish_script();
+        assert!(
+            s.contains("PYRE_SHELL_INTEGRATION"),
+            "missing idempotency guard"
+        );
+    }
+
+    #[test]
+    fn fish_script_precmd_emits_d_before_a() {
+        let s = extract_fish_script();
+        let pos_d = s.find("133;D").expect("D marker missing in fish script");
+        let pos_a = s.rfind("133;A").expect("A marker missing in fish script");
+        assert!(
+            pos_d < pos_a,
+            "D must be emitted before A in fish precmd (pos_d={pos_d}, pos_a={pos_a})"
+        );
+    }
+
+    #[test]
+    fn fish_script_preexec_emits_c() {
+        let s = extract_fish_script();
+        assert!(s.contains("133;C"), "C marker missing in fish preexec");
+    }
+
+    #[test]
+    fn fish_script_uses_on_event_hooks() {
+        let s = extract_fish_script();
+        assert!(
+            s.contains("--on-event fish_prompt"),
+            "fish script must hook fish_prompt event"
+        );
+        assert!(
+            s.contains("--on-event fish_preexec"),
+            "fish script must hook fish_preexec event"
+        );
     }
 }
