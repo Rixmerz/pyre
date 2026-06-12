@@ -12,10 +12,33 @@ searchable scrollback, but no blocks are created: search returns no results,
 exit codes are unavailable, and `pane_run_command` cannot detect command
 completion.
 
-### One-line install
+### Auto-injection in pyre-spawned panes (bash)
+
+Panes spawned by `pyred` in **single-process mode** automatically receive bash
+shell integration — no manual steps required.
+
+When the resolved shell is `bash` (from `$SHELL`, or an explicit `--shell
+/bin/bash`), pyred writes a temporary rcfile to
+`$XDG_RUNTIME_DIR/pyre/bash-integration.rc` and launches bash as:
+
+```
+bash --rcfile $XDG_RUNTIME_DIR/pyre/bash-integration.rc
+```
+
+The rcfile sources `~/.bashrc` first (user config preserved), then appends the
+OSC 133 hooks. The idempotency guard (`PYRE_SHELL_INTEGRATION=1`) prevents
+double-registration if you also source the script from your own `.bashrc`.
+
+**Opt-out:** set `PYRE_NO_AUTO_INTEGRATION=1` in the daemon environment.
+
+**zsh and fish** are not yet auto-injected (zsh needs `ZDOTDIR` override; fish
+needs `conf.d` placement). Use the one-line install below for those shells, or
+for external terminals that connect to pyred from outside.
+
+### One-line install (zsh / fish / external terminals)
 
 ```sh
-# bash — add to ~/.bashrc
+# bash — add to ~/.bashrc (if you opted out of auto-injection, or use an external terminal)
 eval "$(pyrec shell-init bash)"
 
 # zsh — add to ~/.zshrc

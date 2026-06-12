@@ -2,6 +2,31 @@
 //!
 //! `spawn_pty` is the only public entry point. Callers (session.rs) wrap the
 //! returned `PaneState` in an Arc and insert it into a `SessionState`.
+//!
+//! ## Auto-injection of bash shell integration
+//!
+//! When the resolved shell basename is `bash` and the env var
+//! `PYRE_NO_AUTO_INTEGRATION=1` is **not** set, pyre automatically writes a
+//! temporary rcfile containing the OSC 133 integration script (from
+//! `pyre_proto::shell_integration::BASH_SCRIPT`) and spawns bash as
+//! `bash --rcfile <path>`.
+//!
+//! The rcfile is written **once per daemon run** (stored in a `OnceLock`).
+//! Path: `$XDG_RUNTIME_DIR/pyre/bash-integration.rc`, falling back to
+//! `/tmp/pyre-<uid>/bash-integration.rc`.
+//!
+//! The rcfile sources `~/.bashrc` first so that user configuration is
+//! preserved before appending the integration hooks.
+//!
+//! Non-bash shells (zsh, fish) and explicit non-shell commands are spawned
+//! unchanged.  zsh/fish auto-injection is deferred: zsh would need ZDOTDIR
+//! override; fish needs per-conf.d placement.  Both are addressed by the
+//! manual `pyrec shell-init` path documented in USAGE.md.
+//!
+//! Worker mode (worker.rs) streams raw PTY bytes to the supervisor without
+//! running a BlockParser, so OSC 133 markers are forwarded but not consumed
+//! within the worker.  Auto-injection is NOT applied in worker mode;
+//! document and defer.
 
 #[cfg(unix)]
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
@@ -9,13 +34,70 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use chrono::Utc;
+use pyre_proto::shell_integration::BASH_SCRIPT;
 use pyre_proto::{BlockEvent, PaneId, SessionId, SpawnReq};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::session::{PaneState, SessionRegistry};
+
+// ── rcfile path (written once per daemon run) ────────────────────────────────
+
+/// Cached path to the written bash integration rcfile.
+///
+/// `None` means writing was attempted but failed (logged as a warning); in
+/// that case bash is spawned without `--rcfile` so the pane still works.
+static BASH_RCFILE: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// Return the directory for pyre runtime files, analogous to
+/// `pyre_proto::paths::runtime_pyre_dir` but without needing the socket path.
+fn pyre_runtime_dir() -> PathBuf {
+    // Match the logic in pyred main.rs / socket_path().
+    let base = if let Ok(rt) = std::env::var("XDG_RUNTIME_DIR") {
+        PathBuf::from(rt)
+    } else {
+        // SAFETY: getuid() is always safe.
+        let uid = unsafe { libc::getuid() };
+        PathBuf::from(format!("/tmp/pyre-{uid}"))
+    };
+    base.join("pyre")
+}
+
+/// Write the bash integration rcfile exactly once per daemon run.
+///
+/// Returns the path on success, `None` if writing failed (warning logged;
+/// bash will be spawned without `--rcfile` rather than failing).
+fn ensure_bash_rcfile() -> Option<&'static PathBuf> {
+    let opt = BASH_RCFILE.get_or_init(|| {
+        let dir = pyre_runtime_dir();
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(
+                "bash-integration: cannot create runtime dir {}: {e}",
+                dir.display()
+            );
+            return None;
+        }
+        let path = dir.join("bash-integration.rc");
+        // Source the user's ~/.bashrc first so their config is preserved,
+        // then append the integration script.  The idempotency guard
+        // (PYRE_SHELL_INTEGRATION=1) inside BASH_SCRIPT prevents double-
+        // registration if the user also sources it from their own .bashrc.
+        let contents = format!("[ -f ~/.bashrc ] && . ~/.bashrc\n{}", BASH_SCRIPT);
+        if let Err(e) = std::fs::write(&path, &contents) {
+            tracing::warn!(
+                "bash-integration: cannot write rcfile {}: {e}",
+                path.display()
+            );
+            return None;
+        }
+        tracing::info!("bash-integration: rcfile written to {}", path.display());
+        Some(path)
+    });
+    opt.as_ref()
+}
 
 const OUT_CHANNEL_CAP: usize = 1024;
 const IN_CHANNEL_CAP: usize = 256;
@@ -51,7 +133,45 @@ pub async fn spawn_pty(
         .or_else(|| std::env::var("SHELL").ok())
         .unwrap_or_else(|| "/bin/bash".to_string());
 
-    let mut cmd = CommandBuilder::new(&shell);
+    // Determine whether to auto-inject the bash OSC 133 integration script.
+    //
+    // Conditions for injection (all must hold):
+    //   1. The resolved shell's basename is "bash".
+    //   2. PYRE_NO_AUTO_INTEGRATION is not set to "1".
+    //   3. The rcfile can be written (ensure_bash_rcfile returns Some).
+    //
+    // When injected, bash is launched as `bash --rcfile <path>` which causes
+    // bash to source the rcfile instead of ~/.bashrc.  The rcfile sources
+    // ~/.bashrc first so user config is preserved.
+    //
+    // Non-bash shells, explicit program invocations (e.g. "htop"), and
+    // opt-out environments all fall through to the plain spawn path below.
+    let shell_basename = std::path::Path::new(&shell)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    let auto_integrate =
+        shell_basename == "bash" && std::env::var("PYRE_NO_AUTO_INTEGRATION").as_deref() != Ok("1");
+
+    let mut cmd = if auto_integrate {
+        if let Some(rcfile) = ensure_bash_rcfile() {
+            tracing::debug!(
+                "bash auto-integration: spawning with --rcfile {}",
+                rcfile.display()
+            );
+            let mut c = CommandBuilder::new(&shell);
+            c.arg("--rcfile");
+            c.arg(rcfile.as_os_str());
+            c
+        } else {
+            // rcfile write failed; fall back to plain spawn.
+            tracing::debug!("bash auto-integration: rcfile unavailable, spawning plain bash");
+            CommandBuilder::new(&shell)
+        }
+    } else {
+        CommandBuilder::new(&shell)
+    };
+
     if let Some(cwd) = &req.cwd {
         cmd.cwd(cwd);
     }

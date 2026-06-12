@@ -6,6 +6,7 @@ pub mod layout;
 pub mod paths;
 pub mod service;
 pub mod sessions;
+pub mod shell_integration;
 pub mod socket;
 pub mod supervisor;
 pub use blocks::{BlockEvent, BlockHit, ListBlocksReq, SearchBlocksReq};

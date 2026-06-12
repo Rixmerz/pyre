@@ -27,6 +27,7 @@ use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use clap::Parser;
 use futures::{SinkExt, StreamExt};
+use pyre_proto::shell_integration::{BASH_SCRIPT, FISH_SCRIPT, ZSH_SCRIPT};
 use pyre_proto::{
     attach_stream, connect_control, default_socket, BlockHit, InputFrame, ListBlocksReq,
     OpenPaneReq, OutputFrame, PaneId, PaneStateKind, PyreDaemonClient, SearchBlocksReq, SessionId,
@@ -1098,122 +1099,9 @@ fn integration_config_dir() -> PathBuf {
 /// double-registration of hooks.
 fn run_shell_init(shell: &str) -> Result<()> {
     let script = match shell {
-        "bash" => {
-            r#"# pyre bash shell integration (OSC 133)
-# Install: eval "$(pyrec shell-init bash)"
-#
-# Guards against double-installation.
-if [ "${PYRE_SHELL_INTEGRATION:-0}" = "1" ]; then
-  return 0 2>/dev/null || true
-fi
-export PYRE_SHELL_INTEGRATION=1
-
-# Tracks whether a preexec fired (i.e. a C marker was emitted) since the
-# last precmd. Prevents emitting D before any command has run.
-PYRE_CMD_STARTED=0
-
-__pyre_precmd() {
-  local __pyre_exit=$?
-  # Emit D;<exit> only if a command was started (C was emitted).
-  if [ "$PYRE_CMD_STARTED" = "1" ]; then
-    printf '\033]133;D;%s\007' "$__pyre_exit"
-    PYRE_CMD_STARTED=0
-  fi
-  # Emit A — PromptStart. Flushes output, starts command-text capture.
-  printf '\033]133;A\007'
-}
-
-__pyre_preexec() {
-  # Emit C — CommandStart. BlockMachine takes cmd_buf as command text.
-  printf '\033]133;C\007'
-  PYRE_CMD_STARTED=1
-}
-
-# Register via PROMPT_COMMAND (array form preferred; fall back to string).
-if [[ "$(declare -p PROMPT_COMMAND 2>/dev/null)" =~ "declare -a" ]]; then
-  PROMPT_COMMAND=(__pyre_precmd "${PROMPT_COMMAND[@]}")
-else
-  PROMPT_COMMAND="__pyre_precmd${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
-fi
-
-# Register preexec via the DEBUG trap (fires before each command).
-# We chain with any existing DEBUG trap so we don't clobber user hooks.
-__pyre_prev_debug="${BASH_COMMAND-}"
-trap '__pyre_preexec' DEBUG
-"#
-        }
-
-        "zsh" => {
-            r#"# pyre zsh shell integration (OSC 133)
-# Install: eval "$(pyrec shell-init zsh)"
-#
-# Guards against double-installation.
-if [[ "${PYRE_SHELL_INTEGRATION:-0}" == "1" ]]; then
-  return 0
-fi
-export PYRE_SHELL_INTEGRATION=1
-
-# Tracks whether preexec fired since the last precmd.
-typeset -g PYRE_CMD_STARTED=0
-
-__pyre_precmd() {
-  local __pyre_exit=$?
-  # Emit D;<exit> only if a command was started.
-  if [[ "$PYRE_CMD_STARTED" == "1" ]]; then
-    printf '\033]133;D;%s\007' "$__pyre_exit"
-    PYRE_CMD_STARTED=0
-  fi
-  # Emit A — PromptStart. Flushes output, starts command-text capture.
-  printf '\033]133;A\007'
-}
-
-__pyre_preexec() {
-  # Emit C — CommandStart. BlockMachine takes cmd_buf as the command text.
-  printf '\033]133;C\007'
-  PYRE_CMD_STARTED=1
-}
-
-# add-zsh-hook is the idiomatic zsh hook mechanism.
-# It appends our function so existing hooks keep running.
-autoload -Uz add-zsh-hook
-add-zsh-hook precmd  __pyre_precmd
-add-zsh-hook preexec __pyre_preexec
-"#
-        }
-
-        "fish" => {
-            r#"# pyre fish shell integration (OSC 133)
-# Install: pyrec shell-init fish | source
-#
-# Guards against double-installation.
-if set -q PYRE_SHELL_INTEGRATION
-  exit 0
-end
-set -gx PYRE_SHELL_INTEGRATION 1
-
-# Tracks whether a command started since the last fish_prompt event.
-set -g __pyre_cmd_started 0
-
-# fish_prompt fires just before the prompt is drawn (equivalent to precmd).
-function __pyre_precmd --on-event fish_prompt
-  set __pyre_exit $status
-  if test "$__pyre_cmd_started" = "1"
-    printf '\033]133;D;%s\007' "$__pyre_exit"
-    set __pyre_cmd_started 0
-  end
-  # Emit A — PromptStart.
-  printf '\033]133;A\007'
-end
-
-# fish_preexec fires after Enter, before the command runs.
-function __pyre_preexec --on-event fish_preexec
-  # Emit C — CommandStart.
-  printf '\033]133;C\007'
-  set __pyre_cmd_started 1
-end
-"#
-        }
-
+        "bash" => BASH_SCRIPT,
+        "zsh" => ZSH_SCRIPT,
+        "fish" => FISH_SCRIPT,
         other => {
             return Err(anyhow!(
                 "unsupported shell '{other}'; supported shells: bash, zsh, fish"

@@ -11,19 +11,26 @@ result:
 
 ```
 1. session_spawn          → get session_id + pane_id
-2. pyrec shell-init bash | source   (run once inside the pane via pane_send_keys)
-3. pane_run_command       → send command, wait, get exit_code + output in one call
-4. branch on exit_code    → 0 = success, non-zero = investigate
-5. block_search           → find relevant failures across all session history
+                            (bash panes auto-inject OSC 133 — no manual step)
+2. pane_run_command       → send command, wait, get exit_code + output in one call
+3. branch on exit_code    → 0 = success, non-zero = investigate
+4. block_search           → find relevant failures across all session history
 ```
 
 `pane_run_command` is the preferred way to run commands from an agent. It
 replaces the error-prone `pane_send_keys → sleep → pane_capture` pattern.
 It polls for a new finalized block (OSC 133 D marker) and returns
-`{completed, exit_code, duration_ms, command, output, block_id}`. If
-`completed` is false or `block_id` is absent, OSC 133 shell integration is
-not active in the pane — install it with `pyrec shell-init bash` (or zsh /
-fish) sourced inside the pane.
+`{completed, exit_code, duration_ms, command, output, block_id}`.
+
+**Bash panes spawned by pyred auto-inject the OSC 133 integration** — step 2
+from the old flow (manual `pyrec shell-init bash | source`) is no longer
+needed for bash. If `completed` is false or `block_id` is absent after using
+bash, check whether `PYRE_NO_AUTO_INTEGRATION=1` is set in the daemon
+environment.
+
+For zsh or fish panes, shell integration is still installed manually:
+source `pyrec shell-init zsh` (or `fish`) once inside the pane via
+`pane_send_keys`.
 
 Structured error codes in every MCP error response (`data.code`):
 
