@@ -113,6 +113,79 @@ impl BlockIndex {
         })
     }
 
+    /// Return the number of documents currently committed to the index.
+    ///
+    /// Used by the startup backfill guard: if doc count is 0 but SQLite has
+    /// blocks, the v3 index is empty and needs to be backfilled.
+    pub fn doc_count(&self) -> Result<u64> {
+        let reader = self
+            .index
+            .reader()
+            .context("tantivy reader for doc_count")?;
+        Ok(reader.searcher().num_docs())
+    }
+
+    /// Backfill the v3 index from `blocks` (already fetched from SQLite).
+    ///
+    /// Each block's stdout blob is read via `read_blob` (a closure so the
+    /// sync blob reading can be tested without a real `Store`).  A missing or
+    /// corrupt blob results in an empty-stdout document (warn, not abort).
+    ///
+    /// Documents are added in batches of `BACKFILL_BATCH_SIZE` and committed
+    /// together at the end; a mid-batch commit fires every `BACKFILL_BATCH_SIZE`
+    /// docs to bound memory on very large histories.
+    ///
+    /// Returns the number of documents successfully added.
+    pub fn backfill<F>(&self, blocks: &[Block], mut read_blob: F) -> Result<usize>
+    where
+        F: FnMut(BlockId) -> Result<Vec<u8>>,
+    {
+        const BACKFILL_BATCH_SIZE: usize = 500;
+
+        let mut writer = self.writer.lock().expect("tantivy writer poisoned");
+        let mut added = 0usize;
+
+        for (i, block) in blocks.iter().enumerate() {
+            let stdout_bytes = match read_blob(block.id) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    tracing::warn!(block_id = %block.id, "backfill: failed to read stdout blob: {e:#}");
+                    Vec::new()
+                }
+            };
+            let stdout = String::from_utf8_lossy(&stdout_bytes);
+
+            let mut doc = tantivy::TantivyDocument::new();
+            doc.add_text(self.schema.block_id, block.id.0.to_string());
+            doc.add_text(self.schema.pane_id, block.pane.0.to_string());
+            doc.add_text(self.schema.session_id, block.session.0.to_string());
+            doc.add_i64(self.schema.started_at, block.started_at.timestamp_millis());
+            doc.add_text(self.schema.command, &block.command);
+            doc.add_text(self.schema.stdout, stdout.as_ref());
+            doc.add_i64(
+                self.schema.exit_code,
+                block.exit_code.map(i64::from).unwrap_or(i64::MIN),
+            );
+
+            if let Err(e) = writer.add_document(doc) {
+                tracing::warn!(block_id = %block.id, "backfill: add_document failed: {e:#}");
+                continue;
+            }
+            added += 1;
+
+            // Chunked commit every BACKFILL_BATCH_SIZE docs to bound memory.
+            if (i + 1) % BACKFILL_BATCH_SIZE == 0 {
+                if let Err(e) = writer.commit() {
+                    tracing::warn!("backfill: mid-batch commit failed at doc {i}: {e:#}");
+                }
+            }
+        }
+
+        // Final commit for any remaining docs.
+        writer.commit().context("backfill: final commit")?;
+        Ok(added)
+    }
+
     /// Add a block and its decoded stdout to the index, then commit.
     ///
     /// Blocks with no exit code are stored as `i64::MIN` sentinel so the

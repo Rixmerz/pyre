@@ -163,6 +163,9 @@ async fn run_single(path: PathBuf) -> Result<()> {
             .context("spawn BlockIndex::open")?
             .context("open block index")?,
     );
+    migration::backfill_index_if_empty(&store, block_index.clone())
+        .await
+        .context("backfill search index")?;
 
     let registry = Arc::new(SessionRegistry::new());
     let focus_queue: Arc<Mutex<VecDeque<PaneId>>> = Arc::new(Mutex::new(VecDeque::new()));
@@ -307,6 +310,9 @@ async fn main() -> Result<()> {
                     .context("spawn BlockIndex::open")?
                     .context("open block index")?,
             );
+            migration::backfill_index_if_empty(&store, block_index.clone())
+                .await
+                .context("backfill search index")?;
 
             supervisor::run(path, store, block_index).await
         }

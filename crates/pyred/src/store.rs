@@ -269,6 +269,15 @@ impl Store {
         Ok(ids)
     }
 
+    /// Return the total number of block rows in SQLite (fast COUNT query).
+    pub async fn count_blocks(&self) -> Result<u64> {
+        let row = sqlx::query("SELECT COUNT(*) AS n FROM blocks")
+            .fetch_one(&self.pool)
+            .await?;
+        let n: i64 = row.try_get("n")?;
+        Ok(n.max(0) as u64)
+    }
+
     pub async fn list_blocks_for_pane(&self, pane: PaneId, limit: u32) -> Result<Vec<Block>> {
         let rows = sqlx::query(
             "SELECT id, pane_id, session_id, command, started_at, ended_at, exit_code, cwd, stdout_len

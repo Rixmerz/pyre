@@ -464,6 +464,87 @@ async fn collect_all_blocks(pool: &SqlitePool) -> Result<Vec<LegacyBlock>> {
 // Schema v2 migration: add exit_code field to Tantivy index
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// v3 startup backfill
+// ---------------------------------------------------------------------------
+
+/// Check whether the v3 Tantivy index needs to be backfilled from SQLite, and
+/// if so run the backfill.
+///
+/// Trigger condition: `index.doc_count() == 0` AND `store.count_blocks() > 0`.
+/// After a successful backfill `doc_count() > 0`, so the check is self-disarming
+/// on subsequent startups.  Even if every blob is unreadable the documents are
+/// still added with empty stdout, which also self-disarms the guard.
+///
+/// This is called once per startup, immediately after `BlockIndex::open` and
+/// before the daemon begins accepting connections.
+pub async fn backfill_index_if_empty(
+    store: &crate::store::Store,
+    block_index: std::sync::Arc<crate::index::BlockIndex>,
+) -> Result<()> {
+    // Fast path: check doc count synchronously inside spawn_blocking.
+    let index_for_check = block_index.clone();
+    let doc_count = tokio::task::spawn_blocking(move || index_for_check.doc_count())
+        .await
+        .context("spawn_blocking doc_count")??;
+
+    if doc_count > 0 {
+        // Index already populated — nothing to do.
+        return Ok(());
+    }
+
+    let block_count = store.count_blocks().await.context("count_blocks")?;
+    if block_count == 0 {
+        // No blocks in SQLite either — nothing to backfill.
+        return Ok(());
+    }
+
+    tracing::info!(block_count, "backfilling search index from SQLite");
+
+    // Fetch all blocks (metadata only — no blobs yet; blobs are read inside
+    // spawn_blocking where sync I/O is allowed).
+    let all_blocks = store
+        .list_blocks(None, u32::MAX)
+        .await
+        .context("list_blocks for backfill")?;
+
+    let total = all_blocks.len();
+    let started = std::time::Instant::now();
+
+    // Clone the data_dir so the blob reader can locate blob files without
+    // holding a reference to `store` across the spawn_blocking boundary.
+    let data_dir = store.data_dir().to_path_buf();
+
+    let added = tokio::task::spawn_blocking(move || {
+        block_index.backfill(&all_blocks, |block_id| {
+            let path = data_dir.join("blocks").join(format!("{}.zst", block_id.0));
+            if !path.exists() {
+                return Ok(Vec::new());
+            }
+            let raw =
+                std::fs::read(&path).with_context(|| format!("read blob {}", path.display()))?;
+            zstd::decode_all(std::io::Cursor::new(raw))
+                .with_context(|| format!("zstd decode {}", path.display()))
+        })
+    })
+    .await
+    .context("spawn_blocking backfill")??;
+
+    let elapsed = started.elapsed();
+    tracing::info!(
+        added,
+        total,
+        elapsed_ms = elapsed.as_millis(),
+        "search index backfill complete"
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Schema v2 migration: add exit_code field to Tantivy index
+// ---------------------------------------------------------------------------
+
 /// Detect whether the Tantivy index at `index_dir` is missing the `exit_code`
 /// field (schema v1). If so:
 ///  1. Rename `index_dir` → `index_dir/../index.bak.YYYYMMDD-HHMMSS`.
@@ -813,5 +894,194 @@ mod tests {
 
         let result = tantivy_has_exit_code_field(tmp.path()).unwrap();
         assert!(!result, "v1 index should NOT have exit_code field");
+    }
+
+    // -----------------------------------------------------------------------
+    // Startup backfill tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: open a Store pointed at a temp dir via PYRE_DATA_DIR.
+    async fn open_store_in(tmp: &TempDir) -> Result<std::sync::Arc<crate::store::Store>> {
+        unsafe {
+            std::env::set_var("PYRE_DATA_DIR", tmp.path());
+        }
+        Ok(std::sync::Arc::new(crate::store::Store::open().await?))
+    }
+
+    /// Insert a block row directly via the store and optionally write a zstd blob.
+    async fn insert_block_with_blob(
+        store: &crate::store::Store,
+        block: &pyre_proto::Block,
+        stdout: Option<&[u8]>,
+    ) -> Result<()> {
+        store.create_block(block).await?;
+        store
+            .finalize_block(block.id, chrono::Utc::now(), block.exit_code, 0)
+            .await?;
+        if let Some(bytes) = stdout {
+            let path = store.blob_path_for(block.id);
+            let mut bw = crate::store::BlobWriter::open(&path)?;
+            bw.write(bytes)?;
+            bw.close()?;
+        }
+        Ok(())
+    }
+
+    fn make_test_block(command: &str, exit_code: Option<i32>) -> pyre_proto::Block {
+        use pyre_proto::{Block, BlockId, PaneId, SessionId};
+        Block {
+            id: BlockId(uuid::Uuid::new_v4()),
+            pane: PaneId(uuid::Uuid::new_v4()),
+            session: SessionId(uuid::Uuid::new_v4()),
+            command: command.to_string(),
+            cwd: None,
+            started_at: chrono::Utc::now(),
+            ended_at: None,
+            exit_code,
+            stdout_len: 0,
+        }
+    }
+
+    // These tests mutate PYRE_DATA_DIR, so they must be serialized under ENV_LOCK
+    // (shared with the store tests that mutate the same env var).
+    use crate::shard::ENV_TEST_LOCK as STORE_LOCK;
+
+    #[tokio::test]
+    async fn backfill_populates_empty_v3_index() -> Result<()> {
+        let _g = STORE_LOCK.lock().await;
+        let tmp = TempDir::new()?;
+        let store = open_store_in(&tmp).await?;
+
+        // Insert 3 blocks, one with a readable blob, one with no blob.
+        let block_a = make_test_block("cargo build", Some(0));
+        let block_b = make_test_block("cargo test", Some(1));
+        let block_c = make_test_block("git status", None); // no blob — missing is graceful
+
+        let sid = pyre_proto::SessionId(uuid::Uuid::new_v4());
+        let pid = pyre_proto::PaneId(uuid::Uuid::new_v4());
+        store.upsert_session(sid, "test").await?;
+        store.upsert_pane(pid, sid, "/bin/sh", None, 80, 24).await?;
+
+        insert_block_with_blob(&store, &block_a, Some(b"compiling pyre")).await?;
+        insert_block_with_blob(&store, &block_b, Some(b"test FAILED")).await?;
+        insert_block_with_blob(&store, &block_c, None).await?;
+
+        // Open a fresh (empty) v3 index.
+        let index_dir = tmp.path().join("index");
+        let block_index = std::sync::Arc::new(
+            tokio::task::spawn_blocking({
+                let d = index_dir.clone();
+                move || crate::index::BlockIndex::open(&d)
+            })
+            .await??,
+        );
+
+        // Confirm pre-condition: index empty, store has 3 blocks.
+        assert_eq!(block_index.doc_count()?, 0, "index should start empty");
+        assert_eq!(store.count_blocks().await?, 3, "store should have 3 blocks");
+
+        // Run backfill.
+        backfill_index_if_empty(&store, block_index.clone()).await?;
+
+        // Post-condition: index has 3 docs.
+        assert_eq!(
+            block_index.doc_count()?,
+            3,
+            "index should have 3 docs after backfill"
+        );
+
+        // Search finds block_a by command text.
+        let cargo_hits = block_index.search("cargo", 10, false, None, None, None)?;
+        assert!(
+            cargo_hits.contains(&block_a.id),
+            "block_a (cargo build) should be searchable after backfill"
+        );
+
+        // failures_only filter works on backfilled docs.
+        let failures = block_index.search("cargo", 10, true, None, None, None)?;
+        assert_eq!(
+            failures.len(),
+            1,
+            "only one failure block among cargo blocks"
+        );
+        assert_eq!(failures[0], block_b.id, "the failure must be block_b");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn backfill_is_noop_on_second_startup() -> Result<()> {
+        let _g = STORE_LOCK.lock().await;
+        let tmp = TempDir::new()?;
+        let store = open_store_in(&tmp).await?;
+
+        let block = make_test_block("echo hello", Some(0));
+        let sid = pyre_proto::SessionId(uuid::Uuid::new_v4());
+        let pid = pyre_proto::PaneId(uuid::Uuid::new_v4());
+        store.upsert_session(sid, "test").await?;
+        store.upsert_pane(pid, sid, "/bin/sh", None, 80, 24).await?;
+        insert_block_with_blob(&store, &block, Some(b"hello")).await?;
+
+        let index_dir = tmp.path().join("index");
+        let block_index = std::sync::Arc::new(
+            tokio::task::spawn_blocking({
+                let d = index_dir.clone();
+                move || crate::index::BlockIndex::open(&d)
+            })
+            .await??,
+        );
+
+        // First backfill.
+        backfill_index_if_empty(&store, block_index.clone()).await?;
+        assert_eq!(block_index.doc_count()?, 1);
+
+        // Second call must not add more documents (self-disarming guard).
+        backfill_index_if_empty(&store, block_index.clone()).await?;
+        assert_eq!(
+            block_index.doc_count()?,
+            1,
+            "second backfill must be a no-op"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn backfill_with_missing_blob_still_indexes_doc() -> Result<()> {
+        let _g = STORE_LOCK.lock().await;
+        let tmp = TempDir::new()?;
+        let store = open_store_in(&tmp).await?;
+
+        // Block with no blob file on disk.
+        let block = make_test_block("mystery command", Some(0));
+        let sid = pyre_proto::SessionId(uuid::Uuid::new_v4());
+        let pid = pyre_proto::PaneId(uuid::Uuid::new_v4());
+        store.upsert_session(sid, "test").await?;
+        store.upsert_pane(pid, sid, "/bin/sh", None, 80, 24).await?;
+        // Deliberately omit blob by passing None.
+        insert_block_with_blob(&store, &block, None).await?;
+
+        let index_dir = tmp.path().join("index");
+        let block_index = std::sync::Arc::new(
+            tokio::task::spawn_blocking({
+                let d = index_dir.clone();
+                move || crate::index::BlockIndex::open(&d)
+            })
+            .await??,
+        );
+
+        backfill_index_if_empty(&store, block_index.clone()).await?;
+
+        // The doc with empty stdout is still indexed — searchable by command.
+        assert_eq!(
+            block_index.doc_count()?,
+            1,
+            "doc indexed despite missing blob"
+        );
+        let hits = block_index.search("mystery", 10, false, None, None, None)?;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0], block.id);
+
+        Ok(())
     }
 }
