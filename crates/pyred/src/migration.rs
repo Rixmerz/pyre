@@ -785,9 +785,12 @@ mod tests {
     #[test]
     fn tantivy_v2_index_reports_has_exit_code() {
         let tmp = TempDir::new().unwrap();
-        // Open a fresh BlockIndex (schema v2) and verify the field is detected.
+        // BlockIndex::open places the real index in a versioned sub-directory
+        // (currently "v3/").  tantivy_has_exit_code_field must be given the
+        // same sub-directory, not the parent.
         BlockIndex::open(tmp.path()).unwrap();
-        let result = tantivy_has_exit_code_field(tmp.path()).unwrap();
+        let versioned = tmp.path().join(crate::index::SCHEMA_VERSION_DIR);
+        let result = tantivy_has_exit_code_field(&versioned).unwrap();
         assert!(result, "fresh index should have exit_code field");
     }
 

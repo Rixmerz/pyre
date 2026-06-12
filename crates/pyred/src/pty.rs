@@ -270,12 +270,27 @@ pub async fn spawn_pty(
                         ref cwd,
                         ..
                     } => {
+                        // Resolve the foreground process cwd from /proc/<pid>/cwd.
+                        // This gives the actual working directory at command-start
+                        // time rather than relying on the shell to emit it via OSC.
+                        // Falls back to the cwd carried in the event (always None
+                        // from the current parser), then to None on any error.
+                        #[cfg(unix)]
+                        let resolved_cwd: Option<std::path::PathBuf> =
+                            { std::fs::read_link(format!("/proc/{child_pid}/cwd")).ok() };
+                        #[cfg(not(unix))]
+                        let resolved_cwd: Option<std::path::PathBuf> =
+                            cwd.as_ref().map(std::path::PathBuf::from);
+                        #[cfg(unix)]
+                        let resolved_cwd =
+                            resolved_cwd.or_else(|| cwd.as_ref().map(std::path::PathBuf::from));
+
                         let proto_block = pyre_proto::Block {
                             id: block,
                             pane: pane_id,
                             session: session_id,
                             command: command.clone(),
-                            cwd: cwd.as_ref().map(std::path::PathBuf::from),
+                            cwd: resolved_cwd,
                             started_at: chrono::Utc::now(),
                             ended_at: None,
                             exit_code: None,

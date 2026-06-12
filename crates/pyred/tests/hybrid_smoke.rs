@@ -177,6 +177,9 @@ async fn run_cross_session_search() -> anyhow::Result<()> {
                 query: "hello".into(),
                 limit: 20,
                 failures_only: false,
+                session: None,
+                pane: None,
+                exit_code: None,
             },
         )
         .await

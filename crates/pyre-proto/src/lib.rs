@@ -99,6 +99,20 @@ pub struct Block {
     pub stdout_len: u64,
 }
 
+impl Block {
+    /// Wall-clock duration of the block in milliseconds.
+    ///
+    /// Returns `None` when the block has not yet received a `BlockEnd` event
+    /// (i.e. `ended_at` is `None`).
+    pub fn duration_ms(&self) -> Option<u64> {
+        let ended = self.ended_at?;
+        let delta = ended - self.started_at;
+        // to_std() fails only when the duration is negative (clock skew / test
+        // fixture artefact); treat that as None rather than panicking.
+        delta.to_std().ok().map(|d| d.as_millis() as u64)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
@@ -159,5 +173,47 @@ mod tests {
         };
         let s = serde_json::to_string(&r).unwrap();
         let _back: Request = serde_json::from_str(&s).unwrap();
+    }
+
+    #[test]
+    fn duration_ms_none_when_not_ended() {
+        let b = Block {
+            id: BlockId::new(),
+            pane: PaneId::new(),
+            session: SessionId::new(),
+            command: "ls".to_string(),
+            cwd: None,
+            started_at: DateTime::from_timestamp_millis(0).unwrap(),
+            ended_at: None,
+            exit_code: None,
+            stdout_len: 0,
+        };
+        assert_eq!(
+            b.duration_ms(),
+            None,
+            "duration_ms must be None when ended_at is absent"
+        );
+    }
+
+    #[test]
+    fn duration_ms_correct_when_ended() {
+        let start = DateTime::from_timestamp_millis(1_000_000).unwrap();
+        let end = DateTime::from_timestamp_millis(1_001_500).unwrap(); // 1500 ms later
+        let b = Block {
+            id: BlockId::new(),
+            pane: PaneId::new(),
+            session: SessionId::new(),
+            command: "sleep 1".to_string(),
+            cwd: None,
+            started_at: start,
+            ended_at: Some(end),
+            exit_code: Some(0),
+            stdout_len: 0,
+        };
+        assert_eq!(
+            b.duration_ms(),
+            Some(1500),
+            "duration_ms must equal ended_at - started_at in milliseconds"
+        );
     }
 }

@@ -707,6 +707,9 @@ async fn run_search(socket: PathBuf, query: String, limit: u32, failures: bool) 
                 query,
                 limit,
                 failures_only: failures,
+                session: None,
+                pane: None,
+                exit_code: None,
             },
         )
         .await

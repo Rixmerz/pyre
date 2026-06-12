@@ -130,6 +130,9 @@ impl SearchUi {
                 query,
                 limit: 20,
                 failures_only,
+                session: None,
+                pane: None,
+                exit_code: None,
             };
             let hits = client
                 .search_blocks(tarpc::context::current(), req)

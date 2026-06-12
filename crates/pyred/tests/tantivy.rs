@@ -208,6 +208,9 @@ async fn run_tantivy_test() -> anyhow::Result<()> {
                         query: "tantivytokenalpha".into(),
                         limit: 10,
                         failures_only: false,
+                        session: None,
+                        pane: None,
+                        exit_code: None,
                     },
                 )
                 .await
@@ -246,6 +249,9 @@ async fn run_tantivy_test() -> anyhow::Result<()> {
                         query: "tantivytokenbeta".into(),
                         limit: 10,
                         failures_only: false,
+                        session: None,
+                        pane: None,
+                        exit_code: None,
                     },
                 )
                 .await

@@ -40,8 +40,20 @@ pub struct SearchBlocksReq {
     pub query: String,
     pub limit: u32,
     /// When true, only blocks with a non-zero exit code are returned.
+    /// Superseded by `exit_code` if both are set; when `exit_code` is `Some`,
+    /// `failures_only` is ignored.
     #[serde(default)]
     pub failures_only: bool,
+    /// Restrict results to blocks belonging to this session.
+    #[serde(default)]
+    pub session: Option<crate::SessionId>,
+    /// Restrict results to blocks belonging to this pane.
+    #[serde(default)]
+    pub pane: Option<crate::PaneId>,
+    /// Restrict results to blocks with this exact exit code.
+    /// When set, `failures_only` is ignored.
+    #[serde(default)]
+    pub exit_code: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

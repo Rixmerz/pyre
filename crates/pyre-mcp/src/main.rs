@@ -896,6 +896,9 @@ impl Server {
                     query,
                     limit,
                     failures_only,
+                    session: None,
+                    pane: None,
+                    exit_code: None,
                 },
             )
             .await

@@ -212,6 +212,9 @@ async fn run_blocks_test() -> anyhow::Result<()> {
                 query: "pwd".into(),
                 limit: 10,
                 failures_only: false,
+                session: None,
+                pane: None,
+                exit_code: None,
             },
         )
         .await

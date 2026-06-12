@@ -427,6 +427,9 @@ async fn test3_block_detection() -> bool {
                 query: "ls".into(),
                 limit: 10,
                 failures_only: false,
+                session: None,
+                pane: None,
+                exit_code: None,
             },
         )
         .await

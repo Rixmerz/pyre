@@ -358,6 +358,9 @@ pub(crate) async fn run_tui(
                     query,
                     limit: 20,
                     failures_only,
+                    session: None,
+                    pane: None,
+                    exit_code: None,
                 };
                 tokio::spawn(async move {
                     let hits = client

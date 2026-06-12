@@ -112,11 +112,15 @@ impl pyre_proto::service::PyreDaemon for DaemonImpl {
         let query = req.query.clone();
         let failures_only = req.failures_only;
         let limit = req.limit;
-        let ids =
-            tokio::task::spawn_blocking(move || block_index.search(&query, limit, failures_only))
-                .await
-                .map_err(|e| PyreError::Io(e.to_string()))?
-                .map_err(|e| PyreError::Io(e.to_string()))?;
+        let session = req.session;
+        let pane = req.pane;
+        let exit_code = req.exit_code;
+        let ids = tokio::task::spawn_blocking(move || {
+            block_index.search(&query, limit, failures_only, session, pane, exit_code)
+        })
+        .await
+        .map_err(|e| PyreError::Io(e.to_string()))?
+        .map_err(|e| PyreError::Io(e.to_string()))?;
 
         let mut blocks = Vec::with_capacity(ids.len());
         for id in ids {
