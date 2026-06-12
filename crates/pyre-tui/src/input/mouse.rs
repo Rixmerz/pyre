@@ -13,13 +13,16 @@ use ratatui::layout::Rect;
 
 use alacritty_terminal::index::{Column as TermColumn, Line as TermLine, Point as TermPoint};
 
-use crate::model::pane::DragState;
-use crate::model::selection::{ClickTracker, Selection, SelectionBase};
-use crate::{
-    children_at_mut, close_pane_by_slot_idx, collect_leaf_rects, focus_slot, focused_slot_idx,
-    pane_leaves_in_order, pane_to_slot_idx, rect_contains, AppState, ContextMenu, NamePrompt,
-    PendingMenuAction, PromptKind, MENU_ITEMS,
+use crate::app::pane_ops::{close_pane_by_slot_idx, focus_slot};
+use crate::app::state::{AppState, PendingMenuAction};
+use crate::model::context_menu::{ContextMenu, MENU_ITEMS};
+use crate::model::layout::{
+    children_at_mut, collect_leaf_rects, focused_slot_idx, pane_leaves_in_order, pane_to_slot_idx,
+    rect_contains,
 };
+use crate::model::pane::DragState;
+use crate::model::prompt::{NamePrompt, PromptKind};
+use crate::model::selection::{ClickTracker, Selection, SelectionBase};
 
 /// Double/triple-click window in milliseconds.
 const CLICK_WINDOW_MS: u64 = 500;
@@ -422,7 +425,6 @@ pub(crate) fn handle_mouse(
                                 last_at: now,
                                 last_pos: click_pos,
                                 count: 2,
-                                pane_idx: usize::MAX,
                             });
                             return true;
                         }
@@ -444,7 +446,6 @@ pub(crate) fn handle_mouse(
                             last_at: now,
                             last_pos: click_pos,
                             count: 1,
-                            pane_idx: usize::MAX,
                         });
                         return true;
                     }
@@ -516,7 +517,6 @@ pub(crate) fn handle_mouse(
                                 last_at: now,
                                 last_pos: click_pos,
                                 count: click_count,
-                                pane_idx: slot_idx,
                             });
                             if let Some(slot) = state.slots[slot_idx].as_mut() {
                                 slot.ribbon_cursor = Some(*chip_idx);
@@ -572,7 +572,6 @@ pub(crate) fn handle_mouse(
                                 last_at: now,
                                 last_pos: click_pos,
                                 count: click_count,
-                                pane_idx: slot_idx,
                             });
 
                             let sel_base = if slot.scroll_offset > 0 {

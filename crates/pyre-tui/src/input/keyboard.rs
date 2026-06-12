@@ -16,11 +16,12 @@ use ratatui::layout::Rect;
 
 use bytes::Bytes;
 
+use crate::app::pane_ops::{close_pane_by_slot_idx, open_new_session, open_new_tab, split_active};
+use crate::app::state::AppState;
+use crate::model::context_menu::{MenuItem, MENU_ITEMS};
+use crate::model::layout::{focused_slot_idx, pane_leaves_in_order, pane_to_slot_idx};
+use crate::model::prompt::PromptKind;
 use crate::render::overlay::pager::PagerState;
-use crate::{
-    close_pane_by_slot_idx, focused_slot_idx, open_new_session, open_new_tab, pane_leaves_in_order,
-    pane_to_slot_idx, split_active, AppState, MenuItem, PromptKind, MENU_ITEMS,
-};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Key serialization

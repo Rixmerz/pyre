@@ -10,10 +10,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block as RatatuiBlock, BorderType, Borders, Clear, Paragraph};
 use ratatui::Terminal;
 
-use crate::build_pane_slot_map;
+use crate::app::state::AppState;
 use crate::fire_motion;
-use crate::focused_slot_idx;
+use crate::model::context_menu::MENU_ITEMS;
+use crate::model::layout::{build_pane_slot_map, focused_slot_idx};
 use crate::model::pane::SplitBoundary;
+use crate::model::prompt::{NamePrompt, PromptKind};
 use crate::render::overlay::pager::render_pager;
 use crate::render::overlay::picker::render_theme_picker;
 use crate::render::overlay::search::render_search_overlay;
@@ -23,8 +25,6 @@ use crate::render::session_strip::render_session_strip;
 use crate::render::sidebar::render_sidebar;
 use crate::render::toast::render_toast_deck;
 use crate::theme;
-use crate::AppState;
-use crate::{NamePrompt, PromptKind, MENU_ITEMS};
 use pyre_proto::layout::LayoutNode;
 
 // ─────────────────────────────────────────────────────────────────────────────

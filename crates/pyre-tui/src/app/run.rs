@@ -342,26 +342,27 @@ pub(crate) async fn run_tui(
             && state.search.pending_query.is_some()
             && state.search.last_query_at.elapsed() >= Duration::from_millis(150)
         {
-            let raw = state.search.pending_query.take().expect("checked Some");
-            let (query, failures_only) = parse_search_input(&raw);
-            state.search.failures_only = failures_only;
-            let (tx, rx) = tokio::sync::mpsc::channel::<Vec<BlockHit>>(1);
-            state.search.rx = Some(rx);
-            let client = state.control.clone();
-            let req = SearchBlocksReq {
-                query,
-                limit: 20,
-                failures_only,
-            };
-            tokio::spawn(async move {
-                let hits = client
-                    .search_blocks(tarpc::context::current(), req)
-                    .await
-                    .ok()
-                    .and_then(|r| r.ok())
-                    .unwrap_or_default();
-                let _ = tx.send(hits).await;
-            });
+            if let Some(raw) = state.search.pending_query.take() {
+                let (query, failures_only) = parse_search_input(&raw);
+                state.search.failures_only = failures_only;
+                let (tx, rx) = tokio::sync::mpsc::channel::<Vec<BlockHit>>(1);
+                state.search.rx = Some(rx);
+                let client = state.control.clone();
+                let req = SearchBlocksReq {
+                    query,
+                    limit: 20,
+                    failures_only,
+                };
+                tokio::spawn(async move {
+                    let hits = client
+                        .search_blocks(tarpc::context::current(), req)
+                        .await
+                        .ok()
+                        .and_then(|r| r.ok())
+                        .unwrap_or_default();
+                    let _ = tx.send(hits).await;
+                });
+            }
         }
 
         // Drain search results.

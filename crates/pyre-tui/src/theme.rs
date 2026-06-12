@@ -8,7 +8,8 @@ use pyre_themes::Palette;
 use ratatui::style::{Color, Modifier, Style};
 
 /// Convenience wrapper around a palette reference, providing style builders.
-/// Prepared for Wave 2 GPU consumption; not yet wired into all render paths.
+/// Prepared for Wave 2 GPU consumption; not yet wired into any render path.
+// dead_code: planned Wave 2 GPU renderer will consume ThemeRef instead of LegacyTheme
 pub struct ThemeRef<'a>(pub &'a Palette);
 
 #[allow(dead_code)]
@@ -148,8 +149,10 @@ impl LegacyTheme {
     }
 }
 
-/// The Ember palette as a `LegacyTheme` for use by `fire_motion` and render
-/// code that hasn't been migrated yet.
+/// The Ember palette as a `LegacyTheme`.
+/// Retained as a compile-time reference value for tests and future GPU render code.
+// dead_code: fire_motion migrated to runtime palette; EMBER kept as a named constant
+// for snapshot tests and Wave 2 GPU renderer baseline — do not delete yet.
 #[allow(dead_code)]
 pub const EMBER: LegacyTheme = LegacyTheme {
     bg: Color::Rgb(0x0d, 0x0a, 0x08),

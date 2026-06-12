@@ -26,6 +26,7 @@ impl Selection {
     /// Clamp `start` and `end` so that neither row exceeds `max_row` and
     /// neither col exceeds `max_col`.  Useful after a resize that shrinks
     /// the content area.
+    // dead_code: planned for resize-triggered selection clamping (not yet wired)
     #[allow(dead_code)]
     pub fn clamp_to(&mut self, max_row: u16, max_col: u16) {
         let clamp_point = |(r, c): (u16, u16)| (r.min(max_row), c.min(max_col));
@@ -43,6 +44,7 @@ impl Selection {
         }
     }
 
+    // dead_code: planned for highlight rendering — test whether a cell falls inside the selection
     #[allow(dead_code)]
     pub fn contains(&self, row: u16, col: u16) -> bool {
         let ((r0, c0), (r1, c1)) = self.normalized();
@@ -69,8 +71,6 @@ pub struct ClickTracker {
     pub last_at: Instant,
     pub last_pos: (u16, u16), // (col, row) in terminal coordinates
     pub count: u8,
-    #[allow(dead_code)]
-    pub pane_idx: usize,
 }
 
 impl ClickTracker {

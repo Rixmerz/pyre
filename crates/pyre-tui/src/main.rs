@@ -16,22 +16,8 @@ mod rpc;
 mod splash;
 mod theme;
 
-pub use app::restore_active_session;
 use app::run::run_tui;
 use rpc::{control_client, first_pane, resolve_pane, resolve_session};
-
-// Re-exports consumed by submodules via `crate::`.
-pub(crate) use app::pane_ops::{
-    close_focused_pane, close_pane_by_slot_idx, focus_slot, open_new_session, open_new_tab,
-    split_active,
-};
-pub(crate) use app::state::{AppState, PendingMenuAction};
-pub(crate) use model::context_menu::{ContextMenu, MenuItem, MENU_ITEMS};
-pub(crate) use model::layout::{
-    build_pane_slot_map, children_at_mut, collect_leaf_rects, focus_next, focused_slot_idx,
-    pane_leaves_in_order, pane_to_slot_idx, rect_contains,
-};
-pub(crate) use model::prompt::{NamePrompt, PromptKind};
 
 /// How the TUI should initialise its first pane on startup.
 pub(crate) enum PaneInit {

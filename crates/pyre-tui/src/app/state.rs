@@ -24,17 +24,22 @@ use crate::render::overlay::search::SearchState;
 
 /// Actions that require async context (RPC calls) but originate from the sync
 /// `handle_mouse` function. The event loop drains this after every mouse event.
-#[allow(dead_code)]
 pub enum PendingMenuAction {
     /// Execute the highlighted item of the context menu.
     ContextMenuCommit,
     /// Activate a specific context menu item by index (mouse-left on item row).
     ContextMenuActivate(usize),
     /// Split active pane horizontally (HSplit).
+    // dead_code: constructed when context-menu split action is wired to mouse handler
+    #[allow(dead_code)]
     SplitH,
     /// Split active pane vertically (VSplit).
+    // dead_code: constructed when context-menu split action is wired to mouse handler
+    #[allow(dead_code)]
     SplitV,
     /// Open a rename prompt for the active session.
+    // dead_code: constructed when rename-session menu action is wired to mouse handler
+    #[allow(dead_code)]
     RenameSession,
     /// Jump to search result at given index (mouse click on result row).
     SearchJump(usize),
@@ -44,7 +49,6 @@ pub enum PendingMenuAction {
 // AppState
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[allow(dead_code)]
 pub struct AppState {
     /// All known sessions (may have tabs loaded lazily).
     pub sessions: Vec<SessionView>,

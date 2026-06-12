@@ -3,9 +3,9 @@
 //! Extracted from `draw_frame` in main.rs (Wave 1D refactor).
 
 use crate::app::sessions::session_is_live;
+use crate::app::state::AppState;
 use crate::fire_motion;
 use crate::theme;
-use crate::AppState;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};

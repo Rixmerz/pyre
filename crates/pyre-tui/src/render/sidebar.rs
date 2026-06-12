@@ -1,6 +1,6 @@
+use crate::app::state::AppState;
 use crate::fire_motion;
 use crate::theme;
-use crate::AppState;
 use pyre_proto::PaneStateKind;
 use ratatui::layout::Rect;
 use ratatui::style::Color;

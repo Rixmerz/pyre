@@ -10,11 +10,11 @@ use std::time::{Duration, Instant};
 use crossterm::event::KeyCode;
 use pyre_themes::Registry;
 
+use crate::app::pane_ops::{close_focused_pane, open_new_tab, split_active};
+use crate::app::state::AppState;
+use crate::model::layout::{focus_next, focused_slot_idx};
+use crate::model::prompt::{NamePrompt, PromptKind};
 use crate::render::overlay::picker::ThemePickerState;
-use crate::{
-    close_focused_pane, focus_next, focused_slot_idx, open_new_tab, split_active, AppState,
-    NamePrompt, PromptKind,
-};
 
 /// Outcome of a prefix-key dispatch, returned to the event loop.
 pub(crate) enum PrefixAction {
