@@ -22,8 +22,8 @@ use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::Terminal;
 
 use crate::app::pane_ops::{
-    apply_focus_request, attach_pane, close_pane_by_slot_idx, compute_pane_inner_size,
-    split_active, term_size,
+    apply_focus_request, attach_pane, close_pane_by_slot_idx, close_pane_locally,
+    compute_pane_inner_size, split_active, term_size,
 };
 use crate::app::sessions::SessionView;
 use crate::app::state::{AppState, PendingMenuAction};
@@ -297,11 +297,9 @@ pub(crate) async fn run_tui(
             if frames_received == 0 {
                 tracing::warn!(
                     slot_idx,
-                    "stream closed with 0 frames; skipping close_pane RPC"
+                    "stream closed with 0 frames; closing pane locally (no close_pane RPC)"
                 );
-                if slot_idx < state.slots.len() {
-                    state.slots[slot_idx] = None;
-                }
+                close_pane_locally(&mut state, slot_idx);
             } else {
                 close_pane_by_slot_idx(&mut state, slot_idx);
             }

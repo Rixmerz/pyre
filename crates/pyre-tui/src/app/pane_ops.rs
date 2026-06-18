@@ -373,9 +373,13 @@ fn locate_pane(state: &AppState, target_pane: PaneId) -> Option<(usize, usize)> 
     None
 }
 
-/// Close a pane by its slot index.
-/// Removes the leaf from the layout tree, drops the slot, cascades tab/session removal.
-pub(crate) fn close_pane_by_slot_idx(state: &mut AppState, slot_idx: usize) {
+/// Inner implementation for closing a pane by its slot index.
+///
+/// When `fire_rpc` is `true`, a `close_pane` RPC is dispatched fire-and-forget
+/// so the daemon evicts the pane.  Pass `false` for transient stream failures
+/// (0-frame closes) where the daemon will self-evict on real PTY exit and
+/// firing the RPC could kill a live pane.
+fn close_pane_inner(state: &mut AppState, slot_idx: usize, fire_rpc: bool) {
     let pane_id = match state.slots.get(slot_idx).and_then(|s| s.as_ref()) {
         Some(slot) => slot.pane_id,
         None => return,
@@ -386,8 +390,8 @@ pub(crate) fn close_pane_by_slot_idx(state: &mut AppState, slot_idx: usize) {
         None => return,
     };
 
-    // Fire close_pane RPC fire-and-forget so the daemon evicts the pane.
-    {
+    // Optionally fire close_pane RPC fire-and-forget so the daemon evicts the pane.
+    if fire_rpc {
         let client = state.control.clone();
         tokio::runtime::Handle::current().spawn(async move {
             let _ = client.close_pane(tarpc::context::current(), pane_id).await;
@@ -447,6 +451,22 @@ pub(crate) fn close_pane_by_slot_idx(state: &mut AppState, slot_idx: usize) {
     }
 }
 
+/// Close a pane by its slot index.
+/// Removes the leaf from the layout tree, drops the slot, cascades tab/session removal.
+/// Fires the `close_pane` RPC so the daemon evicts the pane.
+pub(crate) fn close_pane_by_slot_idx(state: &mut AppState, slot_idx: usize) {
+    close_pane_inner(state, slot_idx, true);
+}
+
+/// Close a pane locally without firing the `close_pane` RPC.
+///
+/// Use this for transient stream failures (e.g. 0-frame closes on startup) where
+/// the daemon will self-evict the pane on real PTY exit.  Firing the RPC in that
+/// race could kill a live pane that simply hadn't produced output yet.
+pub(crate) fn close_pane_locally(state: &mut AppState, slot_idx: usize) {
+    close_pane_inner(state, slot_idx, false);
+}
+
 /// Close the focused pane in the active tab.
 pub(crate) fn close_focused_pane(state: &mut AppState) {
     let sess_idx = state.active_session;
@@ -489,7 +509,7 @@ mod tests {
     use crate::render::overlay::search::SearchState;
     use crate::render::pane::TermSize;
 
-    use super::{close_focused_pane, close_pane_by_slot_idx};
+    use super::{close_focused_pane, close_pane_by_slot_idx, close_pane_locally};
 
     // ── Stub daemon ──────────────────────────────────────────────────────────
 
@@ -964,5 +984,106 @@ mod tests {
         let remaining = pane_leaves_in_order(&state.sessions[0].tabs[0].root);
         assert_eq!(remaining, vec![pane_b], "only pane_b must remain");
         assert_eq!(state.sessions[0].tabs[0].focus_pane, pane_b);
+    }
+
+    /// Regression test for the "session ended" overlay on fresh spawn.
+    ///
+    /// When a newly-spawned pane's UDS stream closes with 0 frames (a transient
+    /// race before the first output), `close_pane_locally` must perform the full
+    /// tree-leaf removal + session cleanup — identical to `close_pane_by_slot_idx`
+    /// but without firing the close_pane RPC.
+    ///
+    /// Before the fix, the 0-frame branch only nulled `state.slots[slot_idx]`
+    /// without removing the pane from the layout tree.  On the next tick, the
+    /// session-lost detector found a leaf whose slot was `None`, concluded
+    /// `all_dead = true`, set `state.session_lost = true`, and the overlay
+    /// rendered — even though the session was brand-new.
+    ///
+    /// This test verifies that after `close_pane_locally` the session is fully
+    /// removed (no orphaned leaf), so no spurious `session_lost` can fire.
+    #[tokio::test]
+    async fn close_pane_locally_removes_session_no_orphaned_leaf() {
+        let pane = PaneId::new();
+        let session = SessionId::new();
+        let control = stub_client().await;
+        let (_, blocks_rx) = watch::channel(HashMap::new());
+        let (_, toast_rx) = mpsc::channel(1);
+
+        let reg = pyre_themes::Registry::builtin();
+        let theme = reg
+            .get(pyre_themes::Registry::default_theme())
+            .expect("default theme present")
+            .clone();
+
+        let tab = Tab {
+            root: LayoutNode::Leaf(pane),
+            focus_pane: pane,
+            zoomed: None,
+            boundaries: vec![],
+            drag: None,
+        };
+
+        let mut state = AppState {
+            sessions: vec![SessionView {
+                id: session,
+                name: "auto-spawn".into(),
+                tabs: vec![tab],
+                active_tab: 0,
+            }],
+            active_session: 0,
+            slots: vec![Some(make_slot(pane))],
+            session_lost: false,
+            control,
+            socket: PathBuf::from("/tmp/pyre-test.sock"),
+            shell: None,
+            search: SearchState::default(),
+            status_msg: None,
+            sidebar_open: false,
+            sidebar_data: vec![],
+            sidebar_last_poll: Instant::now() - Duration::from_secs(10),
+            sidebar_cursor: 0,
+            sidebar_focused: false,
+            selection: None,
+            last_click: None,
+            context_menu: None,
+            pid_inspect: None,
+            prompt: None,
+            session_strip_rects: vec![],
+            session_strip_scroll: 0,
+            session_strip_left_arrow: None,
+            session_strip_right_arrow: None,
+            session_plus_rect: None,
+            tab_plus_rect: None,
+            pending_resizes: vec![],
+            tab_chip_rects: vec![],
+            dragging_tab: None,
+            pager_rect: None,
+            session_list_last_poll: Instant::now() - Duration::from_secs(10),
+            layout_resync_last_poll: Instant::now() - Duration::from_secs(10),
+            blocks_rx,
+            anim: AnimClock::new(),
+            pager: None,
+            theme,
+            theme_picker: None,
+            toast_deck: ToastDeck::new(false, 3000, 3),
+            toast_rx,
+            pending_menu_action: None,
+            last_split_at: None,
+            help_open: false,
+        };
+
+        // Precondition: one session, one tab, one leaf, one live slot.
+        assert_eq!(state.sessions.len(), 1, "precondition: one session");
+        assert!(state.slots[0].is_some(), "precondition: slot is live");
+
+        // Simulate the 0-frame close path that previously only nulled the slot.
+        close_pane_locally(&mut state, 0);
+
+        // The session must be fully removed — no orphaned leaf, no spurious
+        // session_lost can fire from the session-lost detector on the next tick.
+        assert!(
+            state.sessions.is_empty(),
+            "session must be removed after close_pane_locally on the last pane"
+        );
     }
 }
