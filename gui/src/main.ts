@@ -20,6 +20,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { daemonStatus, pollEvents, reconnect, onPaneClosed, onPtyClosedLegacy, onPtyOutput } from "./api";
 import { getState, setState } from "./state";
 import { mountShell } from "./render/index";
+import { startPidPoll } from "./render/statusbar";
 import { initThemes } from "./themes";
 import { installKeybinds } from "./keybinds";
 import { initNotifications } from "./notify";
@@ -201,6 +202,7 @@ async function boot(): Promise<void> {
   await closeSplash();
 
   startPolling();
+  startPidPoll();
   window.addEventListener("resize", () => refitAll());
 }
 

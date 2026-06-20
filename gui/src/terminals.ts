@@ -8,6 +8,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { WebLinksAddon } from "@xterm/addon-web-links";
+import { SearchAddon } from "@xterm/addon-search";
 import "@xterm/xterm/css/xterm.css";
 import { resizePane, sendKeys } from "./api";
 import { getState } from "./state";
@@ -27,11 +28,20 @@ const TERM_FONT_STACK =
 interface PaneTerm {
   term: Terminal;
   fit: FitAddon;
+  search: SearchAddon;
   el: HTMLElement;
   session: string;
   /** debounce timer id for resize_pane RPC */
   resizeTimer?: number;
+  /** the find bar DOM (created on demand), parented into the pane body */
+  findBar?: HTMLElement;
 }
+
+/** Highlight styling for in-pane find matches (current vs all). */
+const SEARCH_DECORATIONS = {
+  matchOverviewRuler: "#e8743b",
+  activeMatchColorOverviewRuler: "#ff9152",
+} as const;
 
 const terms = new Map<string, PaneTerm>();
 
@@ -170,6 +180,12 @@ export function mountPaneTerminal(
   const fit = new FitAddon();
   term.loadAddon(fit);
 
+  // In-pane find (Ctrl+F). The decorations API needs an open terminal, which is
+  // why the addon is loaded after construction but before term.open below works
+  // either way — xterm tolerates load-then-open.
+  const search = new SearchAddon();
+  term.loadAddon(search);
+
   // Unicode 11 width tables: fixes wide-char / emoji / CJK column width so the
   // cursor stays aligned with what the shell thinks it printed (the desync that
   // made powerline separators and emoji shove the cursor off by a cell).
@@ -188,7 +204,7 @@ export function mountPaneTerminal(
   // working by only acting on the Shift-modified chords.
   term.attachCustomKeyEventHandler((e) => keyHandler(e, term, pane));
 
-  entry = { term, fit, el, session };
+  entry = { term, fit, search, el, session };
   terms.set(pane, entry);
 
   // Webview → daemon: forward keystrokes as UTF-8 bytes, tagged with this pane.
@@ -254,9 +270,136 @@ export function disposePaneTerminal(pane: string): void {
   const entry = terms.get(pane);
   if (!entry) return;
   if (entry.resizeTimer) window.clearTimeout(entry.resizeTimer);
+  entry.findBar?.remove();
+  entry.search.dispose();
   entry.term.dispose();
   terms.delete(pane);
 }
+
+// ── In-pane find ──────────────────────────────────────────────────────────────
+
+/**
+ * Open (or re-focus) the find bar over a pane's terminal. The bar is a small
+ * DOM overlay parented into the pane card's header area, with an input plus
+ * prev/next/close controls. Search runs through xterm's SearchAddon so matches
+ * are highlighted natively in the buffer.
+ */
+export function openFindBar(pane: string): void {
+  const entry = terms.get(pane);
+  if (!entry) {
+    console.warn("[pyre-find] no terminal for pane", pane);
+    return;
+  }
+  // Mount inside the pane card so it overlays the right terminal, even in splits.
+  const card = entry.el.closest<HTMLElement>(".pane-card") ?? entry.el;
+  if (entry.findBar && entry.findBar.isConnected) {
+    const input = entry.findBar.querySelector<HTMLInputElement>(".find-input");
+    input?.focus();
+    input?.select();
+    return;
+  }
+
+  const input = document.createElement("input");
+  input.className = "find-input";
+  input.type = "text";
+  input.placeholder = "Find in pane…";
+  input.spellcheck = false;
+
+  const count = document.createElement("span");
+  count.className = "find-count";
+
+  const runFind = (forward: boolean): void => {
+    const q = input.value;
+    if (!q) {
+      entry.search.clearDecorations();
+      count.textContent = "";
+      return;
+    }
+    const opts = {
+      decorations: SEARCH_DECORATIONS,
+      caseSensitive: false,
+    };
+    if (forward) entry.search.findNext(q, opts);
+    else entry.search.findPrevious(q, opts);
+  };
+
+  // Live result count via the addon's results callback (only fires when
+  // decorations are enabled, which all our searches do).
+  entry.search.onDidChangeResults((res) => {
+    if (res.resultCount === 0) {
+      count.textContent = input.value ? "0/0" : "";
+    } else if (res.resultIndex < 0) {
+      // -1 = match threshold exceeded; show the total only.
+      count.textContent = `${res.resultCount}+`;
+    } else {
+      // resultIndex is 0-based; show 1-based for humans.
+      count.textContent = `${res.resultIndex + 1}/${res.resultCount}`;
+    }
+  });
+
+  input.addEventListener("input", () => runFind(true));
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      runFind(!e.shiftKey);
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      closeFindBar(pane);
+    }
+    // Stop the global capture-phase handler from claiming these keys.
+    e.stopPropagation();
+  });
+
+  const btn = (title: string, glyph: string, onClick: () => void): HTMLButtonElement => {
+    const b = document.createElement("button");
+    b.className = "find-btn";
+    b.title = title;
+    b.setAttribute("aria-label", title);
+    b.innerHTML = glyph;
+    b.addEventListener("click", onClick);
+    return b;
+  };
+
+  const bar = document.createElement("div");
+  bar.className = "find-bar";
+  bar.append(
+    input,
+    count,
+    btn("Previous (Shift+Enter)", CHEVRON_UP, () => runFind(false)),
+    btn("Next (Enter)", CHEVRON_DOWN, () => runFind(true)),
+    btn("Close (Esc)", CROSS, () => closeFindBar(pane)),
+  );
+  // Stop clicks inside the bar from bubbling to the pane (which would refocus
+  // the terminal and steal focus from the input).
+  bar.addEventListener("mousedown", (e) => e.stopPropagation());
+
+  card.appendChild(bar);
+  entry.findBar = bar;
+  requestAnimationFrame(() => {
+    input.focus();
+    input.select();
+  });
+}
+
+/** Close a pane's find bar and clear its match decorations. */
+export function closeFindBar(pane: string): void {
+  const entry = terms.get(pane);
+  if (!entry) return;
+  entry.search.clearDecorations();
+  entry.findBar?.remove();
+  entry.findBar = undefined;
+  // Return focus to the terminal so typing resumes immediately.
+  focusPaneTerminal(pane);
+}
+
+// Minimal inline glyphs for the find bar (avoids importing the render layer into
+// the terminal manager — keeps the dependency arrow one-directional).
+const CHEVRON_UP =
+  `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 10 L8 6 L12 10"/></svg>`;
+const CHEVRON_DOWN =
+  `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6 L8 10 L12 6"/></svg>`;
+const CROSS =
+  `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4l8 8M12 4l-8 8"/></svg>`;
 
 /** Focus a pane's terminal (so keystrokes route there). */
 export function focusPaneTerminal(pane: string): void {

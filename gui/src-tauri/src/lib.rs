@@ -166,6 +166,16 @@ pub struct PaneStateDto {
     pub session: String,
     pub state: String,
     pub title: Option<String>,
+    pub agent: String,
+}
+
+#[derive(Serialize)]
+pub struct PidInspectDto {
+    pub pid: u32,
+    pub comm: String,
+    pub env: Vec<(String, String)>,
+    pub fds: Vec<String>,
+    pub children: Vec<u32>,
 }
 
 #[derive(Serialize, Clone)]
@@ -486,8 +496,35 @@ async fn pane_states(state: State<'_, AppState>) -> Result<Vec<PaneStateDto>, St
             session: p.session.0.to_string(),
             state: pane_state_label(&p.state).to_string(),
             title: p.name.clone(),
+            agent: p.agent.label().to_string(),
         })
         .collect())
+}
+
+/// Return process metadata for the foreground PID of a pane (Linux-only).
+///
+/// Maps the daemon's `PidInspect` directly to a serializable DTO. Returns a
+/// clean `Err(String)` on any transport or daemon failure — the frontend should
+/// treat this as "metadata unavailable" and fall back gracefully.
+#[tauri::command]
+async fn inspect_pid(state: State<'_, AppState>, pane: String) -> Result<PidInspectDto, String> {
+    let pid = parse_pane(&pane)?;
+    let client = {
+        let mut guard = state.inner.lock().await;
+        ensure_client(&mut guard).await?
+    };
+    let info = client
+        .inspect_pid(tarpc::context::current(), pid)
+        .await
+        .map_err(|e| format!("inspect_pid transport error: {e}"))?
+        .map_err(|e| format!("inspect_pid daemon error: {e}"))?;
+    Ok(PidInspectDto {
+        pid: info.pid,
+        comm: info.comm,
+        env: info.env,
+        fds: info.fds,
+        children: info.children,
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1025,6 +1062,7 @@ pub fn run() {
             close_pane,
             resize_pane,
             pane_states,
+            inspect_pid,
             // layout
             session_layout,
             open_split,

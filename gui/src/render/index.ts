@@ -9,7 +9,8 @@ import { renderBlocks } from "./blocks";
 import { renderStatusbar } from "./statusbar";
 import { renderPalette, resetPalette, handlePaletteKey } from "./palette";
 import { renderThemePicker } from "./themepicker";
-import { openPalette, closePalette, unzoom } from "../actions";
+import { renderAgents } from "./agents";
+import { openPalette, closePalette, unzoom, closeAgents } from "../actions";
 
 interface Regions {
   topbar: HTMLElement;
@@ -19,6 +20,7 @@ interface Regions {
   statusbar: HTMLElement;
   palette: HTMLElement;
   themepicker: HTMLElement;
+  agents: HTMLElement;
   shell: HTMLElement;
 }
 
@@ -36,13 +38,14 @@ export function mountShell(app: HTMLElement): void {
   const statusbar = el("footer", "statusbar");
   const palette = el("div", "palette-layer");
   const themepicker = el("div", "themepicker-layer");
+  const agents = el("div", "agents-layer");
 
   const shell = el("div", "shell");
   shell.append(rail, center, right);
 
-  app.append(topbar, shell, statusbar, palette, themepicker);
+  app.append(topbar, shell, statusbar, palette, themepicker, agents);
 
-  regions = { topbar, rail, center, right, statusbar, palette, themepicker, shell };
+  regions = { topbar, rail, center, right, statusbar, palette, themepicker, agents, shell };
 
   wireGlobalKeys();
   subscribe(renderAll);
@@ -64,6 +67,7 @@ export function renderAll(): void {
   lastPaletteOpen = s.paletteOpen;
   renderPalette(regions.palette);
   renderThemePicker(regions.themepicker);
+  renderAgents(regions.agents);
 
   // Reflect chrome collapse on the shell grid.
   regions.shell.classList.toggle("rail-collapsed", s.railCollapsed);
@@ -85,7 +89,10 @@ function wireGlobalKeys(): void {
       return;
     }
     if (e.key === "Escape") {
-      if (s.themePickerOpen) {
+      if (s.agentsOpen) {
+        e.preventDefault();
+        closeAgents();
+      } else if (s.themePickerOpen) {
         e.preventDefault();
         import("../actions").then((m) => m.closeThemePicker());
       } else if (s.zoomedPane) {

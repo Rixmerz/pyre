@@ -30,6 +30,11 @@ export interface AppState {
   // Block panel search
   blockQuery: string;
   searchResults: Block[] | null; // null = not searching, show live blocks
+  blocksFailuresOnly: boolean; // panel filter: only show non-zero-exit blocks
+  expandedBlocks: Set<string>; // block ids whose output preview is expanded
+
+  // Agent overview overlay
+  agentsOpen: boolean;
 
   // Theme
   themes: ThemeMeta[];
@@ -55,6 +60,9 @@ const state: AppState = {
   blocksLoading: false,
   blockQuery: "",
   searchResults: null,
+  blocksFailuresOnly: false,
+  expandedBlocks: new Set(),
+  agentsOpen: false,
   themes: [],
   activeTheme: "ember",
   railCollapsed: false,

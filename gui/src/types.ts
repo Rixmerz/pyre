@@ -27,6 +27,31 @@ export interface PaneStateInfo {
   session: string;
   state: PaneState;
   title: string | null;
+  /**
+   * Detected agent kind for this pane — e.g. "shell", "claude", "unknown".
+   * Added by a parallel Rust agent; wired DEFENSIVELY: missing/undefined means
+   * the daemon predates the field, so the UI degrades to "unknown" rather than
+   * crashing. Never assume a specific set of values.
+   */
+  agent?: string | null;
+}
+
+/**
+ * Result of `inspect_pid(pane)` — process-tree metadata for the focused pane.
+ * Mirrors the Rust `PidInspectDto` EXACTLY: the daemon only exposes process-tree
+ * metadata (no CPU% / memory sampling). Wired DEFENSIVELY — the status bar
+ * degrades to omitting the line if the command rejects or the pane is gone.
+ */
+export interface PidInfo {
+  pid: number;
+  /** process name (argv[0] basename), e.g. "bash", "claude". */
+  comm: string;
+  /** environment as [key, value] pairs. */
+  env: [string, string][];
+  /** open file descriptors (string targets). */
+  fds: string[];
+  /** child PIDs of the foreground process. */
+  children: number[];
 }
 
 /** Session metadata from `list_sessions()`. */

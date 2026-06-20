@@ -9,6 +9,7 @@ import {
   openSplit,
   renameSession,
   searchBlocks,
+  sendKeys,
   spawnSession,
 } from "./api";
 import { getState, setState } from "./state";
@@ -233,6 +234,57 @@ export async function runBlockSearch(query: string): Promise<void> {
   }
 }
 
+/** Toggle the panel's "failures only" filter (non-zero exit codes). */
+export function toggleFailuresOnly(): void {
+  setState({ blocksFailuresOnly: !getState().blocksFailuresOnly });
+}
+
+/** Expand or collapse a single block's output preview. */
+export function toggleBlockExpanded(blockId: string): void {
+  const next = new Set(getState().expandedBlocks);
+  if (next.has(blockId)) next.delete(blockId);
+  else next.add(blockId);
+  setState({ expandedBlocks: next });
+}
+
+/**
+ * Rerun a block's command by sending it (plus Enter) to the block's pane. If the
+ * pane is the focused one its terminal regains focus so the user sees it run.
+ */
+export function rerunBlock(pane: string, command: string): void {
+  const bytes = Array.from(new TextEncoder().encode(command + "\n"));
+  void sendKeys(pane, bytes).catch((e) =>
+    console.error("rerun send_keys failed:", e),
+  );
+  if (getState().focusedPane === pane) focusPaneTerminal(pane);
+}
+
+// ── Agent overview overlay ────────────────────────────────────────────────────
+
+export function openAgents(): void {
+  setState({ agentsOpen: true });
+}
+
+export function closeAgents(): void {
+  setState({ agentsOpen: false });
+}
+
+export function toggleAgents(): void {
+  setState({ agentsOpen: !getState().agentsOpen });
+}
+
+/**
+ * Jump to a pane anywhere across all sessions: switch to its session (if needed)
+ * and focus it. Used by the agent overview rows.
+ */
+export async function gotoPane(session: string, pane: string): Promise<void> {
+  setState({ agentsOpen: false });
+  if (getState().activeSession !== session) {
+    await switchSession(session);
+  }
+  focusPane(pane);
+}
+
 // ── Chrome toggles ──────────────────────────────────────────────────────────
 
 export function toggleRail(): void {
@@ -323,6 +375,20 @@ export function buildCommands(): Command[] {
       title: s.rightCollapsed ? "Show blocks panel" : "Hide blocks panel",
       hint: "view",
       run: toggleRightPanel,
+    },
+    {
+      id: "toggle-failures",
+      title: s.blocksFailuresOnly
+        ? "Show all blocks"
+        : "Show failed blocks only",
+      hint: "blocks",
+      run: toggleFailuresOnly,
+    },
+    {
+      id: "agent-overview",
+      title: "Agent overview",
+      hint: "Ctrl+Shift+A",
+      run: openAgents,
     },
   ];
 

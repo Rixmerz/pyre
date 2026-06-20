@@ -136,6 +136,7 @@ function paneStatesEqual(
     if (!infoB) return false;
     if (infoA.state !== infoB.state) return false;
     if (infoA.title !== infoB.title) return false;
+    if ((infoA.agent ?? null) !== (infoB.agent ?? null)) return false;
   }
   return true;
 }
@@ -172,6 +173,15 @@ function applyHeatInPlace(map: Map<string, PaneStateInfo>): void {
     const titleEl = card.querySelector<HTMLElement>(".pane-title");
     if (titleEl) titleEl.textContent = info.title || "pane";
 
+    // Update the per-pane agent chip in place (text + tint class).
+    const chip = card.querySelector<HTMLElement>(".pane-agent-chip");
+    if (chip) {
+      const agent = (info.agent ?? "").trim() || "unknown";
+      chip.textContent = agent;
+      chip.title = `agent: ${agent}`;
+      chip.className = `agent-chip pane-agent-chip agent-${agentChipKind(agent)}`;
+    }
+
     console.log("[pyre-render] heat-in-place pane", pane, info.state);
   }
 }
@@ -186,6 +196,14 @@ function heatVarForState(state: string): string {
     case "done": return "var(--heat-done)";
     default: return "var(--heat-idle)";
   }
+}
+
+/** Agent chip-kind class (mirrors agents.ts chipKind to avoid circular import). */
+function agentChipKind(agent: string): string {
+  const a = agent.toLowerCase();
+  if (a === "claude") return "claude";
+  if (a === "shell") return "shell";
+  return "unknown";
 }
 
 /** Human-readable label (mirrors heat.ts to avoid circular import). */
@@ -347,6 +365,7 @@ export async function applyLifecycleEvent(ev: LifecycleEvent): Promise<void> {
           session,
           state: nextState,
           title: prev?.title ?? null,
+          agent: prev?.agent ?? null,
         };
         map.set(ev.pane, next);
         applyHeatInPlace(map);

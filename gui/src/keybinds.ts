@@ -24,11 +24,12 @@ import {
   splitDown,
   splitRight,
   switchSession,
+  toggleAgents,
   toggleRightPanel,
   zoomPane,
 } from "./actions";
 import { leafPanes } from "./session-ops";
-import { focusPaneTerminal } from "./terminals";
+import { focusPaneTerminal, openFindBar } from "./terminals";
 
 type Dir = "left" | "down" | "up" | "right";
 
@@ -68,12 +69,14 @@ export const KEYBIND_GROUPS: KeyGroup[] = [
       { keys: "Ctrl + Tab", desc: "Next session" },
       { keys: "Ctrl + Shift + Tab", desc: "Previous session" },
       { keys: "Ctrl + Shift + N", desc: "New session" },
+      { keys: "Ctrl + Shift + A", desc: "Agent overview" },
     ],
   },
   {
     title: "Search & palette",
     rows: [
       { keys: "Ctrl / ⌘ + K", desc: "Command palette" },
+      { keys: "Ctrl + F", desc: "Find in pane" },
       { keys: "Ctrl + Shift + F", desc: "Search blocks" },
       { keys: "? · F1", desc: "Toggle this cheatsheet" },
       { keys: "Esc", desc: "Close overlay / unzoom" },
@@ -111,8 +114,33 @@ function onKeyDown(e: KeyboardEvent): void {
   // The palette owns its own keyspace while open — don't fight it.
   if (getState().paletteOpen) return;
 
+  // The agent overview owns Esc (handled in render/index.ts); while it's open we
+  // still allow Ctrl+Shift+A to toggle it closed below, but block other binds.
+  const agentsOpen = getState().agentsOpen;
+
   const ctrl = e.ctrlKey && !e.metaKey && !e.altKey;
   if (!ctrl) return;
+
+  // ── In-pane find: Ctrl+F (no Shift) ─────────────────────────────────────
+  // Opens a find bar over the FOCUSED pane's terminal. Distinct from
+  // Ctrl+Shift+F (block search). Guard against the agents overlay.
+  if (e.key.toLowerCase() === "f" && !e.shiftKey && !agentsOpen) {
+    const pane = getState().focusedPane;
+    if (pane) {
+      e.preventDefault();
+      openFindBar(pane);
+      return;
+    }
+  }
+
+  if (agentsOpen) {
+    // Only the toggle (Ctrl+Shift+A) is honoured while the overview is open.
+    if (e.shiftKey && e.key.toLowerCase() === "a") {
+      e.preventDefault();
+      toggleAgents();
+    }
+    return;
+  }
 
   // ── Session cycling: Ctrl+Tab / Ctrl+Shift+Tab ──────────────────────────
   if (e.key === "Tab") {
@@ -147,6 +175,10 @@ function onKeyDown(e: KeyboardEvent): void {
       case "f":
         e.preventDefault();
         openBlockSearch();
+        return;
+      case "a":
+        e.preventDefault();
+        toggleAgents();
         return;
       default:
         return; // unbound Ctrl+Shift combo — let it pass

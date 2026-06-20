@@ -11,6 +11,7 @@ import type {
   LayoutNode,
   PaneClosedPayload,
   PaneStateInfo,
+  PidInfo,
   PollEventsResult,
   PtyOutputPayload,
   SessionInfo,
@@ -64,6 +65,16 @@ export const openSplit = (
 
 export const setWeight = (pane: string, weight: number): Promise<void> =>
   invoke("set_weight", { pane, weight });
+
+// ── Process inspection ──────────────────────────────────────────────────────
+/**
+ * Inspect the OS process backing a pane. A parallel Rust agent implements the
+ * `inspect_pid` command; callers wire it DEFENSIVELY — if the command is missing
+ * or the pane is gone the promise rejects, and the status bar simply omits the
+ * process line rather than erroring.
+ */
+export const inspectPid = (pane: string): Promise<PidInfo> =>
+  invoke("inspect_pid", { pane });
 
 // ── Pane streams ────────────────────────────────────────────────────────────
 export const attachPaneStream = (

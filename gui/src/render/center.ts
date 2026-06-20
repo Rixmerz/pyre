@@ -28,8 +28,15 @@ import {
   splitRight,
   zoomPane,
 } from "../actions";
-import { mountPaneTerminal } from "../terminals";
+import { mountPaneTerminal, refitAll } from "../terminals";
+import { setWeight } from "../api";
+import { chipKind } from "./agents";
 import type { LayoutNode, PaneState } from "../types";
+
+/** First leaf pane id under a node — the representative weight target. */
+function firstLeaf(node: LayoutNode): string {
+  return node.kind === "leaf" ? node.pane : firstLeaf(node.children[0]!);
+}
 
 /** Canonical string of all leaf pane ids in render order + structural metadata. */
 function layoutFingerprint(
@@ -109,9 +116,12 @@ function renderNode(node: LayoutNode): HTMLElement {
   //   dir "h" = HSplit = top-to-bottom stack   → flex-direction: column (.split-v)
   // (Rust names the split by its AXIS; CSS names it by child arrangement —
   // same letters, opposite meaning. Map explicitly to avoid the inversion.)
+  const horizontal = node.dir === "v"; // row layout → vertical divider drags width
   const el = h("div", {
-    class: "split " + (node.dir === "v" ? "split-h" : "split-v"),
+    class: "split " + (horizontal ? "split-h" : "split-v"),
   });
+
+  const wraps: HTMLElement[] = [];
   node.children.forEach((child, i) => {
     const wrap = h("div", { class: "split-child" });
     const w = node.weights?.[i] ?? 50;
@@ -123,9 +133,105 @@ function renderNode(node: LayoutNode): HTMLElement {
     wrap.style.minWidth = "0";
     wrap.style.minHeight = "0";
     wrap.appendChild(renderNode(child));
+    wraps.push(wrap);
+
+    // Insert a draggable divider BEFORE every child except the first, splitting
+    // the boundary between child i-1 and child i.
+    if (i > 0) {
+      el.appendChild(
+        divider(node, i - 1, i, wraps[i - 1]!, wrap, horizontal),
+      );
+    }
     el.appendChild(wrap);
   });
   return el;
+}
+
+/**
+ * A draggable boundary between two sibling split children. Dragging recomputes
+ * the two children's weights from their live on-screen pixel sizes, updates the
+ * flex-grow inline style immediately (so the resize tracks the cursor), and
+ * commits the new weights to the daemon via set_weight on each represented leaf.
+ */
+function divider(
+  node: LayoutNode & { kind: "split" },
+  leftIdx: number,
+  rightIdx: number,
+  leftWrap: HTMLElement,
+  rightWrap: HTMLElement,
+  horizontal: boolean,
+): HTMLElement {
+  const handle = h("div", {
+    class: "split-divider " + (horizontal ? "vert" : "horiz"),
+    role: "separator",
+    "aria-orientation": horizontal ? "vertical" : "horizontal",
+    title: "Drag to resize",
+  });
+
+  handle.addEventListener("mousedown", (e: MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+
+    const lr = leftWrap.getBoundingClientRect();
+    const rr = rightWrap.getBoundingClientRect();
+    const startPos = horizontal ? e.clientX : e.clientY;
+    const leftSize = horizontal ? lr.width : lr.height;
+    const rightSize = horizontal ? rr.width : rr.height;
+    const totalSize = leftSize + rightSize;
+    // Preserve the SUM of the two weights so siblings outside this pair are
+    // unaffected; only the ratio between this pair changes.
+    const leftW0 = node.children[leftIdx] && node.weights?.[leftIdx] != null
+      ? node.weights[leftIdx]!
+      : 50;
+    const rightW0 = node.children[rightIdx] && node.weights?.[rightIdx] != null
+      ? node.weights[rightIdx]!
+      : 50;
+    const weightSum = leftW0 + rightW0;
+
+    const MIN_PX = 60; // don't let a pane collapse below this
+    let lastLeftW = leftW0;
+    let lastRightW = rightW0;
+
+    document.body.classList.add(horizontal ? "resizing-col" : "resizing-row");
+
+    const onMove = (me: MouseEvent): void => {
+      const delta = (horizontal ? me.clientX : me.clientY) - startPos;
+      let newLeft = leftSize + delta;
+      newLeft = Math.max(MIN_PX, Math.min(totalSize - MIN_PX, newLeft));
+      const ratio = newLeft / totalSize;
+      lastLeftW = weightSum * ratio;
+      lastRightW = weightSum - lastLeftW;
+      leftWrap.style.flex = `${lastLeftW} 1 0%`;
+      rightWrap.style.flex = `${lastRightW} 1 0%`;
+    };
+
+    const onUp = (): void => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      document.body.classList.remove("resizing-col", "resizing-row");
+      // Commit the final weights to the daemon. Mutate the cached node so the
+      // next structural render keeps the new sizes, and refit terminals to the
+      // new geometry.
+      if (node.weights) {
+        node.weights[leftIdx] = lastLeftW;
+        node.weights[rightIdx] = lastRightW;
+      }
+      const leftPane = firstLeaf(node.children[leftIdx]!);
+      const rightPane = firstLeaf(node.children[rightIdx]!);
+      void setWeight(leftPane, Math.round(lastLeftW)).catch((err) =>
+        console.error("set_weight failed:", leftPane, err),
+      );
+      void setWeight(rightPane, Math.round(lastRightW)).catch((err) =>
+        console.error("set_weight failed:", rightPane, err),
+      );
+      refitAll();
+    };
+
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  });
+
+  return handle;
 }
 
 function renderLeaf(pane: string): HTMLElement {
@@ -157,11 +263,18 @@ function renderLeaf(pane: string): HTMLElement {
   dot.style.setProperty("--dot-heat", heatVar(state));
 
   const title = info?.title || "pane";
+  const agent = (info?.agent ?? "").trim() || "unknown";
   const header = h(
     "div",
     { class: "pane-header" },
     dot,
     h("span", { class: "pane-title" }, title),
+    // Per-pane agent chip — subtly tinted by kind (claude / shell / unknown).
+    h(
+      "span",
+      { class: `agent-chip pane-agent-chip agent-${chipKind(agent)}`, title: `agent: ${agent}` },
+      agent,
+    ),
     h("span", { class: "pane-state-label" }, stateLabel(state)),
     h(
       "div",

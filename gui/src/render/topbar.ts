@@ -11,7 +11,9 @@ import {
   openPalette,
   openThemePicker,
   promptRenameSession,
+  toggleAgents,
 } from "../actions";
+import { fleetWaitingCount } from "./agents";
 import { toggleLightDark } from "../themes";
 
 export function renderTopbar(root: HTMLElement): void {
@@ -46,9 +48,26 @@ export function renderTopbar(root: HTMLElement): void {
     paneChip,
   );
 
+  const waiting = fleetWaitingCount();
+  const agentsBtn = h(
+    "button",
+    {
+      class: "icon-btn agents-btn" + (waiting > 0 ? " has-waiting" : ""),
+      title:
+        waiting > 0
+          ? `Agents — ${waiting} pane${waiting === 1 ? "" : "s"} need input  (Ctrl+Shift+A)`
+          : "Agent overview  (Ctrl+Shift+A)",
+      "aria-label": "Agent overview",
+      onclick: () => toggleAgents(),
+    },
+    h("span", { html: icon("agents") }),
+    waiting > 0 && h("span", { class: "agents-btn-badge" }, String(waiting)),
+  );
+
   const right = h(
     "div",
     { class: "topbar-right" },
+    agentsBtn,
     h(
       "button",
       {
