@@ -1,0 +1,932 @@
+/* pyre GUI — "the hearth". A fire-named, agent-aware terminal where agent state
+   is rendered as HEAT. Tokens below are the single source of truth; the theme
+   system overrides the chrome vars at runtime but NEVER the --heat-* ramp. */
+
+:root {
+  /* Surfaces */
+  --surface-0: #0b0c0e;
+  --surface-1: #131419;
+  --surface-2: #1a1c22;
+  --term-bg: #0a0b0e;
+
+  /* Lines */
+  --border: #23252d;
+  --hairline: #2c2f39;
+  --focus: #e8743b;
+
+  /* Text */
+  --fg: #ecedee;
+  --fg-muted: #969ca6;
+  --fg-faint: #5d626c;
+
+  /* Ember family (chrome accent — themeable) */
+  --ember: #e8743b;
+  --ember-bright: #ff9152;
+  --ember-deep: #b8501f;
+
+  /* HEAT RAMP — bound to pane agent state; INVARIANT across themes. */
+  --heat-idle: #6b7280;
+  --heat-running: #e8743b;
+  --heat-waiting: #f5b042;
+  --heat-interactive: #7aa2f7;
+  --heat-crashed: #ff5630;
+  --heat-done: #3fb950;
+
+  /* Status semantics */
+  --ok: #3fb950;
+  --warn: #f5b042;
+  --error: #ff5630;
+
+  /* Type */
+  --font-ui: "Geist", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+
+  /* Geometry */
+  --topbar-h: 40px;
+  --status-h: 28px;
+  --rail-w: 200px;
+  --rail-w-collapsed: 52px;
+  --right-w: 320px;
+  --radius: 8px;
+  --radius-sm: 6px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--surface-0);
+  color: var(--fg);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+button {
+  font-family: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
+/* Visible keyboard focus rings everywhere. */
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+  border-radius: 4px;
+}
+
+.section-label {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--fg-muted);
+}
+
+/* ── App grid ─────────────────────────────────────────────────────────── */
+#app {
+  display: grid;
+  grid-template-rows: var(--topbar-h) 1fr var(--status-h);
+  height: 100vh;
+}
+
+.shell {
+  display: grid;
+  /* minmax(0,1fr) — NOT 1fr (== minmax(auto,1fr)): a default `auto` min lets
+     the center track grow to its content and refuse to shrink, which (with the
+     terminal having no intrinsic height) collapses the flex chain below. */
+  grid-template-columns: var(--rail-w) minmax(0, 1fr) var(--right-w);
+  min-height: 0;
+  overflow: hidden;
+}
+.shell.rail-collapsed {
+  grid-template-columns: var(--rail-w-collapsed) minmax(0, 1fr) var(--right-w);
+}
+.shell.right-collapsed {
+  grid-template-columns: var(--rail-w) minmax(0, 1fr) 0;
+}
+.shell.rail-collapsed.right-collapsed {
+  grid-template-columns: var(--rail-w-collapsed) minmax(0, 1fr) 0;
+}
+
+/* ── Topbar ───────────────────────────────────────────────────────────── */
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 0 12px;
+  background: var(--surface-1);
+  border-bottom: 1px solid var(--border);
+}
+.wordmark {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.ember-mark {
+  display: inline-flex;
+  color: var(--ember);
+  filter: drop-shadow(0 0 6px rgba(232, 116, 59, 0.5));
+}
+.wordmark-text {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: 15px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--fg);
+}
+.session-switcher {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 9px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+}
+.session-switcher:hover {
+  border-color: var(--hairline);
+}
+.session-name {
+  font-size: 12.5px;
+  color: var(--fg);
+}
+.switcher-chevron {
+  display: inline-flex;
+  color: var(--fg-muted);
+}
+.chip {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--surface-1);
+  color: var(--fg-muted);
+  border: 1px solid var(--border);
+}
+.topbar-right {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  border-radius: var(--radius-sm);
+  color: var(--fg-muted);
+}
+.icon-btn:hover {
+  background: var(--surface-2);
+  color: var(--fg);
+}
+.palette-btn .kbd,
+.kbd {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--fg-faint);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 4px;
+  line-height: 1.5;
+}
+.kbd-icon {
+  display: inline-flex;
+  align-items: center;
+}
+.kbd-icon svg {
+  width: 11px;
+  height: 11px;
+}
+
+/* ── Left rail ────────────────────────────────────────────────────────── */
+.rail {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--surface-1);
+  border-right: 1px solid var(--border);
+  padding: 10px 8px;
+  gap: 8px;
+}
+.rail-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 4px;
+  min-height: 22px;
+}
+.rail.collapsed .rail-header {
+  justify-content: center;
+}
+.rail-toggle {
+  color: var(--fg-faint);
+  padding: 3px;
+}
+.rail-toggle:hover {
+  color: var(--fg);
+}
+.rail-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  overflow-y: auto;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+.rail-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 8px;
+  border-radius: var(--radius-sm);
+  text-align: left;
+  border: 1px solid transparent;
+}
+.rail.collapsed .rail-row {
+  justify-content: center;
+  padding: 7px 0;
+}
+.rail-row:hover {
+  background: var(--surface-2);
+}
+.rail-row.active {
+  background: var(--surface-2);
+  border-color: var(--hairline);
+}
+.rail-row.active .rail-session-name {
+  color: var(--fg);
+}
+.rail-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.rail-session-name {
+  font-size: 12.5px;
+  color: var(--fg-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 1 1 auto;
+}
+.rail-pane-count {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--fg-faint);
+}
+.rail-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  border-radius: var(--radius-sm);
+  color: var(--fg-faint);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s ease, color 0.12s ease, background 0.12s ease;
+}
+.rail-row:hover .rail-close,
+.rail-row.active .rail-close {
+  opacity: 1;
+}
+.rail-close:hover {
+  color: var(--error, #e5484d);
+  background: var(--surface-3, var(--surface-2));
+}
+.rail-close-icon {
+  display: inline-flex;
+}
+.rail-empty,
+.theme-empty {
+  color: var(--fg-faint);
+  font-size: 12px;
+  padding: 8px 6px;
+}
+.rail-new {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+  border-radius: var(--radius-sm);
+  border: 1px dashed var(--border);
+  color: var(--fg-muted);
+  justify-content: center;
+}
+.rail-new:hover {
+  border-color: var(--ember);
+  color: var(--ember);
+}
+.rail-new-icon {
+  display: inline-flex;
+}
+
+/* Heat dots (rail + headers). Color comes from --dot-heat (set in JS). */
+.heat-dot,
+.pane-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--dot-heat, var(--heat-idle));
+  box-shadow: 0 0 7px color-mix(in srgb, var(--dot-heat, #888) 70%, transparent);
+  flex: 0 0 auto;
+  display: inline-block;
+}
+
+/* ── Center / split panes ─────────────────────────────────────────────── */
+.center {
+  min-width: 0;
+  min-height: 0;
+  /* The center is a grid item in the `1fr` shell row; align-stretch gives it
+     the row height. height:100% pins that height explicitly so the flex chain
+     below always has a concrete box to divide, even before layout settles. */
+  height: 100%;
+  padding: 10px;
+  background: var(--surface-0);
+  display: flex;
+  overflow: hidden;
+}
+/* The split tree must fill the whole center, not just its content height. */
+.center > .split,
+.center > .pane-card {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+}
+.split {
+  display: flex;
+  /* flex-basis 0 (not auto): a nested split must divide the parent's box, never
+     grow from its own content. With `auto` an inner split sizes to content and
+     collapses siblings down the recursion. */
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+  gap: 8px;
+}
+.split-h {
+  flex-direction: row;
+}
+.split-v {
+  flex-direction: column;
+}
+.split-child {
+  display: flex;
+  /* Fallback flex if the per-weight inline `flex` (set in center.ts) is absent.
+     min-width/min-height:0 are the load-bearing bit — without them a flex child
+     refuses to shrink below content and collapses its siblings to 0. */
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* Pane card */
+.pane-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  transition: box-shadow 0.15s ease, border-color 0.15s ease;
+}
+.pane-card.focused {
+  border-color: var(--hairline);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--heat) 50%, transparent),
+    0 0 22px color-mix(in srgb, var(--heat) 28%, transparent);
+}
+/* The signature: 2px heat edge along the top. */
+.heat-edge {
+  height: 2px;
+  flex: 0 0 auto;
+  background: var(--heat, var(--heat-idle));
+}
+.pane-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px 6px 10px;
+  background: var(--surface-1);
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+.pane-title {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pane-state-label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--fg-faint);
+}
+.pane-toolbar {
+  margin-left: auto;
+  display: inline-flex;
+  gap: 2px;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.pane-card:hover .pane-toolbar,
+.pane-card.focused .pane-toolbar {
+  opacity: 1;
+}
+.pane-tool {
+  display: inline-flex;
+  padding: 4px;
+  border-radius: 5px;
+  color: var(--fg-muted);
+}
+.pane-tool:hover {
+  background: var(--surface-2);
+  color: var(--fg);
+}
+.pane-body {
+  /* The terminal mount target. flex:1 1 0 so it takes ALL remaining card height
+     after the fixed-height header + heat-edge, instead of being squeezed to its
+     (zero) content height. position:relative gives xterm's absolutely-positioned
+     .xterm-screen a sized containing block so FitAddon measures real cols/rows. */
+  position: relative;
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+  background: var(--term-bg);
+  padding: 4px 6px;
+  overflow: hidden;
+}
+
+.center-empty {
+  margin: auto;
+  text-align: center;
+  color: var(--fg-muted);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+}
+.daemon-down .down-mark {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--error);
+}
+.down-title {
+  color: var(--fg);
+  font-size: 14px;
+  margin: 0;
+}
+.down-sub {
+  margin: 0;
+  color: var(--fg-muted);
+}
+.btn {
+  padding: 7px 14px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--fg);
+  font-size: 12.5px;
+}
+.btn.primary {
+  border-color: var(--ember);
+  color: var(--ember);
+}
+.btn.primary:hover {
+  background: color-mix(in srgb, var(--ember) 16%, transparent);
+}
+
+/* ── Right panel (blocks) ─────────────────────────────────────────────── */
+.right-panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  background: var(--surface-1);
+  border-left: 1px solid var(--border);
+  overflow: hidden;
+}
+.right-panel.collapsed {
+  display: none;
+}
+.panel-header {
+  padding: 12px 14px 8px;
+  flex: 0 0 auto;
+}
+.block-search {
+  padding: 0 12px 10px;
+  flex: 0 0 auto;
+}
+.block-search-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+.block-search-icon {
+  position: absolute;
+  left: 9px;
+  display: inline-flex;
+  color: var(--fg-faint);
+  pointer-events: none;
+}
+.block-search-input,
+.palette-input {
+  width: 100%;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--fg);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 7px 9px 7px 28px;
+}
+.block-search-input::placeholder,
+.palette-input::placeholder {
+  color: var(--fg-faint);
+}
+.block-search-input:focus,
+.palette-input:focus {
+  outline: none;
+  border-color: var(--focus);
+}
+.block-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0 12px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.block-empty,
+.palette-empty {
+  color: var(--fg-faint);
+  font-size: 12px;
+  padding: 14px 4px;
+}
+
+/* Block card */
+.block-card {
+  position: relative;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 9px 11px 9px 13px;
+  /* recency cooling: --cool 0..0.4 desaturates older blocks */
+  filter: saturate(calc(1 - var(--cool, 0)));
+}
+.block-card::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  border-radius: var(--radius-sm) 0 0 var(--radius-sm);
+  background: var(--fg-faint);
+}
+.block-card.ok::before {
+  background: var(--ok);
+}
+.block-card.error::before {
+  background: var(--error);
+}
+.block-card.running::before {
+  background: var(--ember);
+}
+.block-cmd {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  color: var(--fg);
+  word-break: break-all;
+  white-space: pre-wrap;
+}
+.block-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 6px;
+}
+.block-status {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.block-status.ok {
+  color: var(--ok);
+}
+.block-status.error {
+  color: var(--error);
+}
+.block-status.running {
+  color: var(--ember);
+}
+.block-dur {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--fg-faint);
+}
+.block-actions {
+  display: flex;
+  gap: 2px;
+  margin-top: 8px;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.block-card:hover .block-actions {
+  opacity: 1;
+}
+.block-action {
+  display: inline-flex;
+  padding: 4px 6px;
+  border-radius: 5px;
+  color: var(--fg-muted);
+}
+.block-action:hover {
+  background: var(--surface-1);
+  color: var(--fg);
+}
+
+/* ── Status bar ───────────────────────────────────────────────────────── */
+.statusbar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 0 12px;
+  background: var(--surface-1);
+  border-top: 1px solid var(--border);
+  font-size: 11.5px;
+  color: var(--fg-muted);
+}
+.status-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+}
+.status-group.right {
+  margin-left: auto;
+}
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+.status-dot.ok {
+  background: var(--ok);
+  box-shadow: 0 0 7px color-mix(in srgb, var(--ok) 70%, transparent);
+}
+.status-dot.down {
+  background: var(--error);
+  box-shadow: 0 0 7px color-mix(in srgb, var(--error) 70%, transparent);
+}
+.status-socket {
+  font-family: var(--font-mono);
+  color: var(--fg-faint);
+  font-size: 11px;
+}
+.status-reconnect {
+  color: var(--ember);
+  font-size: 11.5px;
+  text-decoration: underline;
+}
+.status-item {
+  color: var(--fg-muted);
+}
+.status-item.theme {
+  font-family: var(--font-mono);
+  color: var(--fg-faint);
+}
+
+/* ── Command palette ──────────────────────────────────────────────────── */
+.palette-layer,
+.themepicker-layer {
+  display: none;
+}
+.palette-layer.open,
+.themepicker-layer.open {
+  display: block;
+}
+.palette-backdrop,
+.theme-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding-top: 14vh;
+  z-index: 100;
+  backdrop-filter: blur(2px);
+}
+.palette-modal {
+  width: min(560px, 92vw);
+  background: var(--surface-1);
+  border: 1px solid var(--hairline);
+  border-radius: 10px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.55);
+  overflow: hidden;
+}
+.palette-search {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px;
+  border-bottom: 1px solid var(--border);
+}
+.palette-back {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--fg-muted);
+  padding: 0 6px;
+}
+.palette-list {
+  max-height: 48vh;
+  overflow-y: auto;
+  padding: 6px;
+}
+.palette-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.palette-row.selected {
+  background: color-mix(in srgb, var(--ember) 14%, var(--surface-2));
+}
+.palette-title {
+  flex: 1 1 auto;
+  font-size: 13px;
+  color: var(--fg);
+}
+.palette-hint,
+.palette-submenu-hint {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--fg-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.palette-submenu-hint {
+  display: inline-flex;
+  align-items: center;
+}
+
+/* ── Theme picker ─────────────────────────────────────────────────────── */
+.theme-modal {
+  width: min(620px, 92vw);
+  background: var(--surface-1);
+  border: 1px solid var(--hairline);
+  border-radius: 10px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.55);
+  overflow: hidden;
+}
+.theme-header {
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.theme-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 8px;
+  padding: 14px;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+.theme-swatch {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 9px 11px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  text-align: left;
+}
+.theme-swatch:hover {
+  border-color: var(--hairline);
+}
+.theme-swatch.active {
+  border-color: var(--ember);
+}
+.swatch-chip {
+  width: 18px;
+  height: 18px;
+  border-radius: 5px;
+  border: 1px solid var(--hairline);
+  flex: 0 0 auto;
+}
+.swatch-accent {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+}
+.swatch-name {
+  font-size: 12.5px;
+  color: var(--fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ── Motion: pulse for waiting/crashed; spinner for running ───────────── */
+@keyframes heat-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--heat) 50%, transparent),
+      0 0 10px color-mix(in srgb, var(--heat) 20%, transparent);
+  }
+  50% {
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--heat) 80%, transparent),
+      0 0 26px color-mix(in srgb, var(--heat) 45%, transparent);
+  }
+}
+.pane-card.pulse {
+  animation: heat-pulse 1.6s ease-in-out infinite;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.spin {
+  animation: spin 0.9s linear infinite;
+  transform-origin: center;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pane-card.pulse {
+    animation: none;
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--heat) 70%, transparent);
+  }
+  .spin {
+    animation: none;
+  }
+  * {
+    transition: none !important;
+  }
+}
+
+/* ── Responsive: collapse panels under ~900px ─────────────────────────── */
+@media (max-width: 900px) {
+  .shell,
+  .shell.rail-collapsed,
+  .shell.right-collapsed,
+  .shell.rail-collapsed.right-collapsed {
+    grid-template-columns: var(--rail-w-collapsed) 1fr 0;
+  }
+  .rail .rail-session-name,
+  .rail .rail-pane-count,
+  .rail .section-label,
+  .rail-new span:not(.rail-new-icon) {
+    display: none;
+  }
+  .right-panel {
+    display: none;
+  }
+}
+
+/* xterm fills its pane body. !important overrides xterm.css inline-ish defaults;
+   width:100% ensures the DOM-renderer rows span the full body, height:100% so a
+   non-zero box exists for FitAddon to measure. */
+.xterm {
+  height: 100% !important;
+  width: 100% !important;
+}
+.xterm .xterm-viewport,
+.xterm .xterm-screen {
+  height: 100% !important;
+}

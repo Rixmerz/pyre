@@ -1,0 +1,42 @@
+[package]
+name = "pyre-gui"
+version = "0.0.0"
+edition = "2021"
+description = "Throwaway Tauri v2 spike: pyred pane streaming into an xterm.js webview."
+publish = false
+
+# NOTE: this crate is intentionally EXCLUDED from the repo workspace
+# (see root Cargo.toml `[workspace] exclude`). It declares its own explicit
+# dependency versions (no `workspace = true`) so the Tauri/webkit deps never
+# leak into the main pyre build or CI.
+
+[lib]
+name = "pyre_gui_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+bytes = "1"
+futures = "0.3"
+tarpc = { version = "0.34", features = ["serde-transport", "serde-transport-bincode", "tokio1", "unix"] }
+tokio-serde = { version = "0.9", features = ["bincode"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+
+# The one bridge into the real pyre protocol. Path dep, NOT workspace dep.
+pyre-proto = { path = "../../crates/pyre-proto" }
+# Theme registry — exposes 18 built-in palettes to Tauri commands.
+pyre-themes = { path = "../../crates/pyre-themes" }
+# UUID parsing for newtype IDs.
+uuid = { version = "1", features = ["v4"] }
+
+[features]
+# default tauri custom-protocol feature for production builds
+custom-protocol = ["tauri/custom-protocol"]

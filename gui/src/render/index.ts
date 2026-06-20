@@ -1,0 +1,103 @@
+// App shell: builds the static grid skeleton once, then re-renders each region
+// on every state change. Also owns global keyboard shortcuts (⌘K, Esc).
+
+import { getState, subscribe } from "../state";
+import { renderTopbar } from "./topbar";
+import { renderRail } from "./rail";
+import { renderCenter } from "./center";
+import { renderBlocks } from "./blocks";
+import { renderStatusbar } from "./statusbar";
+import { renderPalette, resetPalette, handlePaletteKey } from "./palette";
+import { renderThemePicker } from "./themepicker";
+import { openPalette, closePalette, unzoom } from "../actions";
+
+interface Regions {
+  topbar: HTMLElement;
+  rail: HTMLElement;
+  center: HTMLElement;
+  right: HTMLElement;
+  statusbar: HTMLElement;
+  palette: HTMLElement;
+  themepicker: HTMLElement;
+  shell: HTMLElement;
+}
+
+let regions: Regions | null = null;
+let lastPaletteOpen = false;
+
+/** Build the static DOM skeleton into #app and wire global keys. */
+export function mountShell(app: HTMLElement): void {
+  app.innerHTML = "";
+
+  const topbar = el("header", "topbar");
+  const rail = el("aside", "rail");
+  const center = el("section", "center");
+  const right = el("aside", "right-panel");
+  const statusbar = el("footer", "statusbar");
+  const palette = el("div", "palette-layer");
+  const themepicker = el("div", "themepicker-layer");
+
+  const shell = el("div", "shell");
+  shell.append(rail, center, right);
+
+  app.append(topbar, shell, statusbar, palette, themepicker);
+
+  regions = { topbar, rail, center, right, statusbar, palette, themepicker, shell };
+
+  wireGlobalKeys();
+  subscribe(renderAll);
+  renderAll();
+}
+
+/** Re-render every region from current state. */
+export function renderAll(): void {
+  if (!regions) return;
+  renderTopbar(regions.topbar);
+  renderRail(regions.rail);
+  renderCenter(regions.center);
+  renderBlocks(regions.right);
+  renderStatusbar(regions.statusbar);
+
+  const s = getState();
+  // Reset palette transient state on open edge.
+  if (s.paletteOpen && !lastPaletteOpen) resetPalette();
+  lastPaletteOpen = s.paletteOpen;
+  renderPalette(regions.palette);
+  renderThemePicker(regions.themepicker);
+
+  // Reflect chrome collapse on the shell grid.
+  regions.shell.classList.toggle("rail-collapsed", s.railCollapsed);
+  regions.shell.classList.toggle("right-collapsed", s.rightCollapsed);
+}
+
+function wireGlobalKeys(): void {
+  window.addEventListener("keydown", (e) => {
+    const s = getState();
+    // ⌘K / Ctrl+K toggles the palette.
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+      e.preventDefault();
+      if (s.paletteOpen) closePalette();
+      else openPalette();
+      return;
+    }
+    if (s.paletteOpen && regions) {
+      handlePaletteKey(e, regions.palette);
+      return;
+    }
+    if (e.key === "Escape") {
+      if (s.themePickerOpen) {
+        e.preventDefault();
+        import("../actions").then((m) => m.closeThemePicker());
+      } else if (s.zoomedPane) {
+        e.preventDefault();
+        unzoom();
+      }
+    }
+  });
+}
+
+function el(tag: string, cls: string): HTMLElement {
+  const e = document.createElement(tag);
+  e.className = cls;
+  return e;
+}
