@@ -12,6 +12,7 @@ import {
 } from "./api";
 import { getState, setState } from "./state";
 import { disposePaneTerminal, mountedPanes } from "./terminals";
+import { maybeNotifyTransition, forgetPane } from "./notify";
 import type {
   LayoutNode,
   LifecycleEvent,
@@ -296,7 +297,10 @@ export async function applyLifecycleEvent(ev: LifecycleEvent): Promise<void> {
 
     case "closed": {
       const pane = ev.pane;
-      if (pane) disposePaneTerminal(pane);
+      if (pane) {
+        disposePaneTerminal(pane);
+        forgetPane(pane);
+      }
 
       // Resolve which session the closed pane belonged to: prefer the event's
       // own session, fall back to cached pane-state.
@@ -335,15 +339,20 @@ export async function applyLifecycleEvent(ev: LifecycleEvent): Promise<void> {
       if (ev.pane && ev.state) {
         const map = new Map(getState().paneStates);
         const prev = map.get(ev.pane);
+        const nextState = ev.state as PaneState;
+        const session =
+          ev.session ?? prev?.session ?? getState().activeSession ?? "";
         const next: PaneStateInfo = {
           pane: ev.pane,
-          session: ev.session ?? prev?.session ?? getState().activeSession ?? "",
-          state: ev.state as PaneState,
+          session,
+          state: nextState,
           title: prev?.title ?? null,
         };
         map.set(ev.pane, next);
         applyHeatInPlace(map);
         setState({ paneStates: map });
+        // Agent-awareness: ping the user on a real transition into done/waiting.
+        maybeNotifyTransition(ev.pane, prev?.state, nextState, session);
       } else {
         // Underspecified event — fall back to an authoritative pane-state poll.
         await reloadPaneStates();

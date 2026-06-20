@@ -16,10 +16,13 @@ import "@fontsource/jetbrains-mono/600.css";
 import "@fontsource/jetbrains-mono/700.css";
 import "./styles.css";
 
+import { invoke } from "@tauri-apps/api/core";
 import { daemonStatus, pollEvents, reconnect, onPaneClosed, onPtyClosedLegacy, onPtyOutput } from "./api";
 import { getState, setState } from "./state";
 import { mountShell } from "./render/index";
 import { initThemes } from "./themes";
+import { installKeybinds } from "./keybinds";
+import { initNotifications } from "./notify";
 import {
   applyLifecycleEvent,
   reloadFocusedBlocks,
@@ -59,6 +62,26 @@ let eventLoopActive = false;
 
 const sleep = (ms: number): Promise<void> =>
   new Promise((r) => window.setTimeout(r, ms));
+
+/** Guard so `close_splash` is only invoked once (boot OR first reconnect). */
+let splashClosed = false;
+
+/**
+ * Close the frameless splash window and reveal the main window. The Rust agent
+ * implements the `close_splash` command; wired DEFENSIVELY — if the command is
+ * missing or rejects (e.g. the splash was never spawned in plain `vite dev`),
+ * we swallow the error and proceed so boot is never blocked. Idempotent.
+ */
+async function closeSplash(): Promise<void> {
+  if (splashClosed) return;
+  splashClosed = true;
+  try {
+    await invoke("close_splash");
+  } catch (err) {
+    // Expected in `vite dev` (no Tauri host) or before the Rust command lands.
+    console.warn("[pyre-splash] close_splash unavailable — continuing:", err);
+  }
+}
 
 /**
  * Event-driven lifecycle loop. Long-polls `poll_events(eventSeq)`; the daemon
@@ -153,6 +176,8 @@ async function boot(): Promise<void> {
   mountShell(app);
   await initThemes();
   await wireEvents();
+  installKeybinds();
+  initNotifications();
 
   // Connectivity → initial load. Retry a few times before surfacing the dead
   // state: the daemon may still be binding its socket when the webview loads.
@@ -169,6 +194,11 @@ async function boot(): Promise<void> {
   } else {
     startReconnectPoll();
   }
+
+  // First paint is done (session loaded, or the daemon-down panel is showing).
+  // Reveal the main window and dismiss the splash either way — leaving the splash
+  // up while the daemon is down would strand the user on a frozen splash.
+  await closeSplash();
 
   startPolling();
   window.addEventListener("resize", () => refitAll());

@@ -12,11 +12,26 @@
   "app": {
     "windows": [
       {
+        "label": "splashscreen",
+        "url": "splashscreen.html",
+        "title": "pyre",
+        "width": 440,
+        "height": 280,
+        "resizable": false,
+        "decorations": false,
+        "center": true,
+        "transparent": true,
+        "visible": true,
+        "alwaysOnTop": true
+      },
+      {
+        "label": "main",
         "title": "pyre — GUI spike",
         "width": 980,
         "height": 760,
         "resizable": true,
-        "fullscreen": false
+        "fullscreen": false,
+        "visible": false
       }
     ],
     "security": {

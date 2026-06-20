@@ -1,0 +1,34 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="ember" x1="512" y1="160" x2="512" y2="880" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ff9152"/>
+      <stop offset="0.42" stop-color="#e8743b"/>
+      <stop offset="1" stop-color="#b8501f"/>
+    </linearGradient>
+    <linearGradient id="emberDim" x1="512" y1="320" x2="512" y2="880" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#e8743b"/>
+      <stop offset="1" stop-color="#a3461a"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="512" cy="600" r="420" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#e8743b" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#e8743b" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <!-- Dark rounded-square plate -->
+  <rect x="0" y="0" width="1024" height="1024" rx="224" fill="#0b0c0e"/>
+  <!-- Ember glow behind the mark -->
+  <rect x="0" y="0" width="1024" height="1024" rx="224" fill="url(#glow)"/>
+  <!-- Mark: same geometry as logo.svg, scaled ~14x and centered (logo viewBox 64 → 1024 scale 16, recentred with margin) -->
+  <g transform="translate(192, 192) scale(10)">
+    <!-- Left shard -->
+    <path d="M20 60 L13 38 L26 50 Z" fill="url(#emberDim)"/>
+    <!-- Right shard -->
+    <path d="M44 60 L52 34 L38 50 Z" fill="url(#emberDim)"/>
+    <!-- Central spire -->
+    <path d="M32 4 L46 40 L32 60 L18 40 Z" fill="url(#ember)"/>
+    <!-- Highlight facet -->
+    <path d="M32 4 L40 33 L32 44 L24 33 Z" fill="#ff9152" opacity="0.9"/>
+    <!-- Base spark notch -->
+    <path d="M32 60 L26 48 L32 52 L38 48 Z" fill="#b8501f"/>
+  </g>
+</svg>

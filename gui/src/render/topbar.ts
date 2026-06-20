@@ -2,6 +2,10 @@
 
 import { h, replaceChildren } from "./dom";
 import { icon } from "./icons";
+// The pyre mark — angular ember shards. Imported raw so it inlines into the
+// wordmark and inherits no external request (offline-first). It carries its own
+// ember gradient, so it does NOT use currentColor like the stroke icons.
+import logoSvg from "../assets/logo.svg?raw";
 import { activeSessionInfo, getState } from "../state";
 import {
   openPalette,
@@ -24,7 +28,7 @@ export function renderTopbar(root: HTMLElement): void {
   const wordmark = h(
     "div",
     { class: "wordmark" },
-    h("span", { class: "ember-mark", html: icon("ember") }),
+    h("span", { class: "ember-mark", html: logoSvg, "aria-hidden": "true" }),
     h("span", { class: "wordmark-text" }, "PYRE"),
   );
 

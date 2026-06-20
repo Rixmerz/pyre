@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>pyre</title>
+    <style>
+      /* Self-contained splash. No external fonts/assets so it paints instantly
+         while the main window + daemon are still warming up. The window itself
+         is frameless + transparent (tauri.conf), so the rounded plate IS the
+         visible surface. */
+      :root {
+        --surface-0: #0b0c0e;
+        --surface-1: #131419;
+        --ember: #e8743b;
+        --ember-bright: #ff9152;
+        --ember-deep: #b8501f;
+        --fg: #ecedee;
+        --fg-muted: #969ca6;
+        --hairline: #2c2f39;
+      }
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      html, body {
+        width: 100%;
+        height: 100%;
+        background: transparent;
+        overflow: hidden;
+        font-family:
+          ui-monospace, "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+        -webkit-font-smoothing: antialiased;
+      }
+      .plate {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 18px;
+        background:
+          radial-gradient(
+            120% 90% at 50% 38%,
+            rgba(232, 116, 59, 0.14) 0%,
+            rgba(232, 116, 59, 0) 60%
+          ),
+          var(--surface-0);
+        border: 1px solid var(--hairline);
+        border-radius: 16px;
+      }
+      /* Mark + kindle glow */
+      .mark {
+        position: relative;
+        width: 96px;
+        height: 96px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .mark svg { width: 88px; height: 88px; display: block; }
+      .mark::after {
+        /* Pulsing ember halo behind the mark — the "kindle". */
+        content: "";
+        position: absolute;
+        inset: -22px;
+        border-radius: 50%;
+        background: radial-gradient(
+          circle,
+          rgba(232, 116, 59, 0.42) 0%,
+          rgba(232, 116, 59, 0) 68%
+        );
+        z-index: -1;
+        animation: kindle 1.7s ease-in-out infinite;
+      }
+      /* The central spire flickers brightness as it "ignites". */
+      #spire { animation: flicker 1.7s ease-in-out infinite; transform-origin: center; }
+
+      .wordmark {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+      .wordmark-text {
+        font-weight: 700;
+        font-size: 22px;
+        letter-spacing: 0.34em;
+        text-transform: uppercase;
+        color: var(--fg);
+        /* trailing letter-spacing pushes text right; nudge back for optical centre */
+        margin-right: -0.34em;
+      }
+      .status {
+        font-size: 11.5px;
+        letter-spacing: 0.18em;
+        text-transform: lowercase;
+        color: var(--fg-muted);
+      }
+      .status .dots::after {
+        content: "";
+        animation: dots 1.4s steps(4, end) infinite;
+      }
+
+      @keyframes kindle {
+        0%, 100% { opacity: 0.55; transform: scale(0.94); }
+        50%      { opacity: 1;    transform: scale(1.06); }
+      }
+      @keyframes flicker {
+        0%, 100% { opacity: 0.86; }
+        45%      { opacity: 1; }
+        70%      { opacity: 0.92; }
+      }
+      @keyframes dots {
+        0%   { content: ""; }
+        25%  { content: "."; }
+        50%  { content: ".."; }
+        75%  { content: "..."; }
+        100% { content: ""; }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .mark::after { animation: none; opacity: 0.8; }
+        #spire { animation: none; opacity: 1; }
+        .status .dots::after { content: "..."; animation: none; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="plate" role="status" aria-live="polite" aria-label="pyre is igniting">
+      <div class="mark">
+        <!-- Inline mark (mirrors src/assets/logo.svg) so the splash needs no asset fetch. -->
+        <svg viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+          <defs>
+            <linearGradient id="ember" x1="32" y1="4" x2="32" y2="60" gradientUnits="userSpaceOnUse">
+              <stop offset="0" stop-color="#ff9152"/>
+              <stop offset="0.42" stop-color="#e8743b"/>
+              <stop offset="1" stop-color="#b8501f"/>
+            </linearGradient>
+            <linearGradient id="emberDim" x1="32" y1="14" x2="32" y2="60" gradientUnits="userSpaceOnUse">
+              <stop offset="0" stop-color="#e8743b"/>
+              <stop offset="1" stop-color="#a3461a"/>
+            </linearGradient>
+          </defs>
+          <path d="M20 60 L13 38 L26 50 Z" fill="url(#emberDim)"/>
+          <path d="M44 60 L52 34 L38 50 Z" fill="url(#emberDim)"/>
+          <path id="spire" d="M32 4 L46 40 L32 60 L18 40 Z" fill="url(#ember)"/>
+          <path d="M32 4 L40 33 L32 44 L24 33 Z" fill="#ff9152" opacity="0.9"/>
+          <path d="M32 60 L26 48 L32 52 L38 48 Z" fill="#b8501f"/>
+        </svg>
+      </div>
+      <div class="wordmark">
+        <span class="wordmark-text">PYRE</span>
+      </div>
+      <div class="status">igniting<span class="dots"></span></div>
+    </div>
+  </body>
+</html>

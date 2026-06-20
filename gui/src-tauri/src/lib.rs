@@ -23,7 +23,7 @@ use pyre_proto::{
     SpawnResp,
 };
 use serde::Serialize;
-use tauri::{Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_serde::formats::SymmetricalBincode;
@@ -960,6 +960,46 @@ async fn start_pane(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Commands: splash / window lifecycle
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Close the splashscreen window and reveal the main window.
+///
+/// Called by the frontend once it has finished bootstrapping (daemon connected,
+/// initial data loaded).  Tolerates either window being absent — no panic.
+#[tauri::command]
+async fn close_splash(app: AppHandle) {
+    if let Some(splash) = app.get_webview_window("splashscreen") {
+        let _ = splash.close();
+    }
+    if let Some(main) = app.get_webview_window("main") {
+        let _ = main.show();
+        let _ = main.set_focus();
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Commands: OS desktop notifications
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Send an OS desktop notification.
+///
+/// Used by the frontend to surface agent-state changes and other events that
+/// the embedded terminal header bar cannot convey (e.g. background job
+/// finished, daemon reconnected).  Returns `Err(String)` on failure so the
+/// caller can surface or ignore the error without a JS exception.
+#[tauri::command]
+async fn notify(app: AppHandle, title: String, body: String) -> Result<(), String> {
+    use tauri_plugin_notification::NotificationExt;
+    app.notification()
+        .builder()
+        .title(&title)
+        .body(&body)
+        .show()
+        .map_err(|e| format!("notification failed: {e}"))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Entry point
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -967,6 +1007,7 @@ async fn start_pane(
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             app.manage(AppState::default());
             Ok(())
@@ -1003,6 +1044,9 @@ pub fn run() {
             get_theme,
             // legacy
             start_pane,
+            // splash + notifications
+            close_splash,
+            notify,
         ])
         .run(tauri::generate_context!())
         .expect("error while running pyre-gui");

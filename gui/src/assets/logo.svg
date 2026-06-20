@@ -1,0 +1,24 @@
+<svg width="64" height="64" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="pyre">
+  <title>pyre</title>
+  <defs>
+    <linearGradient id="pyreEmber" x1="32" y1="4" x2="32" y2="60" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ff9152"/>
+      <stop offset="0.42" stop-color="#e8743b"/>
+      <stop offset="1" stop-color="#b8501f"/>
+    </linearGradient>
+    <linearGradient id="pyreEmberDim" x1="32" y1="14" x2="32" y2="60" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#e8743b"/>
+      <stop offset="1" stop-color="#a3461a"/>
+    </linearGradient>
+  </defs>
+  <!-- Left shard: a short angular flame leaning inward -->
+  <path d="M20 60 L13 38 L26 50 Z" fill="url(#pyreEmberDim)"/>
+  <!-- Right shard: mirror, slightly taller -->
+  <path d="M44 60 L52 34 L38 50 Z" fill="url(#pyreEmberDim)"/>
+  <!-- Central spire: the tallest shard, an upward ember built from straight cuts -->
+  <path d="M32 4 L46 40 L32 60 L18 40 Z" fill="url(#pyreEmber)"/>
+  <!-- Highlight: a bright inner facet near the tip -->
+  <path d="M32 4 L40 33 L32 44 L24 33 Z" fill="#ff9152" opacity="0.9"/>
+  <!-- Spark notch: small dark cut at the base, the funeral-pyre ember gap -->
+  <path d="M32 60 L26 48 L32 52 L38 48 Z" fill="#b8501f"/>
+</svg>
