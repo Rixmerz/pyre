@@ -24,6 +24,7 @@ import { heatVar, pulses, stateLabel } from "../heat";
 import {
   closePaneAction,
   focusPane,
+  newSession,
   splitDown,
   splitRight,
   zoomPane,
@@ -83,6 +84,7 @@ export function renderCenter(root: HTMLElement): void {
     return;
   }
   if (!layout) {
+    dlog("[pyre-session] new-session: rendered empty-state (activeSession=", s.activeSession, ")");
     replaceChildren(
       root,
       h(
@@ -91,7 +93,7 @@ export function renderCenter(root: HTMLElement): void {
         h("p", {}, "No active session."),
         h(
           "button",
-          { class: "btn primary", onclick: () => void import("../actions").then((m) => m.newSession()) },
+          { class: "btn primary", onclick: () => void newSession() },
           "New session",
         ),
       ),

@@ -30,12 +30,16 @@ import { dlog } from "./debug";
 // ── Session actions ─────────────────────────────────────────────────────────
 
 export async function newSession(): Promise<void> {
+  dlog("[pyre-session] new-session: start");
   try {
     const s = await spawnSession(80, 24);
+    dlog("[pyre-session] new-session: spawn result", s.session, "pane", s.pane);
     await reloadSessions();
     setState({ activeSession: s.session });
+    dlog("[pyre-session] new-session: adopted active=", s.session);
     await reloadSession(s.session);
     focusFirstLeaf(s.session);
+    dlog("[pyre-session] new-session: rendered session=", s.session);
   } catch (err) {
     console.error("spawn_session failed:", err);
   }
@@ -201,10 +205,15 @@ export async function closePaneAction(pane: string | null): Promise<void> {
       focusFirstLeaf(session);
     } else {
       const first = getState().sessions[0]?.id ?? null;
-      setState({ activeSession: first, focusedPane: null });
+      setState({ activeSession: first, focusedPane: null, zoomedPane: null });
       if (first) {
         await reloadSession(first);
         focusFirstLeaf(first);
+      } else {
+        // Last pane of the last session was closed — spawn a fresh session so
+        // the UI is never stranded at the empty state with no auto-recovery.
+        dlog("[pyre-session] last pane closed, no sessions remain — spawning fresh session");
+        await newSession();
       }
     }
   }
