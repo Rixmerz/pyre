@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Pyre
+Comment=Agent-aware terminal multiplexer
+Exec=pyre
+Icon=pyre
+Terminal=false
+Categories=System;TerminalEmulator;Utility;

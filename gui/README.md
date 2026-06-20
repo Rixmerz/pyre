@@ -1,88 +1,130 @@
-# pyre GUI spike (throwaway)
+# Pyre GUI
 
-A **minimal Tauri v2 desktop spike** evaluating whether pyre should pivot its
-flagship frontend from a TUI to a GUI. It proves two things and nothing more:
+A **Tauri v2 desktop client** for the `pyred` daemon. It is a full-fledged
+graphical front end alongside the TUI (`pyre-tui`): both speak the same
+`pyred` protocol over the same Unix socket, so the GUI is a peer surface,
+not a wrapper around the terminal client.
 
-- **Q1** — a Warp-style command "block" renders better in a webview than in a
-  terminal UI (two static ember-themed block cards at the top).
-- **Q2** — a Tauri Rust backend can bridge the existing `pyred` daemon's
-  streaming pane output into an `xterm.js` terminal in the webview (the live
-  pane below the cards).
+The GUI renders the complete pyre surface:
 
-> This is **throwaway, spike-quality** code. No settings, no multi-pane, no
-> tabs, no error-recovery UI. One window, one live terminal, two static cards.
-> Delete it once the pivot decision is made.
+- **Sessions** — attach to, switch between, and spawn `pyred` sessions.
+- **Layout-tree panes** — the recursive split layout (`LayoutNode`), with
+  live PTY output streamed into `xterm.js` terminals.
+- **Blocks** — the Warp-style command-block model (prompt + output framed
+  as discrete cards).
+- **Search** — query across blocks/sessions via the daemon's search index.
+- **18 themes** — the built-in palettes exposed by the `pyre-themes` crate.
+- **Heat signature** — the activity/heat visualization for panes.
 
-## Architecture (why the Rust bridge is mandatory)
+## Architecture
 
-The webview cannot speak tarpc/bincode over the Unix socket, so a Rust layer
-bridges it:
+```
+gui/
+├── src/            vanilla-TypeScript frontend (xterm.js, theme UI, blocks)
+└── src-tauri/      Rust bridge — Tauri commands + tarpc client to pyred
+```
+
+The webview cannot speak tarpc/bincode over the Unix socket, so the Rust
+layer in `gui/src-tauri` bridges it: webview `invoke(...)` calls cross into
+Tauri commands, which hold a `tarpc` `PyreDaemonClient` (control conn) plus a
+raw streaming connection (`OutputFrame` loop) and emit pane bytes back to the
+webview via Tauri events. The wire format is the existing pyre proto — the GUI
+path-depends on the real `pyre-proto` and `pyre-themes` crates and modifies
+neither.
 
 ```
 xterm.js (webview)
    │  invoke("start_pane") / invoke("send_keys", bytes)
    ▼
 Tauri Rust backend  (gui/src-tauri/src/lib.rs)
-   │  control conn (0x01) → tarpc PyreDaemonClient → spawn(80x24)
-   │  stream  conn (0x02 + session16 + pane16) → OutputFrame loop
-   ▼  emit("pty-output", Vec<u8>) ───────────► term.write(Uint8Array)
-pyred daemon (Unix socket: $XDG_RUNTIME_DIR/pyre.sock)
+   │  control conn  → tarpc PyreDaemonClient
+   │  stream  conn  → OutputFrame loop
+   ▼  emit("pty-output", bytes) ───────────► term.write(...)
+pyred daemon  (Unix socket: $XDG_RUNTIME_DIR/pyre.sock)
 ```
 
-The connection/stream pattern is copied verbatim from the reference TUI client
-(`crates/pyre-tui/src/app/pane_ops.rs` + `crates/pyre-tui/src/rpc/client.rs`).
-It path-depends on the real `pyre-proto` crate; nothing in `pyre-proto` was
-modified.
+> **Workspace note:** `gui/src-tauri` is deliberately **excluded** from the
+> repo cargo workspace (`[workspace] exclude = ["gui/src-tauri"]` in the root
+> `Cargo.toml`). It pins its own Tauri/webkit dependency versions so those
+> deps never enter the main pyre build or CI. Build it from inside
+> `gui/src-tauri` (or via `pnpm tauri`), not from the workspace root.
 
-`gui/src-tauri` is **excluded** from the repo cargo workspace (see the
-`[workspace] exclude` line in the root `Cargo.toml`) so the Tauri/webkit deps
-never enter the main pyre build or CI.
+Socket resolution mirrors the other pyre clients:
+`$PYRE_SOCK` → `$PYRE_SOCKET` → `$XDG_RUNTIME_DIR/pyre.sock` →
+`/tmp/pyre-<uid>.sock`.
 
-## Run steps
-
-1. **Start the daemon.** The live terminal shows nothing unless `pyred` is
-   running and listening on its socket:
-
-   ```sh
-   # from the repo root
-   cargo run -p pyred        # or: ./target/release/pyred
-   ```
-
-   Socket resolution mirrors the other pyre clients: `$PYRE_SOCK` →
-   `$PYRE_SOCKET` → `$XDG_RUNTIME_DIR/pyre.sock` → `/tmp/pyre-<uid>.sock`.
-
-2. **Install frontend deps:**
-
-   ```sh
-   cd gui
-   pnpm install
-   ```
-
-3. **Run the GUI in dev mode:**
-
-   ```sh
-   pnpm tauri dev
-   ```
-
-   First run compiles the whole Tauri Rust backend — that is slow (minutes);
-   let it finish. A window titled "pyre — GUI spike" opens with the two block
-   cards on top and a live shell terminal below.
-
-If `pyred` is **not** running, the terminal area shows a clear ember error
-message instead of crashing.
-
-## Build / typecheck only (no display needed)
+## Run
 
 ```sh
-# Rust backend compiles:
-cd gui/src-tauri && cargo build
-
-# Frontend typechecks + builds:
-cd gui && pnpm install && pnpm build
+pyre
 ```
+
+The `pyre` wrapper (`~/.local/bin/pyre`) ensures `pyred` is running, sets the
+NVIDIA/Wayland webkit workaround env vars, then execs `~/.local/bin/pyre-gui`.
+It also retries once on a sub-3s cold-start crash (a transient
+NVIDIA/webkit2gtk init race).
+
+## Develop
+
+> **pnpm only.** `npm` is forbidden in this project. The Tauri CLI is the
+> pnpm-scoped `@tauri-apps/cli` — there is no global `cargo-tauri` dependency.
+
+```sh
+cd gui
+pnpm install
+pnpm tauri dev      # opens the GUI; first run compiles the Rust backend (slow)
+```
+
+Backend-only / typecheck-only checks (no display needed):
+
+```sh
+cd gui/src-tauri && cargo build      # Rust bridge compiles
+cd gui && pnpm build                 # frontend typechecks + builds
+```
+
+## Build
+
+```sh
+cd gui
+pnpm tauri build --no-bundle         # release binary, no OS installer bundle
+```
+
+This produces `gui/src-tauri/target/release/pyre-gui`. (The cargo binary
+name stays `pyre-gui`; the `pyre` wrapper execs it. The Tauri product name is
+`Pyre` and the app identifier is `dev.pyre.gui`.)
+
+## Install
+
+The desktop integration assets live in `gui/packaging/`:
+
+1. **Binaries** — copy the release `pyre-gui` and `pyred` to `~/.local/bin/`,
+   along with the `pyre` wrapper script. Ensure `~/.local/bin` is on `PATH`.
+
+2. **Desktop entry** — so Pyre shows up in Hyprland/app launchers:
+
+   ```sh
+   cp gui/packaging/pyre.desktop ~/.local/share/applications/
+   # icon (so Icon=pyre resolves)
+   mkdir -p ~/.local/share/icons/hicolor/128x128/apps
+   cp gui/src-tauri/icons/128x128.png ~/.local/share/icons/hicolor/128x128/apps/pyre.png
+   cp gui/src-tauri/icons/icon.png    ~/.local/share/icons/pyre.png
+   update-desktop-database ~/.local/share/applications 2>/dev/null || true
+   ```
+
+3. **systemd user service (optional).** The `pyre` wrapper already ensures
+   `pyred`, so the daemon service is **opt-in**. Install it, then enable
+   only if you want `pyred` managed by systemd:
+
+   ```sh
+   mkdir -p ~/.config/systemd/user
+   cp gui/packaging/pyred.service ~/.config/systemd/user/
+   systemctl --user daemon-reload
+   systemctl --user enable --now pyred.service   # opt-in; not enabled by default
+   ```
 
 ## Prereqs
 
-- Node + pnpm (uses the pnpm-based `@tauri-apps/cli` — no global `cargo-tauri`).
+- Node + pnpm (`npm` is not supported).
 - `webkit2gtk-4.1` + `libsoup-3.0` (Tauri v2 Linux webview deps).
 - Rust stable.
+- A running `pyred` daemon (the `pyre` wrapper starts one automatically).

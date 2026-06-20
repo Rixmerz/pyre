@@ -31,6 +31,7 @@ import {
 import { mountPaneTerminal, refitAll } from "../terminals";
 import { setWeight } from "../api";
 import { chipKind } from "./agents";
+import { dlog } from "../debug";
 import type { LayoutNode, PaneState } from "../types";
 
 /** First leaf pane id under a node — the representative weight target. */
@@ -70,11 +71,11 @@ export function renderCenter(root: HTMLElement): void {
     // Layout structure, focus, and zoom are all unchanged.
     // Heat/state updates are applied in-place by session-ops.ts — skip the
     // full tear-down to prevent xterm re-parenting and focus-blur.
-    console.log("[pyre-render] skip structural re-render — fingerprint unchanged");
+    dlog("[pyre-render] skip structural re-render — fingerprint unchanged");
     return;
   }
 
-  console.log("[pyre-render] structural re-render — fingerprint changed:", lastFingerprint, "→", fp);
+  dlog("[pyre-render] structural re-render — fingerprint changed:", lastFingerprint, "→", fp);
   lastFingerprint = fp;
 
   if (!s.connected) {
@@ -249,7 +250,7 @@ function renderLeaf(pane: string): HTMLElement {
     "data-state": state,
     tabindex: "0",
     onmousedown: () => {
-      console.log("[pyre-input] click pane", pane); // (a) click stage
+      dlog("[pyre-input] click pane", pane); // (a) click stage
       focusPane(pane);
     },
   });

@@ -12,6 +12,7 @@ import { SearchAddon } from "@xterm/addon-search";
 import "@xterm/xterm/css/xterm.css";
 import { resizePane, sendKeys } from "./api";
 import { getState } from "./state";
+import { dlog } from "./debug";
 
 /**
  * Font stack for the terminal. Resolved from the system at build time:
@@ -140,7 +141,7 @@ export function mountPaneTerminal(
     if (entry.el !== el) {
       const node = entry.term.element;
       if (node && node.parentElement !== el) {
-        console.log("[pyre-render] re-parenting terminal for pane", pane,
+        dlog("[pyre-render] re-parenting terminal for pane", pane,
           "— will restore focus if focused");
         el.appendChild(node);
         // Re-parenting fires blur on the hidden textarea. If this pane is the
@@ -150,7 +151,7 @@ export function mountPaneTerminal(
           entry.term.focus();
           const ta = el.querySelector<HTMLElement>(".xterm-helper-textarea");
           if (ta) ta.focus();
-          console.log("[pyre-input] focus restored after re-parent for pane", pane);
+          dlog("[pyre-input] focus restored after re-parent for pane", pane);
         }
       }
       entry.el = el;
@@ -210,11 +211,11 @@ export function mountPaneTerminal(
   // Webview → daemon: forward keystrokes as UTF-8 bytes, tagged with this pane.
   term.onData((d) => {
     const bytes = Array.from(new TextEncoder().encode(d));
-    console.log("[pyre-input] onData", pane, d.length); // (c) onData stage
-    console.log("[pyre-input] send_keys ->", pane, bytes.length); // (d) sendKeys invocation
+    dlog("[pyre-input] onData", pane, d.length); // (c) onData stage
+    dlog("[pyre-input] send_keys ->", pane, bytes.length); // (d) sendKeys invocation
     void sendKeys(pane, bytes)
       .then(() => {
-        console.log("[pyre-input] send_keys ok", pane); // (e-ok)
+        dlog("[pyre-input] send_keys ok", pane); // (e-ok)
       })
       .catch((err) => {
         console.error("[pyre-input] send_keys FAILED", pane, err); // (e-err)
@@ -408,7 +409,7 @@ export function focusPaneTerminal(pane: string): void {
     console.warn("[pyre-input] focusPaneTerminal: no terminal for pane", pane);
     return;
   }
-  console.log("[pyre-input] focus", pane); // (b) terminal focus stage
+  dlog("[pyre-input] focus", pane); // (b) terminal focus stage
   entry.term.focus();
   // WebKitGTK (the Tauri webview) sometimes needs an explicit focus on the
   // underlying hidden textarea rather than the xterm wrapper element.

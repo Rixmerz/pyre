@@ -13,6 +13,8 @@ import {
 import { getState, setState } from "./state";
 import { disposePaneTerminal, mountedPanes } from "./terminals";
 import { maybeNotifyTransition, forgetPane } from "./notify";
+import { dlog } from "./debug";
+import { paneStatesEqual } from "./pane-state-eq";
 import type {
   LayoutNode,
   LifecycleEvent,
@@ -125,21 +127,9 @@ export async function reloadPaneStates(): Promise<void> {
   }
 }
 
-/** Shallow equality check for pane state maps. */
-function paneStatesEqual(
-  a: Map<string, PaneStateInfo>,
-  b: Map<string, PaneStateInfo>,
-): boolean {
-  if (a.size !== b.size) return false;
-  for (const [pane, infoA] of a) {
-    const infoB = b.get(pane);
-    if (!infoB) return false;
-    if (infoA.state !== infoB.state) return false;
-    if (infoA.title !== infoB.title) return false;
-    if ((infoA.agent ?? null) !== (infoB.agent ?? null)) return false;
-  }
-  return true;
-}
+// paneStatesEqual lives in ./pane-state-eq (pure, headless-testable) and is
+// imported above; re-exported here so existing importers keep working.
+export { paneStatesEqual };
 
 /**
  * Apply heat/state changes directly on the existing pane-card DOM elements.
@@ -182,7 +172,7 @@ function applyHeatInPlace(map: Map<string, PaneStateInfo>): void {
       chip.className = `agent-chip pane-agent-chip agent-${agentChipKind(agent)}`;
     }
 
-    console.log("[pyre-render] heat-in-place pane", pane, info.state);
+    dlog("[pyre-render] heat-in-place pane", pane, info.state);
   }
 }
 

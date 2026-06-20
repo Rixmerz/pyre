@@ -1,0 +1,10 @@
+[Unit]
+Description=Pyre daemon
+
+[Service]
+ExecStart=%h/.local/bin/pyred
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

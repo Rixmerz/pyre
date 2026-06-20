@@ -25,6 +25,7 @@ import {
   reloadSessions,
   focusFirstLeaf,
 } from "./session-ops";
+import { dlog } from "./debug";
 
 // ── Session actions ─────────────────────────────────────────────────────────
 
@@ -64,16 +65,16 @@ export async function promptRenameSession(session: string): Promise<void> {
  * new active session (spawning a fresh one if none remain).
  */
 export async function closeSessionAction(session: string): Promise<void> {
-  console.log("[pyre-session] closeSession action fired:", session);
+  dlog("[pyre-session] closeSession action fired:", session);
 
   // Capture the leaves BEFORE we drop the layout, so we can detach each stream.
   const leaves = leafPanes(getState().layouts.get(session));
   const wasActive = getState().activeSession === session;
 
   try {
-    console.log("[pyre-session] invoking close_session command:", session);
+    dlog("[pyre-session] invoking close_session command:", session);
     await closeSession(session);
-    console.log("[pyre-session] close_session command ok:", session);
+    dlog("[pyre-session] close_session command ok:", session);
   } catch (err) {
     console.error("[pyre-session] close_session command FAILED:", session, err);
     return;
@@ -95,7 +96,7 @@ export async function closeSessionAction(session: string): Promise<void> {
   // Reload the session list from the daemon (authoritative post-close view).
   await reloadSessions();
   const remaining = getState().sessions;
-  console.log(
+  dlog(
     "[pyre-session] session list reloaded, new count:",
     remaining.length,
   );
@@ -105,12 +106,12 @@ export async function closeSessionAction(session: string): Promise<void> {
   if (wasActive) {
     const next = remaining[0]?.id ?? null;
     if (next) {
-      console.log("[pyre-session] active session switched to:", next);
+      dlog("[pyre-session] active session switched to:", next);
       setState({ activeSession: next, focusedPane: null, zoomedPane: null });
       await reloadSession(next);
       focusFirstLeaf(next);
     } else {
-      console.log("[pyre-session] no sessions remain — spawning a fresh one");
+      dlog("[pyre-session] no sessions remain — spawning a fresh one");
       setState({ activeSession: null, focusedPane: null, zoomedPane: null });
       await newSession();
     }
@@ -138,11 +139,11 @@ export async function splitDown(pane: string | null): Promise<void> {
 async function doSplit(pane: string, orient: "h" | "v"): Promise<void> {
   const session = getState().activeSession;
   if (!session) return;
-  console.log("[pyre-split] action orient=", orient, "pane=", pane);
+  dlog("[pyre-split] action orient=", orient, "pane=", pane);
   try {
     const result = await openSplit(pane, orient);
     const newPane = result.pane;
-    console.log("[pyre-split] daemon new pane=", newPane);
+    dlog("[pyre-split] daemon new pane=", newPane);
     await reloadSession(session);
     const layout = getState().layouts.get(session);
     logLayoutTree(layout, 0);
@@ -154,13 +155,13 @@ async function doSplit(pane: string, orient: "h" | "v"): Promise<void> {
 }
 
 function logLayoutTree(node: import("./types").LayoutNode | undefined, depth: number): void {
-  if (!node) { console.log("[pyre-split] tree: (none)"); return; }
+  if (!node) { dlog("[pyre-split] tree: (none)"); return; }
   const indent = "  ".repeat(depth);
   if (node.kind === "leaf") {
-    console.log(`[pyre-split] ${indent}leaf pane=${node.pane}`);
+    dlog(`[pyre-split] ${indent}leaf pane=${node.pane}`);
   } else {
     const cssDir = node.dir === "v" ? "row (split-h)" : "column (split-v)";
-    console.log(`[pyre-split] ${indent}split dir=${node.dir} flex=${cssDir} weights=[${(node.weights ?? []).join(",")}]`);
+    dlog(`[pyre-split] ${indent}split dir=${node.dir} flex=${cssDir} weights=[${(node.weights ?? []).join(",")}]`);
     node.children.forEach(c => logLayoutTree(c, depth + 1));
   }
 }
