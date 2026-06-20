@@ -39,7 +39,7 @@
 
   /* Type */
   --font-ui: "Geist", system-ui, sans-serif;
-  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+  --font-mono: "JetBrainsMono Nerd Font", "Symbols Nerd Font Mono", "JetBrains Mono", "Noto Color Emoji", ui-monospace, monospace;
 
   /* Geometry */
   --topbar-h: 40px;
@@ -929,4 +929,30 @@ button {
 .xterm .xterm-viewport,
 .xterm .xterm-screen {
   height: 100% !important;
+}
+
+/* Slim, theme-aware scrollbar for the 10k-line scrollback so dragging through
+   history reads as part of the chrome rather than a default OS gutter. */
+.xterm .xterm-viewport {
+  scrollbar-width: thin;
+  scrollbar-color: var(--hairline, #2c2f39) transparent;
+}
+.xterm .xterm-viewport::-webkit-scrollbar {
+  width: 8px;
+}
+.xterm .xterm-viewport::-webkit-scrollbar-thumb {
+  background: var(--hairline, #2c2f39);
+  border-radius: 4px;
+}
+.xterm .xterm-viewport::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Web-links addon underlines URLs on hover; tint with the ember accent. */
+.xterm .xterm-link-layer a {
+  cursor: pointer;
+}
+.xterm a[href]:hover {
+  text-decoration: underline;
+  color: var(--ember, #e8743b);
 }

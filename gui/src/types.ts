@@ -125,3 +125,24 @@ export interface PtyOutputPayload {
 export interface PaneClosedPayload {
   pane: string;
 }
+
+/** The kinds of lifecycle event the daemon emits through `poll_events`. */
+export type LifecycleEventKind =
+  | "spawned"
+  | "closed"
+  | "state_changed"
+  | "layout_changed";
+
+/** One entry returned by the `poll_events` long-poll command. */
+export interface LifecycleEvent {
+  kind: LifecycleEventKind;
+  pane?: string;
+  session?: string;
+  state?: string;
+}
+
+/** Result of `poll_events(after_seq)` — a batch plus the new cursor. */
+export interface PollEventsResult {
+  events: LifecycleEvent[];
+  last_seq: number;
+}

@@ -4,14 +4,20 @@
 
 import {
   attachPaneStream,
+  detachPaneStream,
   listBlocks,
   listSessions,
   paneStates,
   sessionLayout,
 } from "./api";
 import { getState, setState } from "./state";
-import { mountedPanes } from "./terminals";
-import type { LayoutNode, PaneStateInfo } from "./types";
+import { disposePaneTerminal, mountedPanes } from "./terminals";
+import type {
+  LayoutNode,
+  LifecycleEvent,
+  PaneStateInfo,
+  PaneState,
+} from "./types";
 
 /** Walk a layout tree and collect every leaf pane id, in render order. */
 export function leafPanes(node: LayoutNode | undefined): string[] {
@@ -20,11 +26,31 @@ export function leafPanes(node: LayoutNode | undefined): string[] {
   return node.children.flatMap((c) => leafPanes(c));
 }
 
-/** Reload the session list into the store. */
+/** Reload the session list into the store.
+ *
+ *  This FULLY REPLACES the list — sessions the daemon no longer reports are
+ *  dropped, and their cached layouts are evicted so a removed session can't
+ *  linger in the rail or in `state.layouts`. If the active session vanished,
+ *  the active pointer is cleared so the caller can pick a new one. */
 export async function reloadSessions(): Promise<void> {
   try {
     const sessions = await listSessions();
-    setState({ sessions });
+    const liveIds = new Set(sessions.map((s) => s.id));
+
+    // Evict cached layouts for sessions that no longer exist.
+    const layouts = new Map(getState().layouts);
+    for (const id of [...layouts.keys()]) {
+      if (!liveIds.has(id)) layouts.delete(id);
+    }
+
+    const active = getState().activeSession;
+    const patch: Parameters<typeof setState>[0] = { sessions, layouts };
+    if (active && !liveIds.has(active)) {
+      patch.activeSession = null;
+      patch.focusedPane = null;
+      patch.zoomedPane = null;
+    }
+    setState(patch);
   } catch (err) {
     console.error("list_sessions failed:", err);
   }
@@ -195,4 +221,134 @@ export function focusFirstLeaf(session: string): void {
   const layout = getState().layouts.get(session);
   const first = leafPanes(layout)[0] ?? null;
   setState({ focusedPane: first });
+}
+
+// ── Event-driven lifecycle ───────────────────────────────────────────────────
+
+/**
+ * Remove a session from the store IMMEDIATELY (rail + layouts + active pointer)
+ * without waiting for the next `list_sessions` poll. Disposes any terminals and
+ * detaches any streams that belonged to it. If the removed session was active,
+ * switches to another (spawning a fresh one if none remain).
+ */
+async function removeSessionNow(session: string): Promise<void> {
+  const st = getState();
+  const wasActive = st.activeSession === session;
+
+  // Tear down terminals + streams for every leaf the session held.
+  for (const pane of leafPanes(st.layouts.get(session))) {
+    detachPaneStream(pane).catch(() => {
+      /* pane already gone — ignore */
+    });
+    disposePaneTerminal(pane);
+  }
+
+  // Drop from the session list and the layout cache in one atomic patch.
+  const sessions = st.sessions.filter((s) => s.id !== session);
+  const layouts = new Map(st.layouts);
+  layouts.delete(session);
+
+  if (wasActive) {
+    const next = sessions[0]?.id ?? null;
+    setState({
+      sessions,
+      layouts,
+      activeSession: next,
+      focusedPane: null,
+      zoomedPane: null,
+    });
+    if (next) {
+      await reloadSession(next);
+      focusFirstLeaf(next);
+    } else {
+      // No sessions remain — spawn a fresh one so the UI is never empty.
+      const { newSession } = await import("./actions");
+      await newSession();
+    }
+  } else {
+    setState({ sessions, layouts });
+  }
+}
+
+/**
+ * Apply a single daemon lifecycle event to the store, driving INSTANT updates
+ * (closed sessions vanish immediately, layouts reload on split/close, heat
+ * updates in place) rather than waiting for the periodic poll.
+ */
+export async function applyLifecycleEvent(ev: LifecycleEvent): Promise<void> {
+  switch (ev.kind) {
+    case "spawned": {
+      // A new pane/session appeared. Refresh the session list (so a brand-new
+      // session shows in the rail) and reload the affected session's layout.
+      await reloadSessions();
+      const session = ev.session ?? getState().activeSession;
+      if (session && getState().sessions.some((s) => s.id === session)) {
+        await reloadSession(session);
+      }
+      // If nothing was active yet, adopt the new session.
+      if (!getState().activeSession && session) {
+        setState({ activeSession: session });
+        await reloadSession(session);
+        focusFirstLeaf(session);
+      }
+      break;
+    }
+
+    case "closed": {
+      const pane = ev.pane;
+      if (pane) disposePaneTerminal(pane);
+
+      // Resolve which session the closed pane belonged to: prefer the event's
+      // own session, fall back to cached pane-state.
+      const session =
+        ev.session ?? (pane ? getState().paneStates.get(pane)?.session : undefined);
+
+      // Authoritative recount from the daemon.
+      await reloadSessions();
+      const live = getState().sessions.find((s) => s.id === session);
+
+      if (session && (!live || live.pane_count === 0)) {
+        // The session has no panes left — remove it from the rail NOW.
+        await removeSessionNow(session);
+      } else if (session) {
+        // Session survives but lost a pane — reload its layout so the leaf drops.
+        if (getState().activeSession === session) {
+          await reloadSession(session);
+          // Keep focus valid if the closed pane was focused.
+          if (getState().focusedPane === pane) focusFirstLeaf(session);
+        }
+      }
+      break;
+    }
+
+    case "layout_changed": {
+      const session = ev.session ?? getState().activeSession;
+      if (session && getState().sessions.some((s) => s.id === session)) {
+        await reloadSession(session);
+      }
+      break;
+    }
+
+    case "state_changed": {
+      // Heat changed for a pane. Update the cached pane-state in place and let
+      // the existing applyHeatInPlace path repaint without a structural render.
+      if (ev.pane && ev.state) {
+        const map = new Map(getState().paneStates);
+        const prev = map.get(ev.pane);
+        const next: PaneStateInfo = {
+          pane: ev.pane,
+          session: ev.session ?? prev?.session ?? getState().activeSession ?? "",
+          state: ev.state as PaneState,
+          title: prev?.title ?? null,
+        };
+        map.set(ev.pane, next);
+        applyHeatInPlace(map);
+        setState({ paneStates: map });
+      } else {
+        // Underspecified event — fall back to an authoritative pane-state poll.
+        await reloadPaneStates();
+      }
+      break;
+    }
+  }
 }

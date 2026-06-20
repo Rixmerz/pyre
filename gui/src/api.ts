@@ -11,6 +11,7 @@ import type {
   LayoutNode,
   PaneClosedPayload,
   PaneStateInfo,
+  PollEventsResult,
   PtyOutputPayload,
   SessionInfo,
   SplitOrient,
@@ -99,6 +100,17 @@ export const listThemes = (): Promise<ThemeMeta[]> => invoke("list_themes");
 
 export const getTheme = (name: string): Promise<ThemePalette> =>
   invoke("get_theme", { name });
+
+// ── Lifecycle events (long-poll) ─────────────────────────────────────────────
+/**
+ * Long-poll the daemon for lifecycle events after `afterSeq`. The daemon holds
+ * the request open until an event arrives or it times out, then returns a batch
+ * plus the new cursor (`last_seq`) to pass on the next call. A parallel agent
+ * implements the Rust `poll_events` command; if it is not yet registered this
+ * rejects, which the caller catches to fall back to the periodic poll.
+ */
+export const pollEvents = (afterSeq: number): Promise<PollEventsResult> =>
+  invoke("poll_events", { after_seq: afterSeq, afterSeq });
 
 // ── Events ──────────────────────────────────────────────────────────────────
 /** Subscribe to per-pane PTY output. The handler routes bytes by pane id. */

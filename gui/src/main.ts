@@ -16,11 +16,12 @@ import "@fontsource/jetbrains-mono/600.css";
 import "@fontsource/jetbrains-mono/700.css";
 import "./styles.css";
 
-import { daemonStatus, reconnect, onPaneClosed, onPtyClosedLegacy, onPtyOutput } from "./api";
+import { daemonStatus, pollEvents, reconnect, onPaneClosed, onPtyClosedLegacy, onPtyOutput } from "./api";
 import { getState, setState } from "./state";
 import { mountShell } from "./render/index";
 import { initThemes } from "./themes";
 import {
+  applyLifecycleEvent,
   reloadFocusedBlocks,
   reloadPaneStates,
   reloadSession,
@@ -35,6 +36,9 @@ import {
 } from "./terminals";
 
 const POLL_MS = 750;
+/** Backoff after a failed `poll_events` call so a missing/erroring command
+ *  doesn't spin a tight loop. The periodic poll keeps the UI fresh meanwhile. */
+const EVENT_POLL_BACKOFF_MS = 2000;
 /** Boot connection retries: the daemon socket may not be ready the instant the
  *  webview loads (startup race). Probe a handful of times before giving up. */
 const BOOT_RETRIES = 5;
@@ -45,8 +49,77 @@ const RECONNECT_POLL_MS = 3000;
 
 let reconnectTimer: number | null = null;
 
+// ── Event long-poll state ─────────────────────────────────────────────────────
+/** Cursor for `poll_events`; advances as we consume batches. */
+let eventSeq = 0;
+/** Guard so we never run two long-poll loops concurrently. */
+let eventLoopRunning = false;
+/** When false, the running loop exits at its next checkpoint. */
+let eventLoopActive = false;
+
 const sleep = (ms: number): Promise<void> =>
   new Promise((r) => window.setTimeout(r, ms));
+
+/**
+ * Event-driven lifecycle loop. Long-polls `poll_events(eventSeq)`; the daemon
+ * returns on the next event or a timeout. Each event is applied for an INSTANT
+ * UI update (dead sessions vanish, layouts reload, heat repaints) — the periodic
+ * `startPolling` loop stays as a fallback/refresh.
+ *
+ * Defensive by design: if `poll_events` is not yet implemented by the Rust
+ * bridge (parallel agent), the invoke rejects; we log once, back off, and keep
+ * looping so the app still works on the periodic poll alone. A drop in
+ * connectivity ends the loop until reconnect restarts it.
+ */
+async function runEventLoop(): Promise<void> {
+  if (eventLoopRunning) return;
+  eventLoopRunning = true;
+  eventLoopActive = true;
+  let warnedMissing = false;
+
+  while (eventLoopActive) {
+    if (!getState().connected) break;
+    try {
+      const res = await pollEvents(eventSeq);
+      // Reset the missing-command warning latch on a successful round-trip.
+      warnedMissing = false;
+      for (const ev of res.events) {
+        try {
+          await applyLifecycleEvent(ev);
+        } catch (err) {
+          console.error("[pyre-events] apply failed:", ev, err);
+        }
+      }
+      // Advance the cursor; tolerate a non-advancing/absent last_seq.
+      if (typeof res.last_seq === "number" && res.last_seq >= eventSeq) {
+        eventSeq = res.last_seq;
+      }
+    } catch (err) {
+      if (!warnedMissing) {
+        console.warn(
+          "[pyre-events] poll_events unavailable — falling back to periodic poll:",
+          err,
+        );
+        warnedMissing = true;
+      }
+      await sleep(EVENT_POLL_BACKOFF_MS);
+    }
+  }
+
+  eventLoopRunning = false;
+}
+
+/** Start the event loop if connected and not already running. */
+function startEventLoop(): void {
+  if (eventLoopRunning) return;
+  if (!getState().connected) return;
+  void runEventLoop();
+}
+
+/** Stop the event loop (e.g. on disconnect). */
+function stopEventLoop(): void {
+  eventLoopActive = false;
+}
 
 /** Probe the daemon once. Returns the status, never throws. */
 async function probe(): Promise<{ connected: boolean; socket: string }> {
@@ -92,6 +165,7 @@ async function boot(): Promise<void> {
 
   if (status.connected) {
     await loadInitial();
+    startEventLoop();
   } else {
     startReconnectPoll();
   }
@@ -145,7 +219,9 @@ export async function attemptReconnect(force: boolean): Promise<boolean> {
   if (connected) {
     stopReconnectPoll();
     await loadInitial();
+    startEventLoop();
   } else {
+    stopEventLoop();
     startReconnectPoll();
   }
   return connected;
@@ -184,8 +260,10 @@ async function wireEvents(): Promise<void> {
 function startPolling(): void {
   window.setInterval(() => {
     if (!getState().connected) {
-      // Dropped (or never connected): ensure the background reconnect poll is
-      // running so the UI self-heals when the daemon returns.
+      // Dropped (or never connected): stop the event loop and ensure the
+      // background reconnect poll is running so the UI self-heals when the
+      // daemon returns.
+      stopEventLoop();
       startReconnectPoll();
       return;
     }

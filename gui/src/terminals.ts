@@ -6,9 +6,23 @@
 
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { Unicode11Addon } from "@xterm/addon-unicode11";
+import { WebLinksAddon } from "@xterm/addon-web-links";
 import "@xterm/xterm/css/xterm.css";
 import { resizePane, sendKeys } from "./api";
 import { getState } from "./state";
+
+/**
+ * Font stack for the terminal. Resolved from the system at build time:
+ * `fc-list` confirmed a full "JetBrainsMono Nerd Font" is installed
+ * system-wide (the user runs starship/powerline), so we lead with the
+ * Nerd Font for powerline + dev-icon glyph coverage, fall back through
+ * plain JetBrains Mono, then an emoji font, then the platform monospace.
+ * The DOM renderer (the one we keep — no WebGL, NVIDIA/WebKit risk)
+ * honours this fallback chain glyph-by-glyph.
+ */
+const TERM_FONT_STACK =
+  '"JetBrainsMono Nerd Font", "Symbols Nerd Font Mono", "JetBrains Mono", "Noto Color Emoji", "Noto Sans Symbols 2", ui-monospace, monospace';
 
 interface PaneTerm {
   term: Terminal;
@@ -33,6 +47,63 @@ function readTermTheme(): Record<string, string> {
     cursorAccent: v("--surface-0", "#0b0c0e"),
     selectionBackground: v("--hairline", "#2c2f39"),
   };
+}
+
+/** Write text to the system clipboard, tolerating webview quirks. */
+async function writeClipboard(text: string): Promise<void> {
+  if (!text) return;
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (err) {
+    console.warn("[pyre-clip] clipboard write failed:", err);
+  }
+}
+
+/** Read text from the system clipboard (empty string on failure). */
+async function readClipboard(): Promise<string> {
+  try {
+    return await navigator.clipboard.readText();
+  } catch (err) {
+    console.warn("[pyre-clip] clipboard read failed:", err);
+    return "";
+  }
+}
+
+/**
+ * Custom key handler for copy/paste. Returns `false` to tell xterm we handled
+ * the event (so it is NOT also sent to the PTY), `true` to let xterm process it.
+ *
+ *  - Ctrl+Shift+C → copy current selection to clipboard.
+ *  - Ctrl+Shift+V → read clipboard, route bytes to the pane via send_keys.
+ *  - plain Ctrl+C (no Shift) → falls through untouched, preserving SIGINT.
+ */
+function keyHandler(e: KeyboardEvent, term: Terminal, pane: string): boolean {
+  if (e.type !== "keydown") return true;
+  if (!e.ctrlKey || !e.shiftKey || e.altKey || e.metaKey) return true;
+  const key = e.key.toLowerCase();
+
+  if (key === "c") {
+    const sel = term.getSelection();
+    if (sel) {
+      void writeClipboard(sel);
+      return false; // consumed — don't forward to PTY
+    }
+    // No selection: let Ctrl+Shift+C fall through (harmless) rather than eat it.
+    return true;
+  }
+
+  if (key === "v") {
+    void readClipboard().then((text) => {
+      if (!text) return;
+      const bytes = Array.from(new TextEncoder().encode(text));
+      void sendKeys(pane, bytes).catch((err) =>
+        console.error("[pyre-clip] paste send_keys failed:", pane, err),
+      );
+    });
+    return false; // consumed
+  }
+
+  return true;
 }
 
 /**
@@ -79,16 +150,43 @@ export function mountPaneTerminal(
   }
 
   const term = new Terminal({
-    fontFamily: '"JetBrains Mono", ui-monospace, monospace',
+    // allowProposedApi is REQUIRED for the Unicode11 addon's activeVersion
+    // switch below — without it xterm throws when you set unicode.activeVersion.
+    allowProposedApi: true,
+    fontFamily: TERM_FONT_STACK,
     fontSize: 12.5,
     lineHeight: 1.2,
     cursorBlink: true,
-    scrollback: 5000,
+    scrollback: 10000,
+    // Right-click selects the word under the cursor (terminal-app convention).
+    rightClickSelectsWord: true,
+    // Slightly smoother wheel scroll without flooding the PTY.
+    scrollSensitivity: 3,
+    // Keep mouse reporting ON so apps (vim, tmux, etc.) receive mouse events;
+    // xterm only swallows the wheel for its own scrollback when the app has NOT
+    // requested mouse tracking, which is exactly the behaviour we want.
     theme: readTermTheme(),
   });
   const fit = new FitAddon();
   term.loadAddon(fit);
+
+  // Unicode 11 width tables: fixes wide-char / emoji / CJK column width so the
+  // cursor stays aligned with what the shell thinks it printed (the desync that
+  // made powerline separators and emoji shove the cursor off by a cell).
+  const unicode11 = new Unicode11Addon();
+  term.loadAddon(unicode11);
+  term.unicode.activeVersion = "11";
+
+  // Clickable URLs. Open via the default handler (Tauri intercepts http(s) and
+  // routes to the system browser); falls back to window.open in plain vite dev.
+  term.loadAddon(new WebLinksAddon());
+
   term.open(el);
+
+  // Copy/paste keymap. xterm's default keymap would let Ctrl+Shift+C/V fall
+  // through to the PTY; intercept them here and keep plain Ctrl+C (SIGINT)
+  // working by only acting on the Shift-modified chords.
+  term.attachCustomKeyEventHandler((e) => keyHandler(e, term, pane));
 
   entry = { term, fit, el, session };
   terms.set(pane, entry);
@@ -105,6 +203,15 @@ export function mountPaneTerminal(
       .catch((err) => {
         console.error("[pyre-input] send_keys FAILED", pane, err); // (e-err)
       });
+  });
+
+  // Copy-on-select: mirror the common terminal convention where a mouse
+  // selection lands on the clipboard immediately (so Ctrl+Shift+V / middle
+  // paste elsewhere just works). Cheap and non-destructive — only fires when a
+  // non-empty selection exists.
+  term.onSelectionChange(() => {
+    const sel = term.getSelection();
+    if (sel) void writeClipboard(sel);
   });
 
   // When the terminal is resized (cols/rows change), tell the daemon so the

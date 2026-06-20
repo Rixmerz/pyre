@@ -767,6 +767,80 @@ async fn search_blocks(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Commands: event long-poll
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One pane lifecycle event serialized for the frontend.
+///
+/// `kind` is one of: "spawned", "closed", "state_changed", "layout_changed".
+/// `pane` is the UUID string of the affected pane (always present).
+/// `session` is always null — `PaneEvent` does not carry a session id.
+/// `state` is the lowercase PaneStateKind string (null when absent).
+#[derive(Serialize)]
+pub struct PaneEventDto {
+    pub kind: &'static str,
+    pub pane: String,
+    pub session: Option<String>,
+    pub state: Option<String>,
+}
+
+/// Response from `poll_events`.
+#[derive(Serialize)]
+pub struct EventsDto {
+    pub events: Vec<PaneEventDto>,
+    pub last_seq: u64,
+}
+
+fn pane_event_kind_label(kind: &pyre_proto::PaneEventKind) -> &'static str {
+    use pyre_proto::PaneEventKind;
+    match kind {
+        PaneEventKind::Spawned => "spawned",
+        PaneEventKind::Closed => "closed",
+        PaneEventKind::StateChanged => "state_changed",
+        PaneEventKind::LayoutChanged => "layout_changed",
+    }
+}
+
+/// Long-poll for pane lifecycle events from the daemon ring buffer.
+///
+/// Returns all events whose `seq` is strictly greater than `after_seq`,
+/// waiting up to 2000 ms for at least one event to arrive. Returns an
+/// empty events list on timeout — the caller should loop passing `last_seq`
+/// back as `after_seq` on the next call.
+///
+/// On daemon error returns a clean `Err(String)` so the frontend can fall
+/// back gracefully without a JS exception.
+#[tauri::command]
+async fn poll_events(
+    state: State<'_, AppState>,
+    after_seq: u64,
+) -> Result<EventsDto, String> {
+    let client = {
+        let mut guard = state.inner.lock().await;
+        ensure_client(&mut guard).await?
+    };
+    let raw = client
+        .next_pane_event(tarpc::context::current(), after_seq, 2000)
+        .await
+        .map_err(|e| format!("poll_events transport error: {e}"))?
+        .map_err(|e| format!("poll_events daemon error: {e}"))?;
+
+    let last_seq = raw.iter().map(|e| e.seq).max().unwrap_or(after_seq);
+
+    let events = raw
+        .iter()
+        .map(|e| PaneEventDto {
+            kind: pane_event_kind_label(&e.kind),
+            pane: e.pane_id.0.to_string(),
+            session: None,
+            state: e.state.as_ref().map(|s| pane_state_label(s).to_string()),
+        })
+        .collect();
+
+    Ok(EventsDto { events, last_seq })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Commands: themes (no daemon call — pure registry lookup)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -918,6 +992,8 @@ pub fn run() {
             attach_pane_stream,
             detach_pane_stream,
             send_keys,
+            // events
+            poll_events,
             // blocks
             list_blocks,
             block_stdout,
