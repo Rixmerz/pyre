@@ -19,8 +19,8 @@ use futures::StreamExt;
 use pyre_proto::{
     blocks::{ListBlocksReq, SearchBlocksReq},
     layout::{LayoutNode, Orient},
-    OpenPaneSplitReq, OutputFrame, PaneId, PyreDaemonClient, ResizePaneReq, SessionId, SpawnReq,
-    SpawnResp,
+    OpenPaneReq, OpenPaneSplitReq, OutputFrame, PaneId, PyreDaemonClient, ResizePaneReq,
+    SessionId, SpawnReq, SpawnResp,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -582,6 +582,43 @@ async fn open_split(
     })
 }
 
+/// Open a standalone pane in a session WITHOUT modifying the layout tree.
+///
+/// Unlike `open_split` (which creates a sibling in the split topology), this
+/// calls the daemon's `open_pane` RPC which spawns a pane and registers it
+/// in the session as an orphaned/standalone pane.  Returns the new `PaneId`
+/// as a UUID string.
+#[tauri::command]
+async fn open_pane(
+    state: State<'_, AppState>,
+    session: String,
+    cols: Option<u16>,
+    rows: Option<u16>,
+) -> Result<OpenPaneDto, String> {
+    let sid = parse_session(&session)?;
+    let req = OpenPaneReq {
+        session: sid,
+        shell: None,
+        cwd: std::env::current_dir().ok(),
+        cols: cols.unwrap_or(80),
+        rows: rows.unwrap_or(24),
+        env: std::env::vars().collect(),
+        name: None,
+    };
+    let client = {
+        let mut guard = state.inner.lock().await;
+        ensure_client(&mut guard).await?
+    };
+    let new_pane = client
+        .open_pane(tarpc::context::current(), req)
+        .await
+        .map_err(|e| format!("open_pane transport error: {e}"))?
+        .map_err(|e| format!("open_pane daemon error: {e}"))?;
+    Ok(OpenPaneDto {
+        pane: new_pane.0.to_string(),
+    })
+}
+
 #[tauri::command]
 async fn set_weight(
     state: State<'_, AppState>,
@@ -1066,6 +1103,7 @@ pub fn run() {
             // layout
             session_layout,
             open_split,
+            open_pane,
             set_weight,
             // streams
             attach_pane_stream,

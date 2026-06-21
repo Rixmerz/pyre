@@ -23,6 +23,8 @@ export const ICON = {
   plus: svg(`<path d="M8 3v10M3 8h10"/>`),
   splitRight: svg(`<rect x="2" y="2.5" width="12" height="11" rx="1"/><path d="M8 2.5v11"/>`),
   splitDown: svg(`<rect x="2" y="2.5" width="12" height="11" rx="1"/><path d="M2 8h12"/>`),
+  // ⊞ — the split-layout tab mark: a framed box quartered into panes.
+  split: svg(`<rect x="2" y="2.5" width="12" height="11" rx="1"/><path d="M8 2.5v11M2 8h12"/>`),
   zoom: svg(`<path d="M3 6V3h3M13 6V3h-3M3 10v3h3M13 10v3h-3"/>`),
   close: svg(`<path d="M4 4l8 8M12 4l-8 8"/>`),
   search: svg(`<circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5 14 14"/>`),

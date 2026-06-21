@@ -19,10 +19,17 @@
 
 import { h, replaceChildren } from "./dom";
 import { icon } from "./icons";
-import { getState, paneStateOf } from "../state";
+import {
+  getState,
+  paneStateOf,
+  sessionTabs,
+  activeTabOf,
+  SPLIT_TAB,
+} from "../state";
 import { heatVar, pulses, stateLabel } from "../heat";
 import {
   closePaneAction,
+  closeStandalonePane,
   focusPane,
   newSession,
   splitDown,
@@ -40,17 +47,26 @@ function firstLeaf(node: LayoutNode): string {
   return node.kind === "leaf" ? node.pane : firstLeaf(node.children[0]!);
 }
 
-/** Canonical string of all leaf pane ids in render order + structural metadata. */
+/**
+ * Canonical string of the rendered structure: layout tree + the standalone pane
+ * set + the active tab + zoom/focus. Changes to ANY of these force a structural
+ * re-render; a heat-only tick (same structure) skips it so xterms survive.
+ */
 function layoutFingerprint(
   layout: LayoutNode | undefined,
+  standalone: string[],
+  activeTab: string,
   zoomedPane: string | null,
   focusedPane: string | null,
   connected: boolean,
 ): string {
   if (!connected) return "__disconnected__";
   if (!layout) return "__no-layout__";
-  if (zoomedPane) return `zoom:${zoomedPane}:focus:${focusedPane ?? ""}`;
-  return `tree:${fingerprintNode(layout)}:focus:${focusedPane ?? ""}`;
+  const tabsFp = `tabs:[${standalone.join(",")}]:active:${activeTab}`;
+  if (zoomedPane) {
+    return `zoom:${zoomedPane}:focus:${focusedPane ?? ""}:${tabsFp}`;
+  }
+  return `tree:${fingerprintNode(layout)}:focus:${focusedPane ?? ""}:${tabsFp}`;
 }
 
 function fingerprintNode(node: LayoutNode): string {
@@ -64,14 +80,27 @@ let lastFingerprint = "";
 
 export function renderCenter(root: HTMLElement): void {
   const s = getState();
-  const layout = s.activeSession ? s.layouts.get(s.activeSession) : undefined;
+  const session = s.activeSession;
+  const layout = session ? s.layouts.get(session) : undefined;
+  const tabs = session ? sessionTabs(session) : [{ kind: "split" as const }];
+  const activeTab = activeTabOf(session);
+  const standalone = tabs
+    .filter((t): t is { kind: "pane"; pane: string } => t.kind === "pane")
+    .map((t) => t.pane);
 
-  const fp = layoutFingerprint(layout, s.zoomedPane, s.focusedPane, s.connected);
+  const fp = layoutFingerprint(
+    layout,
+    standalone,
+    activeTab,
+    s.zoomedPane,
+    s.focusedPane,
+    s.connected,
+  );
 
   if (fp === lastFingerprint) {
-    // Layout structure, focus, and zoom are all unchanged.
-    // Heat/state updates are applied in-place by session-ops.ts — skip the
-    // full tear-down to prevent xterm re-parenting and focus-blur.
+    // Structure, tabs, focus, and zoom are all unchanged. Heat/state updates are
+    // applied in-place by session-ops.ts — skip the full tear-down to prevent
+    // xterm re-parenting and focus-blur.
     dlog("[pyre-render] skip structural re-render — fingerprint unchanged");
     return;
   }
@@ -101,14 +130,35 @@ export function renderCenter(root: HTMLElement): void {
     return;
   }
 
-  // Zoom: render only the zoomed pane full-bleed.
-  if (s.zoomedPane) {
-    const leaf: LayoutNode = { kind: "leaf", pane: s.zoomedPane };
-    replaceChildren(root, renderNode(leaf));
-    return;
+  // Render EVERY tab's view into the pane area; only the active tab's view is
+  // visible (display:block), the rest are display:none. This keeps hidden tabs'
+  // terminals mounted and buffering output rather than disposing on switch.
+  const views: HTMLElement[] = [];
+
+  // Split tab view — the recursive layout tree (or the zoomed pane full-bleed).
+  const splitActive = activeTab === SPLIT_TAB;
+  const splitInner = s.zoomedPane && splitActive
+    ? renderNode({ kind: "leaf", pane: s.zoomedPane })
+    : renderNode(layout);
+  views.push(tabView(SPLIT_TAB, splitActive, splitInner));
+
+  // One full-area pane card per standalone pane tab.
+  for (const pane of standalone) {
+    const active = activeTab === pane;
+    views.push(tabView(pane, active, standalonePaneCard(pane)));
   }
 
-  replaceChildren(root, renderNode(layout));
+  replaceChildren(root, ...views);
+}
+
+/** Wrap a tab's content in a view container that's only shown when active. */
+function tabView(key: string, active: boolean, inner: HTMLElement): HTMLElement {
+  const view = h("div", { class: "tab-view", "data-tab": key });
+  // display:none (not removal) so hidden tabs keep their mounted xterms alive
+  // and buffering output. The active view fills the pane area via flex.
+  view.style.display = active ? "flex" : "none";
+  view.appendChild(inner);
+  return view;
 }
 
 function renderNode(node: LayoutNode): HTMLElement {
@@ -237,7 +287,14 @@ function divider(
   return handle;
 }
 
-function renderLeaf(pane: string): HTMLElement {
+/** A single full-area pane card for a STANDALONE pane (its own tab). Reuses the
+ *  same card + xterm mount as a split leaf, minus the split-toolbar buttons; its
+ *  close routes to closeStandalonePane so the tab (not a layout leaf) is removed. */
+function standalonePaneCard(pane: string): HTMLElement {
+  return renderLeaf(pane, true);
+}
+
+function renderLeaf(pane: string, standalone = false): HTMLElement {
   const s = getState();
   const info = paneStateOf(pane);
   const state: PaneState = info?.state ?? "idle";
@@ -279,18 +336,28 @@ function renderLeaf(pane: string): HTMLElement {
       agent,
     ),
     h("span", { class: "pane-state-label" }, stateLabel(state)),
-    h(
-      "div",
-      { class: "pane-toolbar" },
-      toolBtn("Split down", icon("splitDown"), () => void splitDown(pane)),
-      toolBtn("Split right", icon("splitRight"), () => void splitRight(pane)),
-      toolBtn(
-        s.zoomedPane === pane ? "Restore" : "Zoom",
-        icon("zoom"),
-        () => zoomPane(pane),
-      ),
-      toolBtn("Close pane", icon("close"), () => void closePaneAction(pane)),
-    ),
+    // Standalone panes are a single full-area terminal (not splittable for now):
+    // their toolbar drops the split buttons and routes close to the tab path.
+    standalone
+      ? h(
+          "div",
+          { class: "pane-toolbar" },
+          toolBtn("Close pane", icon("close"), () =>
+            void closeStandalonePane(pane),
+          ),
+        )
+      : h(
+          "div",
+          { class: "pane-toolbar" },
+          toolBtn("Split down", icon("splitDown"), () => void splitDown(pane)),
+          toolBtn("Split right", icon("splitRight"), () => void splitRight(pane)),
+          toolBtn(
+            s.zoomedPane === pane ? "Restore" : "Zoom",
+            icon("zoom"),
+            () => zoomPane(pane),
+          ),
+          toolBtn("Close pane", icon("close"), () => void closePaneAction(pane)),
+        ),
   );
 
   const body = h("div", { class: "pane-body" });

@@ -24,6 +24,14 @@ export interface AppState {
   // Layout & live data (keyed by session / pane)
   layouts: Map<string, LayoutNode>;
   paneStates: Map<string, PaneStateInfo>;
+
+  /**
+   * Active tab per session. A session has tab 0 = "split" (the layout tree) plus
+   * one tab per STANDALONE pane (a pane in `paneStates` for the session that is
+   * NOT a leaf of its layout tree — see open_pane in api.ts). The value is the
+   * sentinel "split" or a standalone paneId. Defaults to "split" when absent.
+   */
+  activeTab: Map<string, string>;
   blocks: Block[]; // blocks for the focused pane, newest-first
   blocksLoading: boolean;
 
@@ -56,6 +64,7 @@ const state: AppState = {
   zoomedPane: null,
   layouts: new Map(),
   paneStates: new Map(),
+  activeTab: new Map(),
   blocks: [],
   blocksLoading: false,
   blockQuery: "",
@@ -121,4 +130,52 @@ export function activeSessionInfo(): SessionInfo | undefined {
 /** Total live pane count across all known sessions. */
 export function totalPaneCount(): number {
   return state.paneStates.size;
+}
+
+// ── Tab model ────────────────────────────────────────────────────────────────
+// A session's tabs = the "split" tab (its layout tree) + one tab per standalone
+// pane. Standalone = a pane in `paneStates` for the session that is NOT a leaf of
+// the session's layout tree. These helpers are pure (read-only over the store) so
+// the render + keybind layers can compute the tab strip without re-deriving it.
+
+/** Sentinel value for the split-layout tab. */
+export const SPLIT_TAB = "split" as const;
+
+/** One tab in a session: the split tree, or a single standalone pane. */
+export type SessionTab =
+  | { kind: "split" }
+  | { kind: "pane"; pane: string };
+
+/** Collect every leaf pane id of a layout tree, in render order (inlined here to
+ *  avoid a circular import with session-ops.ts). */
+function layoutLeaves(node: LayoutNode | undefined): string[] {
+  if (!node) return [];
+  if (node.kind === "leaf") return [node.pane];
+  return node.children.flatMap(layoutLeaves);
+}
+
+/** The standalone pane ids for a session (pane_states minus layout leaves),
+ *  ordered by their position in pane_states for a stable strip order. */
+export function standalonePanes(session: string): string[] {
+  const layoutLeafSet = new Set(layoutLeaves(state.layouts.get(session)));
+  const out: string[] = [];
+  for (const ps of state.paneStates.values()) {
+    if (ps.session === session && !layoutLeafSet.has(ps.pane)) out.push(ps.pane);
+  }
+  return out;
+}
+
+/** The ordered tab list for a session: [split, ...standalone panes]. */
+export function sessionTabs(session: string): SessionTab[] {
+  const tabs: SessionTab[] = [{ kind: "split" }];
+  for (const pane of standalonePanes(session)) {
+    tabs.push({ kind: "pane", pane });
+  }
+  return tabs;
+}
+
+/** The active tab key for a session — defaults to the split tab. */
+export function activeTabOf(session: string | null): string {
+  if (!session) return SPLIT_TAB;
+  return state.activeTab.get(session) ?? SPLIT_TAB;
 }

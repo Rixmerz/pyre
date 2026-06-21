@@ -63,6 +63,24 @@ export const openSplit = (
   orient: SplitOrient,
 ): Promise<{ pane: string }> => invoke("open_split", { pane, direction: orient });
 
+/**
+ * Open a STANDALONE pane in a session — a pane that exists in `pane_states` but
+ * is NOT inserted into the session's split-layout tree (see the daemon model:
+ * `open_pane` leaves `session.layout` untouched on an existing layout). The GUI
+ * surfaces each such pane as its own tab.
+ *
+ * A parallel Rust agent implements the `open_pane` command; callers wire it
+ * DEFENSIVELY — if the command is missing or the daemon predates it, the promise
+ * rejects, the caller catches + dlogs, and the tab strip stays intact (the `+`
+ * pill simply does nothing rather than crashing the UI).
+ */
+export const openPane = (
+  session: string,
+  cols = 80,
+  rows = 24,
+): Promise<{ pane: string }> =>
+  invoke("open_pane", { session, cols, rows });
+
 export const setWeight = (pane: string, weight: number): Promise<void> =>
   invoke("set_weight", { pane, weight });
 

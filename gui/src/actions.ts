@@ -6,13 +6,19 @@ import {
   closePane,
   closeSession,
   detachPaneStream,
+  openPane,
   openSplit,
   renameSession,
   searchBlocks,
   sendKeys,
   spawnSession,
 } from "./api";
-import { getState, setState } from "./state";
+import {
+  getState,
+  setState,
+  SPLIT_TAB,
+  activeTabOf,
+} from "./state";
 import {
   disposePaneTerminal,
   focusPaneTerminal,
@@ -23,6 +29,7 @@ import {
   leafPanes,
   reloadSession,
   reloadSessions,
+  reloadPaneStates,
   focusFirstLeaf,
 } from "./session-ops";
 import { dlog } from "./debug";
@@ -224,6 +231,83 @@ export function focusPane(pane: string): void {
   focusPaneTerminal(pane);
 }
 
+// ── Tab actions (split tab + standalone panes) ────────────────────────────────
+
+/** Switch the active session's tab. `tab` is SPLIT_TAB or a standalone paneId. */
+export function switchTab(tab: string): void {
+  const session = getState().activeSession;
+  if (!session) return;
+  const activeTab = new Map(getState().activeTab);
+  activeTab.set(session, tab);
+  setState({ activeTab });
+  if (tab === SPLIT_TAB) {
+    // Returning to the split tab: focus its first leaf so keystrokes route.
+    focusFirstLeaf(session);
+  } else {
+    // A standalone pane tab is a single full-area pane — focus it directly.
+    focusPane(tab);
+  }
+  // The center render mounts the tab's terminal(s); refit once it settles.
+  requestAnimationFrame(() => refitAll());
+}
+
+/**
+ * Open a NEW standalone pane in the active session and switch to its tab. Wired
+ * DEFENSIVELY: if the daemon lacks `open_pane` the invoke rejects, we catch +
+ * dlog, and the tab strip is unaffected (the `+` pill simply did nothing).
+ */
+export async function newPaneAction(): Promise<void> {
+  const session = getState().activeSession;
+  if (!session) return;
+  dlog("[pyre-tab] new-pane: start session=", session);
+  try {
+    const res = await openPane(session, 80, 24);
+    const pane = res.pane;
+    dlog("[pyre-tab] new-pane: daemon pane=", pane);
+    // Refresh pane_states so the new standalone pane is known, then refresh the
+    // session layout + streams (covers the standalone set too). The lifecycle
+    // "spawned" event will also fire, but we update eagerly for instant feedback.
+    await reloadPaneStates();
+    await reloadSession(session);
+    switchTab(pane);
+  } catch (err) {
+    // open_pane not implemented yet (parallel agent) — degrade gracefully.
+    dlog("[pyre-tab] new-pane: open_pane unavailable, no-op:", err);
+  }
+}
+
+/**
+ * Close a standalone pane tab. Kills the pane on the daemon, disposes its
+ * terminal, and — if it was the active tab — falls back to the split tab.
+ */
+export async function closeStandalonePane(pane: string): Promise<void> {
+  const session = getState().activeSession;
+  try {
+    await closePane(pane);
+  } catch (err) {
+    console.error("close_pane (standalone) failed:", pane, err);
+  }
+  disposePaneTerminal(pane);
+  detachPaneStream(pane).catch(() => {
+    /* pane already gone — ignore */
+  });
+
+  // If this was the active tab, return to the split tab (the safe default).
+  if (session && activeTabOf(session) === pane) {
+    const activeTab = new Map(getState().activeTab);
+    activeTab.set(session, SPLIT_TAB);
+    setState({ activeTab });
+    focusFirstLeaf(session);
+  }
+
+  // Authoritative refresh so the closed pane drops from pane_states + the strip.
+  await reloadPaneStates();
+  if (session && getState().sessions.some((s) => s.id === session)) {
+    await reloadSession(session);
+  }
+  refitAll();
+}
+
 // ── Block panel actions ─────────────────────────────────────────────────────
 
 export async function runBlockSearch(query: string): Promise<void> {
@@ -339,6 +423,12 @@ export function buildCommands(): Command[] {
   const s = getState();
   const cmds: Command[] = [
     { id: "new-session", title: "New session", hint: "spawn", run: newSession },
+    {
+      id: "new-pane",
+      title: "New pane in this session",
+      hint: "Ctrl+Shift+T",
+      run: () => newPaneAction(),
+    },
     {
       id: "split-right",
       title: "Split right",

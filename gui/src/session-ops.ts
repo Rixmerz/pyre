@@ -10,7 +10,7 @@ import {
   paneStates,
   sessionLayout,
 } from "./api";
-import { getState, setState } from "./state";
+import { getState, setState, standalonePanes, SPLIT_TAB } from "./state";
 import { disposePaneTerminal, mountedPanes } from "./terminals";
 import { maybeNotifyTransition, forgetPane } from "./notify";
 import { dlog } from "./debug";
@@ -72,15 +72,24 @@ export async function reloadSession(session: string): Promise<void> {
   }
 }
 
-/** Attach a stream for every leaf pane that doesn't already have a terminal. */
+/**
+ * Attach a stream for every pane of the session that doesn't already have a
+ * terminal — BOTH the layout-tree leaves AND the standalone panes (the ones
+ * surfaced as their own tabs). A standalone pane lives in `paneStates` for the
+ * session but is not a leaf of the layout tree; without this its tab would mount
+ * a terminal that never receives output.
+ */
 async function ensureStreams(
   session: string,
   layout: LayoutNode,
 ): Promise<void> {
   const live = mountedPanes();
   const leaves = leafPanes(layout);
+  const standalone = standalonePanes(session);
+  // De-dupe (a pane can only be in one set, but be defensive).
+  const all = [...new Set([...leaves, ...standalone])];
   await Promise.all(
-    leaves
+    all
       .filter((pane) => !live.has(pane))
       .map((pane) =>
         attachPaneStream(session, pane).catch((err) =>
@@ -244,24 +253,33 @@ async function removeSessionNow(session: string): Promise<void> {
   const st = getState();
   const wasActive = st.activeSession === session;
 
-  // Tear down terminals + streams for every leaf the session held.
-  for (const pane of leafPanes(st.layouts.get(session))) {
+  // Tear down terminals + streams for every pane the session held — both layout
+  // leaves AND standalone (tabbed) panes — so nothing lingers.
+  const panes = new Set([
+    ...leafPanes(st.layouts.get(session)),
+    ...standalonePanes(session),
+  ]);
+  for (const pane of panes) {
     detachPaneStream(pane).catch(() => {
       /* pane already gone — ignore */
     });
     disposePaneTerminal(pane);
   }
 
-  // Drop from the session list and the layout cache in one atomic patch.
+  // Drop from the session list, the layout cache, and the per-session active-tab
+  // map in one atomic patch.
   const sessions = st.sessions.filter((s) => s.id !== session);
   const layouts = new Map(st.layouts);
   layouts.delete(session);
+  const activeTab = new Map(st.activeTab);
+  activeTab.delete(session);
 
   if (wasActive) {
     const next = sessions[0]?.id ?? null;
     setState({
       sessions,
       layouts,
+      activeTab,
       activeSession: next,
       focusedPane: null,
       zoomedPane: null,
@@ -275,8 +293,26 @@ async function removeSessionNow(session: string): Promise<void> {
       await newSession();
     }
   } else {
-    setState({ sessions, layouts });
+    setState({ sessions, layouts, activeTab });
   }
+}
+
+/**
+ * If a session's active tab points at a standalone pane that no longer exists
+ * (closed), fall back to the split tab so the center never renders a dead pane.
+ * Returns true if the active tab was reset.
+ */
+function reconcileActiveTab(session: string): boolean {
+  const active = getState().activeTab.get(session);
+  if (!active || active === SPLIT_TAB) return false;
+  // The active tab is a standalone pane id — still present?
+  const stillThere = standalonePanes(session).includes(active);
+  if (stillThere) return false;
+  const activeTab = new Map(getState().activeTab);
+  activeTab.set(session, SPLIT_TAB);
+  setState({ activeTab });
+  if (getState().activeSession === session) focusFirstLeaf(session);
+  return true;
 }
 
 /**
@@ -288,8 +324,11 @@ export async function applyLifecycleEvent(ev: LifecycleEvent): Promise<void> {
   switch (ev.kind) {
     case "spawned": {
       // A new pane/session appeared. Refresh the session list (so a brand-new
-      // session shows in the rail) and reload the affected session's layout.
+      // session shows in the rail) and pane_states (so a new STANDALONE pane is
+      // known before ensureStreams runs), then reload the affected session's
+      // layout — which also attaches streams for the standalone set.
       await reloadSessions();
+      await reloadPaneStates();
       const session = ev.session ?? getState().activeSession;
       if (session && getState().sessions.some((s) => s.id === session)) {
         await reloadSession(session);
@@ -323,11 +362,20 @@ export async function applyLifecycleEvent(ev: LifecycleEvent): Promise<void> {
         // The session has no panes left — remove it from the rail NOW.
         await removeSessionNow(session);
       } else if (session) {
-        // Session survives but lost a pane — reload its layout so the leaf drops.
+        // Session survives but lost a pane. Refresh pane_states first so the
+        // standalone set is current, then reload the layout. A standalone pane
+        // closing leaves the layout tree unchanged but must drop its tab.
+        await reloadPaneStates();
         if (getState().activeSession === session) {
           await reloadSession(session);
-          // Keep focus valid if the closed pane was focused.
-          if (getState().focusedPane === pane) focusFirstLeaf(session);
+          // If the active tab pointed at the closed standalone pane, fall back to
+          // the split tab; otherwise keep focus valid if the closed pane was it.
+          if (!reconcileActiveTab(session) && getState().focusedPane === pane) {
+            focusFirstLeaf(session);
+          }
+        } else {
+          // Inactive session lost a standalone pane — still reconcile its tab.
+          reconcileActiveTab(session);
         }
       }
       break;

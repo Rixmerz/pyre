@@ -20,6 +20,7 @@
 import { getState, setState } from "./state";
 import {
   closePaneAction,
+  newPaneAction,
   newSession,
   splitDown,
   splitRight,
@@ -57,6 +58,7 @@ export const KEYBIND_GROUPS: KeyGroup[] = [
   {
     title: "Panes",
     rows: [
+      { keys: "Ctrl + Shift + T", desc: "New pane in this session" },
       { keys: "Ctrl + Shift + E", desc: "Split right" },
       { keys: "Ctrl + Shift + O", desc: "Split down" },
       { keys: "Ctrl + Shift + Z", desc: "Zoom pane (toggle)" },
@@ -152,6 +154,11 @@ function onKeyDown(e: KeyboardEvent): void {
   // ── Pane management: Ctrl+Shift+<key> ───────────────────────────────────
   if (e.shiftKey) {
     switch (e.key.toLowerCase()) {
+      case "t":
+        // New STANDALONE pane in the active session (its own tab) + switch to it.
+        e.preventDefault();
+        void newPaneAction();
+        return;
       case "e":
         e.preventDefault();
         void splitRight(null);

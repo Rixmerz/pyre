@@ -365,16 +365,164 @@ button {
   min-height: 0;
   /* The center is a grid item in the `1fr` shell row; align-stretch gives it
      the row height. height:100% pins that height explicitly so the flex chain
-     below always has a concrete box to divide, even before layout settles. */
+     below always has a concrete box to divide, even before layout settles.
+     It now stacks the tab strip over the pane area (column). */
   height: 100%;
   padding: 10px;
   background: var(--surface-0);
   display: flex;
+  flex-direction: column;
+  gap: 8px;
   overflow: hidden;
 }
-/* The split tree must fill the whole center, not just its content height. */
-.center > .split,
-.center > .pane-card {
+
+/* ── Tab strip ─────────────────────────────────────────────────────────────
+   Disciplined chrome — quiet pills, NOT a bold element. The signature stays the
+   heat; the strip is restraint. A thin fixed-height row above the pane area. */
+.tabstrip {
+  flex: 0 0 auto;
+  min-height: 0;
+}
+.tabstrip:not(.has-strip) {
+  display: none;
+}
+.tabstrip-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+.tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  /* >=24px hit target (WCAG 2.5.8) via padding without inflating the visual. */
+  min-height: 24px;
+  padding: 3px 9px;
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--fg-muted);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.4;
+  white-space: nowrap;
+  flex: 0 0 auto;
+  position: relative;
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+.tab:hover {
+  background: var(--surface-1);
+  color: var(--fg);
+}
+.tab.active {
+  color: var(--fg);
+  background: var(--surface-1);
+  border-color: var(--hairline);
+}
+/* The active pill carries a quiet ember underline — the only "heat" the strip
+   spends, so it reads as a focus cue, not a loud accent. */
+.tab.active::after {
+  content: "";
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: -1px;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--ember);
+  box-shadow: 0 0 7px color-mix(in srgb, var(--ember) 45%, transparent);
+}
+.tab-icon,
+.tab-add-icon {
+  display: inline-flex;
+  color: var(--fg-faint);
+}
+.tab.active .tab-icon {
+  color: var(--ember);
+}
+.tab-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 14ch;
+}
+.tab-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--dot-heat, var(--heat-idle));
+  box-shadow: 0 0 6px color-mix(in srgb, var(--dot-heat, #888) 65%, transparent);
+  flex: 0 0 auto;
+}
+.tab.pulse .tab-dot {
+  /* keyed to --dot-heat (not --heat) so the pulse reads the dot's own color. */
+  animation: tab-dot-pulse 1.4s ease-in-out infinite;
+}
+@keyframes tab-dot-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 5px color-mix(in srgb, var(--dot-heat, #888) 55%, transparent);
+  }
+  50% {
+    box-shadow: 0 0 11px color-mix(in srgb, var(--dot-heat, #888) 85%, transparent);
+  }
+}
+/* The × on a standalone-pane pill appears on hover/active (kept discoverable but
+   quiet); on hover it warms to the crashed/error heat so its intent is clear. */
+.tab-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  margin: 0 -3px 0 1px;
+  border-radius: 4px;
+  color: var(--fg-faint);
+  opacity: 0;
+  transition: opacity 0.12s ease, background 0.12s ease, color 0.12s ease;
+}
+.tab-pane:hover .tab-close,
+.tab-pane.active .tab-close,
+.tab-close:focus-visible {
+  opacity: 1;
+}
+.tab-close:hover {
+  background: color-mix(in srgb, var(--heat-crashed) 18%, transparent);
+  color: var(--heat-crashed);
+}
+/* The "+" pill — the one ember-tinted affordance, sized like a tab. */
+.tab-add {
+  color: var(--fg-faint);
+  padding: 3px 7px;
+}
+.tab-add:hover {
+  background: color-mix(in srgb, var(--ember) 14%, transparent);
+  color: var(--ember);
+  border-color: color-mix(in srgb, var(--ember) 40%, transparent);
+}
+
+/* ── Pane area (the body renderCenter owns) ──────────────────────────────── */
+.pane-area {
+  position: relative;
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  overflow: hidden;
+}
+/* Each tab's view fills the pane area; only the active one is display:flex
+   (inline style in center.ts), the rest are display:none so their xterms stay
+   mounted and keep buffering output. */
+.tab-view {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+}
+/* The split tree / standalone card must fill the whole pane area, not just its
+   content height. */
+.pane-area > .tab-view > .split,
+.pane-area > .tab-view > .pane-card {
   flex: 1 1 0;
   min-width: 0;
   min-height: 0;
@@ -977,6 +1125,9 @@ button {
   .pane-card.pulse {
     animation: none;
     box-shadow: 0 0 0 1px color-mix(in srgb, var(--heat) 70%, transparent);
+  }
+  .tab.pulse .tab-dot {
+    animation: none;
   }
   .spin {
     animation: none;

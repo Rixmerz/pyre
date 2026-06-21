@@ -5,6 +5,7 @@ import { getState, subscribe } from "../state";
 import { renderTopbar } from "./topbar";
 import { renderRail } from "./rail";
 import { renderCenter } from "./center";
+import { renderTabs } from "./tabs";
 import { renderBlocks } from "./blocks";
 import { renderStatusbar } from "./statusbar";
 import { renderPalette, resetPalette, handlePaletteKey } from "./palette";
@@ -16,6 +17,8 @@ interface Regions {
   topbar: HTMLElement;
   rail: HTMLElement;
   center: HTMLElement;
+  tabs: HTMLElement;
+  paneArea: HTMLElement;
   right: HTMLElement;
   statusbar: HTMLElement;
   palette: HTMLElement;
@@ -33,7 +36,16 @@ export function mountShell(app: HTMLElement): void {
 
   const topbar = el("header", "topbar");
   const rail = el("aside", "rail");
+  // The center stacks a per-session TAB STRIP over the pane area. The strip is a
+  // fixed-height chrome row; the pane area is the flex body renderCenter owns
+  // (its xterm-survival fingerprint logic mutates ONLY the pane area, never the
+  // strip, so switching tabs never tears down terminals in hidden tabs).
   const center = el("section", "center");
+  const tabs = el("nav", "tabstrip");
+  tabs.setAttribute("aria-label", "Session tabs");
+  const paneArea = el("div", "pane-area");
+  center.append(tabs, paneArea);
+
   const right = el("aside", "right-panel");
   const statusbar = el("footer", "statusbar");
   const palette = el("div", "palette-layer");
@@ -45,7 +57,7 @@ export function mountShell(app: HTMLElement): void {
 
   app.append(topbar, shell, statusbar, palette, themepicker, agents);
 
-  regions = { topbar, rail, center, right, statusbar, palette, themepicker, agents, shell };
+  regions = { topbar, rail, center, tabs, paneArea, right, statusbar, palette, themepicker, agents, shell };
 
   wireGlobalKeys();
   subscribe(renderAll);
@@ -57,7 +69,8 @@ export function renderAll(): void {
   if (!regions) return;
   renderTopbar(regions.topbar);
   renderRail(regions.rail);
-  renderCenter(regions.center);
+  renderTabs(regions.tabs);
+  renderCenter(regions.paneArea);
   renderBlocks(regions.right);
   renderStatusbar(regions.statusbar);
 
