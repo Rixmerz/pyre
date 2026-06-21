@@ -1,6 +1,6 @@
 # pyre
 
-Daemon-owned terminal multiplexer with block-level history, full-text search, and agent observability.
+Daemon-owned terminal multiplexer with block-level history, full-text search, and agent observability. A Tauri v2 desktop GUI (`pyre`) is the flagship client; the TUI (`pyre-tui`) remains a first-class peer.
 
 [![status](https://img.shields.io/badge/status-S3%20multi--pane%20%2B%20reattach-green)]()
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)]()
@@ -21,6 +21,33 @@ Daemon-owned terminal multiplexer with block-level history, full-text search, an
 - **tmux-compatible CLI** — `pyrec` accepts `list-sessions`, `new-session`, `kill-session`, `send-keys`, `split-window`, and more.
 - **Clipboard integration** — `pyrec capture-pane --copy` copies output to the system clipboard via `wl-copy` (Wayland) or `xclip` (X11).
 - **Searchable scrollback** — ring buffer per pane with configurable depth; `PgUp`/`PgDn` in `pyre` or `capture-pane -S` in `pyrec`.
+
+## Desktop GUI (`pyre`)
+
+The flagship client is a **Tauri v2 desktop GUI** (`gui/`, webview built on
+xterm.js + vanilla TS, bridged to `pyred` by a Rust/Tauri backend). It is
+another client of `pyred` over the existing proto — same Unix socket, zero
+proto changes — so it is a peer surface to the TUI, not a wrapper around it.
+The TUI remains available as `pyre-tui`. Its "hearth" design renders agent
+state as heat: embers on a dark ground, hotter as a pane works.
+
+- **Sessions + layout-tree panes** — session rail plus recursive split panes
+  (the same `LayoutNode` model), with per-pane PTY output streamed into
+  `xterm.js` (unicode11, Nerd Font, copy/paste, scrollback, in-pane find).
+- **Interactive command blocks** — discrete command cards with rerun, copy,
+  collapse, and a failures-only filter, plus block search.
+- **Cross-session agent overview** — every pane's agent state at a glance.
+- **18 themes** — the shared `pyre-themes` palettes.
+- **Drag-resize dividers** and **full keyboard control** — directional pane
+  navigation, keybinds, and a `?` cheat-sheet — plus a startup splash window.
+- **Native desktop notifications** on agent state change (`Done`,
+  `WaitingInput`).
+
+Launch it with `pyre` (the `~/.local/bin/pyre` wrapper ensures `pyred` is
+running, sets the NVIDIA/Wayland webkit env, and cold-start retries once).
+Frontend tooling is **pnpm** (npm is not used). Linux-first; tested on Arch +
+Hyprland/Wayland. See [gui/README.md](gui/README.md) for build, install, and
+architecture details.
 
 ## Quickstart
 
@@ -227,6 +254,7 @@ is specified in [docs/adr/0002-daemon-process-architecture.md](docs/adr/0002-dae
 
 | File | Contents |
 |------|----------|
+| [gui/README.md](gui/README.md) | Desktop GUI (`pyre`) — build, install, Tauri bridge architecture |
 | [docs/USAGE.md](docs/USAGE.md) | All subcommands, tmux mapping table, TUI bindings, troubleshooting |
 | [docs/CONFIG.md](docs/CONFIG.md) | `hooks.toml` schema, `process_model` flag, future config knobs |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Crate map, process diagram, block lifecycle, state engine |
