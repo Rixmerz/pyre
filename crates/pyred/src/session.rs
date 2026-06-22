@@ -646,8 +646,9 @@ impl SessionRegistry {
             .get_pane(pane_id)
             .await
             .ok_or_else(|| anyhow!("no such pane {pane_id}"))?;
+        let session_id = pane.session;
         *pane.name.write().await = Some(name.clone());
-        store.rename_pane(pane_id, &name).await?;
+        store.rename_pane(pane_id, session_id, &name).await?;
         Ok(())
     }
 

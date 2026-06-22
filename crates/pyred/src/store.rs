@@ -245,8 +245,31 @@ impl Store {
         Ok(out)
     }
 
-    /// Persist a human-readable name for a pane row. No-op when the row is absent.
-    pub async fn rename_pane(&self, id: PaneId, name: &str) -> Result<()> {
+    /// Persist a human-readable name for a pane row.
+    ///
+    /// In hybrid mode the supervisor's `panes` table is never populated by
+    /// normal pane-spawn paths (workers write their own per-session shard, not
+    /// the supervisor's `state.db`). A plain `UPDATE ... WHERE id = ?` is
+    /// therefore a no-op when no row exists, silently discarding the rename.
+    ///
+    /// This method uses `INSERT OR IGNORE` + `UPDATE` (an UPSERT) so a stub
+    /// row is created on first rename if none exists, and subsequent renames
+    /// overwrite the name in place. `session_id` is required for the initial
+    /// insert; `cols`/`rows` are zeroed because only the `name` column matters
+    /// for the rename read-path (`get_pane_name`).
+    pub async fn rename_pane(&self, id: PaneId, session_id: SessionId, name: &str) -> Result<()> {
+        let now = Utc::now().timestamp_millis();
+        // Ensure a row exists (no-op if it already does).
+        sqlx::query(
+            "INSERT OR IGNORE INTO panes (id, session_id, argv, cols, rows, created_at)
+             VALUES (?1, ?2, '', 0, 0, ?3)",
+        )
+        .bind(id.0.to_string())
+        .bind(session_id.0.to_string())
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        // Now set the name (works whether the row was just created or pre-existed).
         sqlx::query("UPDATE panes SET name = ?2 WHERE id = ?1")
             .bind(id.0.to_string())
             .bind(name)

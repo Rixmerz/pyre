@@ -1147,13 +1147,26 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
     ) -> Result<(), PyreError> {
         // In hybrid/supervisor mode the pane name is persisted directly to
         // SQLite — the same approach rename_session uses for session names.
-        // Verify the pane exists in the registry before writing.
-        self.registry
+        // Verify the pane exists in the registry before writing; also capture
+        // the session_id so rename_pane can upsert a row when the supervisor's
+        // panes table has no entry (hybrid mode never inserts pane rows on
+        // spawn — workers use their own per-session shard instead).
+        let (session_id_str, _slot_idx) = self
+            .registry
             .lookup_pane(pane.0)
             .await
             .ok_or(PyreError::NoSuchPane(pane))?;
+        let session_id = uuid::Uuid::parse_str(&session_id_str)
+            .map(pyre_proto::SessionId)
+            .map_err(|e| PyreError::Io(format!("invalid session uuid {session_id_str}: {e}")))?;
+        tracing::debug!(
+            pane = ?pane,
+            session = %session_id_str,
+            name = %name,
+            "[pyre-rename] supervisor: persisting pane name via upsert"
+        );
         self.store
-            .rename_pane(pane, &name)
+            .rename_pane(pane, session_id, &name)
             .await
             .map_err(|e| PyreError::Io(e.to_string()))
     }

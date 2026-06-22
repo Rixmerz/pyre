@@ -77,11 +77,24 @@ export async function renameSessionAction(
 ): Promise<void> {
   const next = name.trim();
   if (!next) return;
+  dlog("[pyre-rename] commit session=", session, 'name="' + next + '"');
   try {
     await renameSession(session, next);
+    dlog("[pyre-rename] rpc ok session=", session);
+    // Refresh the rail immediately so the new name appears without waiting for
+    // the next list_sessions poll.
     await reloadSessions();
+    const afterName =
+      getState().sessions.find((x) => x.id === session)?.name ?? null;
+    dlog("[pyre-rename] after-reload session=", session, 'name="' + afterName + '"');
+    if (afterName !== next) {
+      dlog(
+        "[pyre-rename] MISMATCH: sent='" + next + "' got='" + afterName +
+        "' — daemon read-path did not reflect the session rename on reload",
+      );
+    }
   } catch (err) {
-    console.error("rename_session failed:", err);
+    dlog("[pyre-rename] rpc FAILED session=", session, err);
   }
 }
 

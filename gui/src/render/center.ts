@@ -19,7 +19,7 @@
 
 import { h, replaceChildren } from "./dom";
 import { icon } from "./icons";
-import { beginInlineEdit } from "./inline-edit";
+import { attachRenameAffordance } from "./inline-edit";
 import {
   getState,
   paneStateOf,
@@ -330,27 +330,22 @@ function renderLeaf(pane: string, standalone = false): HTMLElement {
   const title = paneDisplayName(pane, fallbackTitle);
   const agent = (info?.agent ?? "").trim() || "unknown";
   // Pane title span — double-click swaps it for an inline editor (commit →
-  // rename_pane). The card's onmousedown still focuses the pane on a single
-  // click; the dblclick handler stops propagation so the edit isn't interrupted.
-  const titleSpan = h(
-    "span",
-    {
-      class: "pane-title",
-      title: "Double-click to rename",
-      ondblclick: (e: Event) => {
-        e.stopPropagation();
-        e.preventDefault();
-        beginInlineEdit({
-          label: titleSpan,
-          value: title,
-          inputClass: "inline-edit-pane",
-          ariaLabel: "Rename pane",
-          onCommit: (name) => renamePaneAction(pane, name),
-        });
-      },
-    },
-    title,
-  );
+  // rename_pane). CRITICAL: the card's onmousedown calls focusPane(pane), which
+  // setState({focusedPane}) → renderAll → a STRUCTURAL renderCenter re-render
+  // (the fingerprint includes focus). On an UNFOCUSED pane the very first
+  // mousedown of a double-click would rebuild the card and destroy this span
+  // before the dblclick lands on it, so the editor never opened. attachRename-
+  // Affordance stops mousedown/click at the title so moving focus to the card
+  // never tears the title out mid-double-click. No onSingleClick: the card body/
+  // terminal owns focus on click; the title only renames on double-click.
+  const titleSpan = h("span", { class: "pane-title" }, title);
+  attachRenameAffordance({
+    label: titleSpan,
+    value: () => title,
+    inputClass: "inline-edit-pane",
+    ariaLabel: "Rename pane",
+    onCommit: (name) => renamePaneAction(pane, name),
+  });
   const header = h(
     "div",
     { class: "pane-header" },

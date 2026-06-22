@@ -3,7 +3,7 @@
 
 import { h, replaceChildren } from "./dom";
 import { icon } from "./icons";
-import { beginInlineEdit } from "./inline-edit";
+import { attachRenameAffordance } from "./inline-edit";
 import { getState, panesOfSession } from "../state";
 import { heatVar, hottest } from "../heat";
 import {
@@ -60,29 +60,24 @@ export function renderRail(root: HTMLElement): void {
       );
 
     // Session name span — double-click swaps it for an inline editor (commit →
-    // rename_session). Single-click keeps switching session (handled by the row
-    // button); the dblclick handler stops propagation so it doesn't also switch.
+    // rename_session). Single-click switches session. The name span OWNS both
+    // (via attachRenameAffordance): it stops propagation to the row button and
+    // debounces the single-click so a double-click never first fires
+    // switchSession (whose async reload used to rebuild the rail between the two
+    // clicks and destroy this span before dblclick could land on it).
     const nameSpan =
       !s.railCollapsed &&
-      h(
-        "span",
-        {
-          class: "rail-session-name",
-          title: "Double-click to rename",
-          ondblclick: (e: Event) => {
-            e.stopPropagation();
-            e.preventDefault();
-            beginInlineEdit({
-              label: nameSpan as HTMLElement,
-              value: sess.name,
-              inputClass: "inline-edit-rail",
-              ariaLabel: "Rename session",
-              onCommit: (name) => renameSessionAction(sess.id, name),
-            });
-          },
-        },
-        sess.name,
-      );
+      (h("span", { class: "rail-session-name" }, sess.name) as HTMLElement);
+    if (nameSpan) {
+      attachRenameAffordance({
+        label: nameSpan,
+        value: () => sess.name,
+        onSingleClick: () => void switchSession(sess.id),
+        inputClass: "inline-edit-rail",
+        ariaLabel: "Rename session",
+        onCommit: (name) => renameSessionAction(sess.id, name),
+      });
+    }
 
     const row = h(
       "button",

@@ -11,6 +11,7 @@ import { renderStatusbar } from "./statusbar";
 import { renderPalette, resetPalette, handlePaletteKey } from "./palette";
 import { renderThemePicker } from "./themepicker";
 import { renderAgents } from "./agents";
+import { isInlineEditing } from "./inline-edit";
 import { openPalette, closePalette, unzoom, closeAgents } from "../actions";
 
 interface Regions {
@@ -68,9 +69,18 @@ export function mountShell(app: HTMLElement): void {
 export function renderAll(): void {
   if (!regions) return;
   renderTopbar(regions.topbar);
-  renderRail(regions.rail);
-  renderTabs(regions.tabs);
-  renderCenter(regions.paneArea);
+  // While an inline rename editor is open, SKIP rebuilding the three surfaces
+  // that host one (rail, tabs, center). renderRail/renderTabs replaceChildren
+  // unconditionally, so a poll-driven setState (heat change every ≤750ms) would
+  // otherwise tear out the live <input> and discard the user's keystrokes before
+  // Enter/blur commits. The editor itself commits on blur/Enter and the caller's
+  // reload then triggers a fresh renderAll with editing already settled. The
+  // non-editor chrome (blocks, statusbar, palette) still refreshes normally.
+  if (!isInlineEditing()) {
+    renderRail(regions.rail);
+    renderTabs(regions.tabs);
+    renderCenter(regions.paneArea);
+  }
   renderBlocks(regions.right);
   renderStatusbar(regions.statusbar);
 

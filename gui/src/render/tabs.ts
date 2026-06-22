@@ -8,7 +8,7 @@
 
 import { h, replaceChildren } from "./dom";
 import { icon } from "./icons";
-import { beginInlineEdit } from "./inline-edit";
+import { attachRenameAffordance } from "./inline-edit";
 import {
   getState,
   paneStateOf,
@@ -106,27 +106,19 @@ function pill(tab: SessionTab, active: string): HTMLElement {
   const label = paneLabel(pane);
 
   // Tab label span — double-click swaps it for an inline editor (commit →
-  // rename_pane). Single-click still switches to the tab (the pill's onclick);
-  // the dblclick handler stops propagation so it doesn't also switch.
-  const labelSpan = h(
-    "span",
-    {
-      class: "tab-label",
-      title: "Double-click to rename",
-      ondblclick: (e: Event) => {
-        e.stopPropagation();
-        e.preventDefault();
-        beginInlineEdit({
-          label: labelSpan,
-          value: label,
-          inputClass: "inline-edit-tab",
-          ariaLabel: "Rename pane",
-          onCommit: (name) => renamePaneAction(pane, name),
-        });
-      },
-    },
-    label,
-  );
+  // rename_pane); single-click switches to the tab. The label OWNS both via
+  // attachRenameAffordance (stops propagation to the pill button + debounces the
+  // single-click) so the two behaviors are consistent with the rail and the
+  // pane-card title, and a double-click never first fires switchTab.
+  const labelSpan = h("span", { class: "tab-label" }, label);
+  attachRenameAffordance({
+    label: labelSpan,
+    value: () => label,
+    onSingleClick: () => switchTab(pane),
+    inputClass: "inline-edit-tab",
+    ariaLabel: "Rename pane",
+    onCommit: (name) => renamePaneAction(pane, name),
+  });
 
   const close = h(
     "button",
