@@ -112,6 +112,18 @@ export function paneStateOf(pane: string): PaneStateInfo | undefined {
   return state.paneStates.get(pane);
 }
 
+/**
+ * Display name for a pane: the user-assigned `name` when set, else the caller's
+ * `fallback` (e.g. the pane title, agent kind, or a short id). Centralizes the
+ * "name overrides label" rule so the tab pill, pane-card header, and any future
+ * surface stay consistent. `name` is wired DEFENSIVELY — undefined/null/empty on
+ * a daemon that predates the field simply falls through to `fallback`.
+ */
+export function paneDisplayName(pane: string, fallback: string): string {
+  const name = (paneStateOf(pane)?.name ?? "").trim();
+  return name || fallback;
+}
+
 /** All pane states belonging to a given session. */
 export function panesOfSession(session: string): PaneStateInfo[] {
   const out: PaneStateInfo[] = [];

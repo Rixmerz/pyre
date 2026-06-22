@@ -185,6 +185,8 @@ pub trait PyreDaemon {
     async fn resize_pane(req: crate::ResizePaneReq) -> Result<crate::ResizePaneRes, PyreError>;
     /// Rename an existing session. Persists to SQLite immediately.
     async fn rename_session(session: SessionId, name: String) -> Result<(), PyreError>;
+    /// Rename an existing pane. Persists to SQLite immediately.
+    async fn rename_pane(pane: PaneId, name: String) -> Result<(), PyreError>;
     /// Block until `pane` reaches `state` or `timeout_ms` elapses. Returns `true` if reached.
     async fn wait_pane_state(
         pane: PaneId,

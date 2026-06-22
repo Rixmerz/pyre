@@ -168,9 +168,14 @@ function applyHeatInPlace(map: Map<string, PaneStateInfo>): void {
     const lbl = card.querySelector<HTMLElement>(".pane-state-label");
     if (lbl) lbl.textContent = stateLabel(info.state);
 
-    // Update title
+    // Update title — the user-assigned name wins over the daemon title, falling
+    // back to the title, else "pane". Skip while an inline rename editor has
+    // replaced the label (the span is detached; nothing to update mid-edit).
     const titleEl = card.querySelector<HTMLElement>(".pane-title");
-    if (titleEl) titleEl.textContent = info.title || "pane";
+    if (titleEl) {
+      const name = (info.name ?? "").trim();
+      titleEl.textContent = name || info.title || "pane";
+    }
 
     // Update the per-pane agent chip in place (text + tint class).
     const chip = card.querySelector<HTMLElement>(".pane-agent-chip");
@@ -404,6 +409,7 @@ export async function applyLifecycleEvent(ev: LifecycleEvent): Promise<void> {
           state: nextState,
           title: prev?.title ?? null,
           agent: prev?.agent ?? null,
+          name: prev?.name ?? null,
         };
         map.set(ev.pane, next);
         applyHeatInPlace(map);

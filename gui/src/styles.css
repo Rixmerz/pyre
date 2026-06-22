@@ -1674,6 +1674,49 @@ body.resizing-row * {
   }
 }
 
+/* ── Inline rename editor ──────────────────────────────────────────────────
+   One quiet text input that replaces a label in place when a name is double-
+   clicked (session rail row, standalone-pane tab pill, split-pane card header).
+   Hearth-consistent: surface-2 well, hairline border, ember focus ring. The
+   per-surface modifier classes only tune sizing/typography to sit flush in
+   their host so the swap doesn't jump the layout. */
+.inline-edit-input {
+  font-family: inherit;
+  font-size: inherit;
+  color: var(--fg);
+  background: var(--surface-2);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-sm);
+  padding: 1px 6px;
+  margin: 0;
+  min-width: 0;
+  max-width: 100%;
+  line-height: inherit;
+  outline: none;
+}
+.inline-edit-input:focus {
+  border-color: var(--ember);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--ember) 35%, transparent);
+}
+
+/* Rail session-name editor — matches .rail-session-name metrics. */
+.inline-edit-rail {
+  font-size: 12.5px;
+  flex: 1 1 auto;
+}
+
+/* Tab pill editor — matches .tab-label metrics, capped so the pill keeps shape. */
+.inline-edit-tab {
+  font-size: inherit;
+  max-width: 14ch;
+}
+
+/* Pane-card header editor — mono, matches .pane-title metrics. */
+.inline-edit-pane {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
 /* Respect reduced-motion for everything added above (the global `* {transition:
    none}` guard already covers transitions; this also kills the new keyframes). */
 @media (prefers-reduced-motion: reduce) {

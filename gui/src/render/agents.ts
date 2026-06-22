@@ -9,7 +9,7 @@
 
 import { h, replaceChildren } from "./dom";
 import { icon } from "./icons";
-import { getState } from "../state";
+import { getState, paneDisplayName } from "../state";
 import { heatVar, hottest, stateLabel } from "../heat";
 import { closeAgents, gotoPane } from "../actions";
 import type { PaneState, PaneStateInfo, SessionInfo } from "../types";
@@ -46,7 +46,8 @@ function buildRows(): AgentRow[] {
       session: byId.get(info.session),
       sessionId: info.session,
       state: info.state,
-      title: info.title || "pane",
+      // User-assigned name wins over the daemon title (falls back to title, "pane").
+      title: paneDisplayName(info.pane, info.title || "pane"),
       agent: agentLabel(info),
     });
   }

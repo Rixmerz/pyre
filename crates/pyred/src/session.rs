@@ -28,8 +28,8 @@ use crate::store::Store;
 pub struct PaneState {
     pub id: PaneId,
     pub session: SessionId,
-    /// Optional human-readable label assigned at pane creation time.
-    pub name: Option<String>,
+    /// Optional human-readable label; may be changed at runtime via `rename_pane`.
+    pub name: RwLock<Option<String>>,
     pub cols: u16,
     pub rows: u16,
     pub shell: String,
@@ -82,7 +82,7 @@ impl PaneState {
         Self {
             id,
             session,
-            name,
+            name: RwLock::new(name),
             cols,
             rows,
             shell,
@@ -548,7 +548,11 @@ impl SessionRegistry {
             return vec![];
         };
         let panes = s.panes.lock().await;
-        panes.values().map(pane_info_from_state).collect()
+        let mut out = Vec::with_capacity(panes.len());
+        for p in panes.values() {
+            out.push(pane_info_from_state(p).await);
+        }
+        out
     }
 
     /// List all panes across all sessions (convenience; avoids N client RPCs).
@@ -558,7 +562,7 @@ impl SessionRegistry {
         for s in sessions.values() {
             let panes = s.panes.lock().await;
             for p in panes.values() {
-                out.push(pane_info_from_state(p));
+                out.push(pane_info_from_state(p).await);
             }
         }
         out
@@ -631,6 +635,22 @@ impl SessionRegistry {
         self.emit_event(pane_id, PaneEventKind::Closed, None, None);
     }
 
+    /// Rename a pane in-memory and persist to SQLite.
+    pub async fn rename_pane(
+        &self,
+        pane_id: PaneId,
+        name: String,
+        store: &Store,
+    ) -> anyhow::Result<()> {
+        let (_, pane) = self
+            .get_pane(pane_id)
+            .await
+            .ok_or_else(|| anyhow!("no such pane {pane_id}"))?;
+        *pane.name.write().await = Some(name.clone());
+        store.rename_pane(pane_id, &name).await?;
+        Ok(())
+    }
+
     /// Rename a session in-memory and persist to SQLite.
     pub async fn rename_session(
         &self,
@@ -657,7 +677,7 @@ impl SessionRegistry {
 }
 
 /// Build a `PaneInfo` from a live `PaneState`, reading the tracker under lock.
-fn pane_info_from_state(p: &Arc<PaneState>) -> PaneInfo {
+async fn pane_info_from_state(p: &Arc<PaneState>) -> PaneInfo {
     let (state, reason, last_activity, foreground_cmd, root_pid, agent, seen) = {
         let t = p.state_tracker.lock().unwrap_or_else(|e| {
             tracing::error!(
@@ -679,6 +699,7 @@ fn pane_info_from_state(p: &Arc<PaneState>) -> PaneInfo {
             t.seen,
         )
     };
+    let name = p.name.read().await.clone();
     PaneInfo {
         id: p.id,
         session: p.session,
@@ -694,7 +715,7 @@ fn pane_info_from_state(p: &Arc<PaneState>) -> PaneInfo {
         root_pid,
         agent,
         seen,
-        name: p.name.clone(),
+        name,
     }
 }
 

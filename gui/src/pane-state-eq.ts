@@ -9,10 +9,12 @@ import type { PaneStateInfo } from "./types";
 
 /**
  * Shallow equality check for pane-state maps. Two snapshots are equal when they
- * have the same panes and, for each, the same `state`, `title`, and `agent`
- * (treating missing/undefined agent as null). Anything else differing — a pane
- * added or removed, a state change, an agent change — makes them unequal, which
- * is the signal to re-render.
+ * have the same panes and, for each, the same `state`, `title`, `agent`, and
+ * `name` (treating missing/undefined agent/name as null). Anything else
+ * differing — a pane added or removed, a state change, an agent change, a
+ * rename — makes them unequal, which is the signal to re-render. The `name`
+ * check is what makes a rename arriving on the poll repaint the pane card,
+ * tab pill, and rail row.
  */
 export function paneStatesEqual(
   a: Map<string, PaneStateInfo>,
@@ -25,6 +27,7 @@ export function paneStatesEqual(
     if (infoA.state !== infoB.state) return false;
     if (infoA.title !== infoB.title) return false;
     if ((infoA.agent ?? null) !== (infoB.agent ?? null)) return false;
+    if ((infoA.name ?? null) !== (infoB.name ?? null)) return false;
   }
   return true;
 }

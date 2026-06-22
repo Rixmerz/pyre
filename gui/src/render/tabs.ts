@@ -8,24 +8,39 @@
 
 import { h, replaceChildren } from "./dom";
 import { icon } from "./icons";
+import { beginInlineEdit } from "./inline-edit";
 import {
   getState,
   paneStateOf,
+  paneDisplayName,
   sessionTabs,
   activeTabOf,
   SPLIT_TAB,
   type SessionTab,
 } from "../state";
 import { heatVar, pulses, stateLabel } from "../heat";
-import { newPaneAction, switchTab, closeStandalonePane } from "../actions";
+import {
+  newPaneAction,
+  switchTab,
+  closeStandalonePane,
+  renamePaneAction,
+} from "../actions";
 import type { PaneState } from "../types";
 
-/** Short, stable label for a standalone pane tab: its agent, else an 8-char id. */
-function paneLabel(pane: string): string {
+/**
+ * Display label for a standalone pane tab. Prefers the user-assigned pane name;
+ * falls back to the detected agent, else an 8-char id. The fallback is what the
+ * inline editor seeds with when no name has been set yet.
+ */
+function paneFallbackLabel(pane: string): string {
   const info = paneStateOf(pane);
   const agent = (info?.agent ?? "").trim();
   if (agent) return agent;
   return pane.slice(0, 8);
+}
+
+function paneLabel(pane: string): string {
+  return paneDisplayName(pane, paneFallbackLabel(pane));
 }
 
 /** Render the tab strip for the active session into `root`. Hidden if no session. */
@@ -90,6 +105,29 @@ function pill(tab: SessionTab, active: string): HTMLElement {
 
   const label = paneLabel(pane);
 
+  // Tab label span — double-click swaps it for an inline editor (commit →
+  // rename_pane). Single-click still switches to the tab (the pill's onclick);
+  // the dblclick handler stops propagation so it doesn't also switch.
+  const labelSpan = h(
+    "span",
+    {
+      class: "tab-label",
+      title: "Double-click to rename",
+      ondblclick: (e: Event) => {
+        e.stopPropagation();
+        e.preventDefault();
+        beginInlineEdit({
+          label: labelSpan,
+          value: label,
+          inputClass: "inline-edit-tab",
+          ariaLabel: "Rename pane",
+          onCommit: (name) => renamePaneAction(pane, name),
+        });
+      },
+    },
+    label,
+  );
+
   const close = h(
     "button",
     {
@@ -119,7 +157,7 @@ function pill(tab: SessionTab, active: string): HTMLElement {
       onclick: () => switchTab(pane),
     },
     dot,
-    h("span", { class: "tab-label" }, label),
+    labelSpan,
     close,
   );
 }

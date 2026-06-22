@@ -34,6 +34,13 @@ export interface PaneStateInfo {
    * crashing. Never assume a specific set of values.
    */
   agent?: string | null;
+  /**
+   * User-assigned display name for this pane (set via inline rename → the Rust
+   * `rename_pane` command). Added by a parallel Rust agent; wired DEFENSIVELY:
+   * missing/undefined/null means the daemon predates the field, so the UI falls
+   * back to the pane's title / agent / short id rather than showing nothing.
+   */
+  name?: string | null;
 }
 
 /**

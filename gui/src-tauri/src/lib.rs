@@ -167,6 +167,8 @@ pub struct PaneStateDto {
     pub state: String,
     pub title: Option<String>,
     pub agent: String,
+    /// Human-readable label for the pane, if one has been set via `rename_pane`.
+    pub name: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -407,6 +409,24 @@ async fn rename_session(
         .map_err(|e| format!("rename_session daemon error: {e}"))
 }
 
+#[tauri::command]
+async fn rename_pane(
+    state: State<'_, AppState>,
+    pane: String,
+    name: String,
+) -> Result<(), String> {
+    let pid = parse_pane(&pane)?;
+    let client = {
+        let mut guard = state.inner.lock().await;
+        ensure_client(&mut guard).await?
+    };
+    client
+        .rename_pane(tarpc::context::current(), pid, name)
+        .await
+        .map_err(|e| format!("rename_pane transport error: {e}"))?
+        .map_err(|e| format!("rename_pane daemon error: {e}"))
+}
+
 /// Fully terminate a session: close all its panes and evict it from the
 /// registry. Uses the daemon's `close_session` RPC ("close all panes and
 /// remove it from the registry"). We then call `gc_stale_sessions` as a
@@ -497,6 +517,7 @@ async fn pane_states(state: State<'_, AppState>) -> Result<Vec<PaneStateDto>, St
             state: pane_state_label(&p.state).to_string(),
             title: p.name.clone(),
             agent: p.agent.label().to_string(),
+            name: p.name.clone(),
         })
         .collect())
 }
@@ -1098,6 +1119,7 @@ pub fn run() {
             // panes
             close_pane,
             resize_pane,
+            rename_pane,
             pane_states,
             inspect_pid,
             // layout

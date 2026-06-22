@@ -3,11 +3,13 @@
 
 import { h, replaceChildren } from "./dom";
 import { icon } from "./icons";
+import { beginInlineEdit } from "./inline-edit";
 import { getState, panesOfSession } from "../state";
 import { heatVar, hottest } from "../heat";
 import {
   closeSessionAction,
   newSession,
+  renameSessionAction,
   switchSession,
   toggleRail,
 } from "../actions";
@@ -57,6 +59,31 @@ export function renderRail(root: HTMLElement): void {
         h("span", { class: "rail-close-icon", html: icon("close") }),
       );
 
+    // Session name span — double-click swaps it for an inline editor (commit →
+    // rename_session). Single-click keeps switching session (handled by the row
+    // button); the dblclick handler stops propagation so it doesn't also switch.
+    const nameSpan =
+      !s.railCollapsed &&
+      h(
+        "span",
+        {
+          class: "rail-session-name",
+          title: "Double-click to rename",
+          ondblclick: (e: Event) => {
+            e.stopPropagation();
+            e.preventDefault();
+            beginInlineEdit({
+              label: nameSpan as HTMLElement,
+              value: sess.name,
+              inputClass: "inline-edit-rail",
+              ariaLabel: "Rename session",
+              onCommit: (name) => renameSessionAction(sess.id, name),
+            });
+          },
+        },
+        sess.name,
+      );
+
     const row = h(
       "button",
       {
@@ -69,7 +96,7 @@ export function renderRail(root: HTMLElement): void {
         h(
           "span",
           { class: "rail-name" },
-          h("span", { class: "rail-session-name" }, sess.name),
+          nameSpan,
           h("span", { class: "rail-pane-count" }, `${sess.pane_count}`),
         ),
       closeBtn,

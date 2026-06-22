@@ -52,6 +52,16 @@ export const paneStates = (): Promise<PaneStateInfo[]> => invoke("pane_states");
 export const closePane = (pane: string): Promise<void> =>
   invoke("close_pane", { pane });
 
+/**
+ * Rename a pane (sets its user-facing display name). A parallel Rust agent
+ * implements the `rename_pane` command + the `name` field on `pane_states`;
+ * callers wire it DEFENSIVELY — if the command is missing the promise rejects,
+ * the caller catches + dlogs, and the pane keeps its fallback label rather than
+ * crashing the UI.
+ */
+export const renamePane = (pane: string, name: string): Promise<void> =>
+  invoke("rename_pane", { pane, name });
+
 export const resizePane = (
   pane: string,
   cols: number,

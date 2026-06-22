@@ -245,6 +245,16 @@ impl Store {
         Ok(out)
     }
 
+    /// Persist a human-readable name for a pane row. No-op when the row is absent.
+    pub async fn rename_pane(&self, id: PaneId, name: &str) -> Result<()> {
+        sqlx::query("UPDATE panes SET name = ?2 WHERE id = ?1")
+            .bind(id.0.to_string())
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Return the persisted name for a session, or `None` if the row is missing.
     pub async fn get_session_name(&self, id: SessionId) -> Result<Option<String>> {
         let row = sqlx::query("SELECT name FROM sessions WHERE id = ?1")

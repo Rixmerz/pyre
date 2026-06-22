@@ -1111,6 +1111,25 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
             .map_err(|e| PyreError::Io(e.to_string()))
     }
 
+    async fn rename_pane(
+        self,
+        _ctx: context::Context,
+        pane: PaneId,
+        name: String,
+    ) -> Result<(), PyreError> {
+        // In hybrid/supervisor mode the pane name is persisted directly to
+        // SQLite — the same approach rename_session uses for session names.
+        // Verify the pane exists in the registry before writing.
+        self.registry
+            .lookup_pane(pane.0)
+            .await
+            .ok_or(PyreError::NoSuchPane(pane))?;
+        self.store
+            .rename_pane(pane, &name)
+            .await
+            .map_err(|e| PyreError::Io(e.to_string()))
+    }
+
     async fn resize_pane(
         self,
         _ctx: context::Context,

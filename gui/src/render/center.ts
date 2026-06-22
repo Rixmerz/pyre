@@ -19,9 +19,11 @@
 
 import { h, replaceChildren } from "./dom";
 import { icon } from "./icons";
+import { beginInlineEdit } from "./inline-edit";
 import {
   getState,
   paneStateOf,
+  paneDisplayName,
   sessionTabs,
   activeTabOf,
   SPLIT_TAB,
@@ -32,6 +34,7 @@ import {
   closeStandalonePane,
   focusPane,
   newSession,
+  renamePaneAction,
   splitDown,
   splitRight,
   zoomPane,
@@ -322,13 +325,37 @@ function renderLeaf(pane: string, standalone = false): HTMLElement {
   const dot = h("span", { class: "pane-dot", title: stateLabel(state) });
   dot.style.setProperty("--dot-heat", heatVar(state));
 
-  const title = info?.title || "pane";
+  // Display name overrides the daemon title; fall back to title, else "pane".
+  const fallbackTitle = info?.title || "pane";
+  const title = paneDisplayName(pane, fallbackTitle);
   const agent = (info?.agent ?? "").trim() || "unknown";
+  // Pane title span — double-click swaps it for an inline editor (commit →
+  // rename_pane). The card's onmousedown still focuses the pane on a single
+  // click; the dblclick handler stops propagation so the edit isn't interrupted.
+  const titleSpan = h(
+    "span",
+    {
+      class: "pane-title",
+      title: "Double-click to rename",
+      ondblclick: (e: Event) => {
+        e.stopPropagation();
+        e.preventDefault();
+        beginInlineEdit({
+          label: titleSpan,
+          value: title,
+          inputClass: "inline-edit-pane",
+          ariaLabel: "Rename pane",
+          onCommit: (name) => renamePaneAction(pane, name),
+        });
+      },
+    },
+    title,
+  );
   const header = h(
     "div",
     { class: "pane-header" },
     dot,
-    h("span", { class: "pane-title" }, title),
+    titleSpan,
     // Per-pane agent chip — subtly tinted by kind (claude / shell / unknown).
     h(
       "span",

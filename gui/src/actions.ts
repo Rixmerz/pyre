@@ -8,6 +8,7 @@ import {
   detachPaneStream,
   openPane,
   openSplit,
+  renamePane,
   renameSession,
   searchBlocks,
   sendKeys,
@@ -62,8 +63,22 @@ export async function promptRenameSession(session: string): Promise<void> {
   const s = getState().sessions.find((x) => x.id === session);
   const next = window.prompt("Rename session", s?.name ?? "");
   if (next == null || next.trim() === "") return;
+  await renameSessionAction(session, next.trim());
+}
+
+/**
+ * Rename a session and refresh the rail IMMEDIATELY (not waiting for the next
+ * `list_sessions` poll) so the new name appears at once. Shared by the command
+ * palette's prompt path and the rail's double-click inline editor.
+ */
+export async function renameSessionAction(
+  session: string,
+  name: string,
+): Promise<void> {
+  const next = name.trim();
+  if (!next) return;
   try {
-    await renameSession(session, next.trim());
+    await renameSession(session, next);
     await reloadSessions();
   } catch (err) {
     console.error("rename_session failed:", err);
@@ -229,6 +244,29 @@ export async function closePaneAction(pane: string | null): Promise<void> {
 export function focusPane(pane: string): void {
   setState({ focusedPane: pane });
   focusPaneTerminal(pane);
+}
+
+/**
+ * Rename a pane (standalone tab pill OR split-layout pane card). Wired
+ * DEFENSIVELY: if the daemon lacks `rename_pane` the invoke rejects, we catch +
+ * dlog, and the pane keeps its fallback label rather than breaking. On success
+ * we refresh pane states IMMEDIATELY (not waiting for the next poll) so the new
+ * name appears at once across the pane card, tab pill, and agent overview.
+ */
+export async function renamePaneAction(
+  pane: string,
+  name: string,
+): Promise<void> {
+  const next = name.trim();
+  if (!next) return;
+  try {
+    await renamePane(pane, next);
+    // Authoritative refresh so the committed name lands in paneStates and every
+    // surface that reads it (tab pill, pane card, agent overview) repaints.
+    await reloadPaneStates();
+  } catch (err) {
+    dlog("[pyre-rename] rename_pane unavailable, no-op:", pane, err);
+  }
 }
 
 // ── Tab actions (split tab + standalone panes) ────────────────────────────────

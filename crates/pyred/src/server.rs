@@ -337,6 +337,18 @@ impl pyre_proto::service::PyreDaemon for DaemonImpl {
             .map_err(|_| PyreError::NoSuchSession(session))
     }
 
+    async fn rename_pane(
+        self,
+        _ctx: context::Context,
+        pane: PaneId,
+        name: String,
+    ) -> Result<(), PyreError> {
+        self.registry
+            .rename_pane(pane, name, &self.store)
+            .await
+            .map_err(|_| PyreError::NoSuchPane(pane))
+    }
+
     async fn resize_pane(
         self,
         _ctx: context::Context,
