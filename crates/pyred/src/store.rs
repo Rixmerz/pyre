@@ -255,6 +255,20 @@ impl Store {
         Ok(())
     }
 
+    /// Return the persisted name for a pane, or `None` if the row is missing or
+    /// the name column is NULL/empty.
+    pub async fn get_pane_name(&self, id: PaneId) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT name FROM panes WHERE id = ?1")
+            .bind(id.0.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.and_then(|r| {
+            r.try_get::<Option<String>, _>("name")
+                .unwrap_or(None)
+                .filter(|n| !n.is_empty())
+        }))
+    }
+
     /// Return the persisted name for a session, or `None` if the row is missing.
     pub async fn get_session_name(&self, id: SessionId) -> Result<Option<String>> {
         let row = sqlx::query("SELECT name FROM sessions WHERE id = ?1")

@@ -774,6 +774,19 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
             };
             info.id = PaneId(pane_uuid);
             info.session = session;
+            // Overlay the persisted name from the supervisor store.  The worker
+            // process has no name field (PaneHandle carries only PTY state); the
+            // source of truth for the human-readable label is the supervisor's
+            // SQLite row written by rename_pane.  Mirrors how list_sessions
+            // overlays session names via get_session_name.
+            if let Ok(Some(stored_name)) = self.store.get_pane_name(info.id).await {
+                tracing::debug!(
+                    pane = ?info.id,
+                    name = %stored_name,
+                    "[pyre-rename] list_panes: overlaying stored pane name"
+                );
+                info.name = Some(stored_name);
+            }
             panes.push(info);
         }
         Ok(panes)
@@ -991,6 +1004,21 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
                 };
                 info.id = PaneId(pane_uuid);
                 info.session = sid;
+                // Overlay the persisted name from the supervisor store.  The
+                // worker PaneHandle has no name field; the supervisor's SQLite
+                // row is the single source of truth for user-assigned pane
+                // names.  Without this overlay, rename_pane writes to SQLite
+                // but list_all_panes returns name:None from the worker, so
+                // the GUI polls always see the old (None) name and revert.
+                // Mirrors how list_sessions overlays session names.
+                if let Ok(Some(stored_name)) = self.store.get_pane_name(info.id).await {
+                    tracing::debug!(
+                        pane = ?info.id,
+                        name = %stored_name,
+                        "[pyre-rename] list_all_panes: overlaying stored pane name"
+                    );
+                    info.name = Some(stored_name);
+                }
                 all.push(info);
             }
         }

@@ -259,13 +259,24 @@ export async function renamePaneAction(
 ): Promise<void> {
   const next = name.trim();
   if (!next) return;
+  dlog("[pyre-rename] commit pane=", pane, 'name="' + next + '"');
   try {
     await renamePane(pane, next);
+    dlog("[pyre-rename] rpc ok pane=", pane);
     // Authoritative refresh so the committed name lands in paneStates and every
     // surface that reads it (tab pill, pane card, agent overview) repaints.
     await reloadPaneStates();
+    // Verify the name the daemon returned for this pane after the reload.
+    const afterName = getState().paneStates.get(pane)?.name ?? null;
+    dlog("[pyre-rename] after-reload pane=", pane, 'name="' + afterName + '"');
+    if (afterName !== next) {
+      dlog(
+        "[pyre-rename] MISMATCH: sent='" + next + "' got='" + afterName +
+        "' — daemon read-path did not reflect the rename on the next poll",
+      );
+    }
   } catch (err) {
-    dlog("[pyre-rename] rename_pane unavailable, no-op:", pane, err);
+    dlog("[pyre-rename] rpc FAILED pane=", pane, err);
   }
 }
 
