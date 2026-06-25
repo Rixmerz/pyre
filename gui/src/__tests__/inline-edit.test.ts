@@ -193,6 +193,28 @@ describe("beginInlineEdit — commit semantics", () => {
     expect(isInlineEditing()).toBe(false);
   });
 
+  it("commit_restoresLabelWithNewText_removesInput", () => {
+    // Arrange
+    const label = makeLabel("orig");
+    const parent = label.parentNode as HTMLElement;
+    const onCommit = vi.fn();
+    const input = beginInlineEdit({ label, value: "orig", onCommit })!;
+
+    // Act
+    input.value = "renamed";
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+
+    // Assert — BUG-1: the center skips a name-only repaint, so commit must
+    // restore the label itself rather than leave a frozen <input> behind.
+    expect(
+      parent.querySelector("input.inline-edit-input"),
+      "the editor input is removed on commit",
+    ).toBeNull();
+    expect(parent.contains(label), "the label node is restored in place").toBe(true);
+    expect(label.textContent, "the restored label shows the committed name").toBe("renamed");
+    expect(onCommit).toHaveBeenCalledWith("renamed");
+  });
+
   it("blur_commitsTheTrimmedValue", () => {
     const label = makeLabel("orig");
     const onCommit = vi.fn();
@@ -203,5 +225,30 @@ describe("beginInlineEdit — commit semantics", () => {
 
     expect(onCommit, "clicking away commits").toHaveBeenCalledWith("fresh");
     expect(isInlineEditing()).toBe(false);
+  });
+});
+
+describe("beginInlineEdit — focus handoff (WebKitGTK regression)", () => {
+  // In Tauri/WebKitGTK, input.focus() alone does not evict keyboard focus from
+  // xterm's hidden textarea, so Enter keeps routing to the PTY. beginInlineEdit
+  // must blur the previously-focused element BEFORE focusing the editor input.
+  // jsdom focus semantics are enough to assert the blur side effect here.
+  it("blursThePreviouslyFocusedElement_beforeFocusingTheInput", () => {
+    // Arrange — stand in for xterm's hidden textarea, focused as in the live app.
+    const ta = document.createElement("textarea");
+    ta.className = "xterm-helper-textarea";
+    document.body.appendChild(ta);
+    const blurred = vi.fn();
+    ta.addEventListener("blur", blurred);
+    ta.focus();
+    expect(document.activeElement, "precondition: the textarea holds focus").toBe(ta);
+
+    // Act
+    const label = makeLabel("orig");
+    const input = beginInlineEdit({ label, value: "orig", onCommit: () => {} })!;
+
+    // Assert — the prior element was blurred and focus moved into the editor.
+    expect(blurred, "the previously-focused element is blurred").toHaveBeenCalledTimes(1);
+    expect(document.activeElement, "focus is handed to the rename input").toBe(input);
   });
 });

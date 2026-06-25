@@ -341,7 +341,11 @@ function renderLeaf(pane: string, standalone = false): HTMLElement {
   const titleSpan = h("span", { class: "pane-title" }, title);
   attachRenameAffordance({
     label: titleSpan,
-    value: () => title,
+    // Read the current name from LIVE state on each double-click. `title` is a
+    // const captured at render time, and renderCenter does not rebuild on a
+    // name-only change (fingerprint unchanged), so the captured const would seed
+    // a second rename with the pre-rename name. Recompute from paneStates live.
+    value: () => paneDisplayName(pane, paneStateOf(pane)?.title || "pane"),
     inputClass: "inline-edit-pane",
     ariaLabel: "Rename pane",
     onCommit: (name) => renamePaneAction(pane, name),

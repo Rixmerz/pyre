@@ -13,6 +13,10 @@ import "@xterm/xterm/css/xterm.css";
 import { resizePane, sendKeys } from "./api";
 import { getState } from "./state";
 import { dlog } from "./debug";
+// Leaf predicate only (no render-layer machinery): lets terminal-focus calls
+// bail while an inline rename editor is open, so the terminal can't steal
+// keyboard focus back mid-edit and re-break Enter-to-commit.
+import { isInlineEditing } from "./render/inline-edit";
 
 /**
  * Font stack for the terminal. Resolved from the system at build time:
@@ -404,6 +408,13 @@ const CROSS =
 
 /** Focus a pane's terminal (so keystrokes route there). */
 export function focusPaneTerminal(pane: string): void {
+  // While an inline rename editor (rail / tab pill / pane-card title) is open it
+  // MUST keep keyboard focus. Any terminal-focus call racing with an active edit
+  // — directional-focus keybind (Ctrl+H/J/K/L, not gated by typingInField),
+  // pane switch, find-bar close, block rerun — would steal focus back to the
+  // PTY and re-break Enter-to-commit. Bail while editing; the next legitimate
+  // focus call after the edit settles works normally.
+  if (isInlineEditing()) return;
   const entry = terms.get(pane);
   if (!entry) {
     console.warn("[pyre-input] focusPaneTerminal: no terminal for pane", pane);

@@ -11,8 +11,9 @@
 // renaming to "" or to the same name never round-trips to the daemon.
 //
 // The helper swaps the input IN PLACE of the label element and restores the
-// label on cancel; on commit it leaves the input in place and fires the
-// callback — the caller's refresh re-renders the surface with the new name.
+// label on both cancel (original text) and commit (the new text), then fires
+// the callback — so the committed name is visible immediately even on surfaces
+// whose refresh skips a name-only repaint (the center's fingerprint guard).
 
 import { dlog } from "../debug";
 
@@ -183,9 +184,16 @@ export function beginInlineEdit(opts: InlineEditOpts): HTMLInputElement | null {
       restoreLabel();
       return;
     }
-    // Leave the input in place; the caller's refresh repaints the surface with
-    // the committed name (so we don't flash the stale label before the reload).
-    delete label.dataset["editing"];
+    // Restore the label optimistically with the new name BEFORE the async RPC.
+    // The center surface's renderCenter early-returns on name-only changes
+    // (layout fingerprint unchanged), so it never repaints the card — leaving
+    // the <input> in place would strand a frozen editor and hide .pane-title
+    // from applyHeatInPlace. Showing `next` in the restored label makes the new
+    // name visible immediately (no flash) and is harmless for rail/tabs, which
+    // replaceChildren on the next renderAll. Order: clear editing flag
+    // (markSettled, above) → restore label with new text → fire onCommit.
+    label.textContent = next;
+    restoreLabel();
     void Promise.resolve(onCommit(next)).catch((err) =>
       dlog("[pyre-rename] onCommit rejected — kept fallback label:", err),
     );
@@ -207,6 +215,15 @@ export function beginInlineEdit(opts: InlineEditOpts): HTMLInputElement | null {
   input.addEventListener("blur", () => commit());
 
   parent.replaceChild(input, label);
+  // WebKitGTK (the Tauri webview) does NOT reliably move keyboard focus into a
+  // plain <input> via input.focus() alone while xterm's hidden textarea still
+  // holds focus — keystrokes (including Enter) keep routing to the PTY and this
+  // input's keydown never fires. Blur whatever currently holds focus first (the
+  // mirror of focusPaneTerminal's BOTH-focus workaround in terminals.ts) so
+  // WebKitGTK releases the terminal textarea before we steal focus into the
+  // editor. In jsdom this is a harmless no-op.
+  const active = document.activeElement as HTMLElement | null;
+  if (active && active !== input) active.blur();
   input.focus();
   input.select();
   return input;
