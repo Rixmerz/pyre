@@ -30,7 +30,7 @@ use pyre_proto::{
     layout, AttachAck, Block, BlockHit, BlockId, InputFrame, LayoutNode, ListBlocksReq,
     OpenPaneReq, OpenPaneSplitReq, OutputFrame, PaneEvent, PaneEventKind, PaneId, PaneInfo,
     PaneStateKind, PyreError, ReplayBlocks, ResizePaneReq, ResizePaneRes, SearchBlocksReq,
-    SessionId, SessionInfo, SpawnReq, SpawnResp,
+    SessionId, SessionInfo, SpawnReq, SpawnResp, WindowId, WindowInfo,
 };
 use tarpc::server::{BaseChannel, Channel};
 use tarpc::tokio_serde::formats::Bincode;
@@ -447,6 +447,21 @@ impl PaneMirrorRegistry {
 // ---------------------------------------------------------------------------
 
 /// tarpc `PyreDaemon` implementation backed by the worker registry.
+/// In-memory metadata for a single window held by the supervisor.
+///
+/// Windows are a supervisor-only grouping over panes — workers never learn
+/// about them, identical to how layout was supervisor-only before this change.
+/// `layout` is `None` until the first pane is added (no placeholder needed;
+/// `get_window_layout` falls through to the DB and then to the single-leaf
+/// fallback when the in-memory entry is absent or has no layout).
+#[derive(Clone)]
+pub(crate) struct WindowMeta {
+    session_id: String,
+    name: String,
+    position: u32,
+    layout: Option<LayoutNode>,
+}
+
 ///
 /// All RPC methods that require PTY access are forwarded to the appropriate
 /// worker via its `WorkerControl` client. Aggregated operations (list_sessions,
@@ -476,13 +491,22 @@ pub struct SupervisorImpl {
     pub focus_queue: Arc<std::sync::Mutex<std::collections::VecDeque<PaneId>>>,
     /// Pane lifecycle event bus: broadcast ring for `next_pane_event` long-poll.
     pub pane_event_bus: Arc<PaneEventBus>,
-    /// In-memory per-session layout store for the supervisor (M7-C, ADR-0005).
+    /// Per-window in-memory state: layout tree and metadata.
     ///
-    /// The supervisor owns the tiling tree in hybrid mode; workers only manage
-    /// PTY processes. Layout is persisted to `self.store` (supervisor SQLite)
-    /// and mirrored here for fast reads without a DB round-trip.
-    /// Key: session_id UUID string.
-    pub layout_store: Arc<Mutex<HashMap<String, LayoutNode>>>,
+    /// Replaces the old `layout_store` (session-keyed) with a window-keyed map.
+    /// Windows are supervisor-only; workers never learn about them.
+    /// Layout is persisted to `self.store` (windows table) and mirrored here for
+    /// fast reads without a DB round-trip.
+    pub window_store: Arc<Mutex<HashMap<WindowId, WindowMeta>>>,
+    /// Ordered window list per session. Key: session_id UUID string.
+    /// Index entry is the source of truth for display order.
+    pub session_windows: Arc<Mutex<HashMap<String, Vec<WindowId>>>>,
+    /// Fast pane→window reverse index. Key: PaneId.
+    ///
+    /// Maintained alongside `window_store`: set on pane open/spawn, removed on
+    /// pane close. Shared with `SupervisorWorkerImpl` so `pane_closed` can prune
+    /// ghost leaves without re-querying the window store.
+    pub pane_window_map: Arc<Mutex<HashMap<PaneId, WindowId>>>,
 }
 
 impl SupervisorImpl {
@@ -598,6 +622,49 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
             .map_err(|e| PyreError::SpawnFailed(e.to_string()))?;
 
         let pane_id = PaneId(pane_uuid);
+
+        // Create the default window (position 0, name "1") for this session.
+        let default_window = WindowId::new();
+        let now_ms = Utc::now().timestamp_millis();
+        if let Err(e) = self
+            .store
+            .upsert_window(default_window, sid, "1", 0, now_ms)
+            .await
+        {
+            tracing::warn!("spawn: upsert_window default {session_id_str}: {e:#}");
+        }
+        // Assign the initial pane to the default window in the store.
+        if let Err(e) = self
+            .store
+            .assign_pane_window(pane_id, sid, default_window)
+            .await
+        {
+            tracing::warn!("spawn: assign_pane_window {session_id_str}: {e:#}");
+        }
+        // Warm in-memory window state.
+        {
+            let mut ws = self.window_store.lock().await;
+            ws.insert(
+                default_window,
+                WindowMeta {
+                    session_id: session_id_str.clone(),
+                    name: "1".into(),
+                    position: 0,
+                    layout: Some(LayoutNode::Leaf(pane_id)),
+                },
+            );
+        }
+        {
+            let mut sw = self.session_windows.lock().await;
+            sw.entry(session_id_str.clone())
+                .or_default()
+                .push(default_window);
+        }
+        {
+            let mut pwm = self.pane_window_map.lock().await;
+            pwm.insert(pane_id, default_window);
+        }
+
         self.pane_event_bus.emit(
             pane_id,
             PaneEventKind::Spawned,
@@ -606,6 +673,7 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
         Ok(SpawnResp {
             session: sid,
             pane: pane_id,
+            window: default_window,
         })
     }
 
@@ -787,6 +855,35 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
                 );
                 info.name = Some(stored_name);
             }
+            // Window overlay: look up this pane's window from the in-memory
+            // pane_window_map.  If not present (fresh worker pane, or after daemon
+            // restart before the map was warm), lazily assign it to the session's
+            // default (position-0) window — creating one if none exists yet.
+            let assigned_window = {
+                let pwm = self.pane_window_map.lock().await;
+                pwm.get(&info.id).copied()
+            };
+            let window_id = if let Some(wid) = assigned_window {
+                wid
+            } else {
+                // ponytail: lazy-assign to default window; per-window active hint
+                // is a follow-up if multi-window spawn-without-target becomes common
+                let default_wid = self.get_or_create_default_window(&id, session).await;
+                if let Some(wid) = default_wid {
+                    if let Err(e) = self.store.assign_pane_window(info.id, session, wid).await {
+                        tracing::warn!(
+                            pane = ?info.id,
+                            "list_panes: assign_pane_window failed: {e:#}"
+                        );
+                    }
+                    let mut pwm = self.pane_window_map.lock().await;
+                    pwm.insert(info.id, wid);
+                    wid
+                } else {
+                    WindowId::default()
+                }
+            };
+            info.window = window_id;
             panes.push(info);
         }
         Ok(panes)
@@ -817,6 +914,46 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
             .map_err(|e| PyreError::Io(e.to_string()))?
             .map_err(|e| PyreError::Io(e.to_string()))?;
         let pane_id = PaneId(pane_uuid);
+
+        // Resolve target window: use req.window if non-nil, else default.
+        let target_window = if req.window != WindowId::default() {
+            req.window
+        } else {
+            self.get_or_create_default_window(&session_id_str, req.session)
+                .await
+                .unwrap_or_else(WindowId::new)
+        };
+        // Assign pane → window in store and in-memory map.
+        if let Err(e) = self
+            .store
+            .assign_pane_window(pane_id, req.session, target_window)
+            .await
+        {
+            tracing::warn!("open_pane: assign_pane_window: {e:#}");
+        }
+        {
+            let mut pwm = self.pane_window_map.lock().await;
+            pwm.insert(pane_id, target_window);
+        }
+        // Ensure the window exists in session_windows (create if the caller
+        // passed a window we haven't seen yet — possible when the GUI creates a
+        // window then immediately opens a pane into it).
+        {
+            let mut sw = self.session_windows.lock().await;
+            let entry = sw.entry(session_id_str.clone()).or_default();
+            if !entry.contains(&target_window) {
+                let position = entry.len() as u32;
+                entry.push(target_window);
+                let mut ws = self.window_store.lock().await;
+                ws.entry(target_window).or_insert_with(|| WindowMeta {
+                    session_id: session_id_str.clone(),
+                    name: (position + 1).to_string(),
+                    position,
+                    layout: Some(LayoutNode::Leaf(pane_id)),
+                });
+            }
+        }
+
         self.pane_event_bus.emit(
             pane_id,
             PaneEventKind::Spawned,
@@ -842,23 +979,38 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
             .map_err(|e| PyreError::Io(e.to_string()))?
             .map_err(|e| PyreError::Io(e.to_string()))?;
 
-        // Collapse layout in supervisor's in-memory store + persist.
-        // Collect json under the lock, then release before the async persist.
-        let layout_persist: Option<(SessionId, String)> = {
-            let mut ls = self.layout_store.lock().await;
-            if let Some(tree) = ls.get_mut(&session_id_str) {
-                tree.close(&pane);
-                let json = serde_json::to_string(tree).unwrap_or_default();
-                uuid::Uuid::parse_str(&session_id_str)
-                    .ok()
-                    .map(|u| (SessionId(u), json))
+        // Look up this pane's window, then collapse the layout in window_store.
+        // Collect json under the lock, then release before the async persist
+        // (avoids holding window_store across an await — the prior close_pane
+        // deadlock was caused by this exact pattern with layout_store).
+        let window_id = {
+            let pwm = self.pane_window_map.lock().await;
+            pwm.get(&pane).copied()
+        };
+        let layout_persist: Option<(WindowId, String)> = if let Some(wid) = window_id {
+            let mut ws = self.window_store.lock().await;
+            if let Some(meta) = ws.get_mut(&wid) {
+                if let Some(ref mut tree) = meta.layout {
+                    tree.close(&pane);
+                    let json = serde_json::to_string(tree).unwrap_or_default();
+                    Some((wid, json))
+                } else {
+                    None
+                }
             } else {
                 None
             }
+        } else {
+            None
         };
-        if let Some((sid, json)) = layout_persist {
-            if let Err(e) = self.store.upsert_session_layout(sid, &json).await {
-                tracing::warn!("supervisor: upsert_session_layout on close: {e:#}");
+        // Remove from reverse index.
+        {
+            let mut pwm = self.pane_window_map.lock().await;
+            pwm.remove(&pane);
+        }
+        if let Some((wid, json)) = layout_persist {
+            if let Err(e) = self.store.upsert_window_layout(wid, &json).await {
+                tracing::warn!("supervisor: upsert_window_layout on close_pane: {e:#}");
             }
             self.pane_event_bus
                 .emit(pane, PaneEventKind::LayoutChanged, None);
@@ -1301,6 +1453,300 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
         Ok(evicted)
     }
 
+    // ── Window RPCs (window-model-plan §6.3) ──────────────────────────────
+
+    async fn list_windows(
+        self,
+        _ctx: context::Context,
+        session: SessionId,
+    ) -> Result<Vec<WindowInfo>, PyreError> {
+        let id = session.0.to_string();
+        // Snapshot ordered window IDs for this session from the in-memory index.
+        let window_ids: Vec<WindowId> = {
+            let sw = self.session_windows.lock().await;
+            sw.get(&id).cloned().unwrap_or_default()
+        };
+        // If empty, load from DB (cold start / after restart).
+        let window_ids = if window_ids.is_empty() {
+            let rows = self
+                .store
+                .list_windows(session)
+                .await
+                .map_err(|e| PyreError::Io(e.to_string()))?;
+            let ids: Vec<WindowId> = rows.iter().map(|(wid, _, _)| *wid).collect();
+            // Warm the in-memory index.
+            {
+                let mut ws = self.window_store.lock().await;
+                let mut sw = self.session_windows.lock().await;
+                let entry = sw.entry(id.clone()).or_default();
+                for (wid, name, position) in &rows {
+                    if !entry.contains(wid) {
+                        entry.push(*wid);
+                    }
+                    ws.entry(*wid).or_insert_with(|| WindowMeta {
+                        session_id: id.clone(),
+                        name: name.clone(),
+                        position: *position,
+                        layout: None,
+                    });
+                }
+            }
+            ids
+        } else {
+            window_ids
+        };
+
+        let mut result = Vec::with_capacity(window_ids.len());
+        for wid in window_ids {
+            // Get name and position from in-memory store first.
+            let (name, position) = {
+                let ws = self.window_store.lock().await;
+                if let Some(meta) = ws.get(&wid) {
+                    (meta.name.clone(), meta.position)
+                } else {
+                    continue;
+                }
+            };
+            // Overlay name from DB (same pattern as list_sessions overlays
+            // session names via get_session_name).
+            let name = match self.store.get_window_name(wid).await {
+                Ok(Some(n)) if !n.is_empty() => n,
+                _ => name,
+            };
+            // Count panes assigned to this window via the pane_window_map.
+            let pane_count = {
+                let pwm = self.pane_window_map.lock().await;
+                pwm.values().filter(|&&w| w == wid).count() as u32
+            };
+            result.push(WindowInfo {
+                id: wid,
+                session,
+                name,
+                position,
+                pane_count,
+                created_at: Utc::now(),
+            });
+        }
+        Ok(result)
+    }
+
+    async fn new_window(
+        self,
+        _ctx: context::Context,
+        session: SessionId,
+        name: Option<String>,
+    ) -> Result<WindowId, PyreError> {
+        let id = session.0.to_string();
+        let window_id = WindowId::new();
+        let position = {
+            let sw = self.session_windows.lock().await;
+            sw.get(&id).map(|v| v.len() as u32).unwrap_or(0)
+        };
+        let resolved_name = name.unwrap_or_else(|| (position + 1).to_string());
+        let now_ms = Utc::now().timestamp_millis();
+        self.store
+            .upsert_window(window_id, session, &resolved_name, position, now_ms)
+            .await
+            .map_err(|e| PyreError::Io(e.to_string()))?;
+        {
+            let mut ws = self.window_store.lock().await;
+            ws.insert(
+                window_id,
+                WindowMeta {
+                    session_id: id.clone(),
+                    name: resolved_name,
+                    position,
+                    layout: None,
+                },
+            );
+        }
+        {
+            let mut sw = self.session_windows.lock().await;
+            sw.entry(id).or_default().push(window_id);
+        }
+        Ok(window_id)
+    }
+
+    async fn rename_window(
+        self,
+        _ctx: context::Context,
+        window: WindowId,
+        name: String,
+    ) -> Result<(), PyreError> {
+        // Update in-memory store first.
+        {
+            let mut ws = self.window_store.lock().await;
+            if let Some(meta) = ws.get_mut(&window) {
+                meta.name = name.clone();
+            }
+        }
+        // Persist — mirrors rename_session (supervisor.rs:1136-1139).
+        self.store
+            .rename_window(window, &name)
+            .await
+            .map_err(|e| PyreError::Io(e.to_string()))
+    }
+
+    async fn close_window(self, _ctx: context::Context, window: WindowId) -> Result<(), PyreError> {
+        // Collect panes assigned to this window from the store.
+        let pane_ids = self
+            .store
+            .list_panes_for_window(window)
+            .await
+            .map_err(|e| PyreError::Io(e.to_string()))?;
+
+        // Close each pane through the worker (mirrors the existing close_pane
+        // path without re-running the window-layout collapse — we drop the whole
+        // window below).
+        for pane in &pane_ids {
+            if let Some((session_id_str, slot_idx)) = self.registry.lookup_pane(pane.0).await {
+                if let Some(client) = self.registry.get_ctrl_client(&session_id_str).await {
+                    let _ = client.close_pane(context::current(), slot_idx).await;
+                }
+            }
+            let mut pwm = self.pane_window_map.lock().await;
+            pwm.remove(pane);
+        }
+
+        // Get session_id BEFORE removing the window from window_store.
+        let session_id_opt = {
+            let ws = self.window_store.lock().await;
+            ws.get(&window).map(|m| m.session_id.clone())
+        };
+        // Remove from in-memory state.
+        {
+            let mut ws = self.window_store.lock().await;
+            ws.remove(&window);
+        }
+        if let Some(sid) = session_id_opt {
+            let mut sw = self.session_windows.lock().await;
+            if let Some(v) = sw.get_mut(&sid) {
+                v.retain(|&w| w != window);
+            }
+        }
+        // Persist deletion.
+        self.store
+            .delete_window(window)
+            .await
+            .map_err(|e| PyreError::Io(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn get_window_layout(
+        self,
+        _ctx: context::Context,
+        window: WindowId,
+    ) -> Result<layout::LayoutNode, PyreError> {
+        // Find the session_id for this window (needed for live-pane lookup and
+        // the single-leaf fallback).
+        let session_id_str_opt = {
+            let ws = self.window_store.lock().await;
+            ws.get(&window).map(|m| m.session_id.clone())
+        };
+        // If not in memory, try loading from DB.
+        let session_id_str = if let Some(s) = session_id_str_opt {
+            s
+        } else {
+            // Attempt to find by querying DB — load all windows and warm the cache.
+            // This handles the cold-start case after a daemon restart.
+            return Err(PyreError::NoSuchSession(SessionId(uuid::Uuid::nil())));
+        };
+        let session_id = uuid::Uuid::parse_str(&session_id_str)
+            .map(SessionId)
+            .map_err(|_| {
+                PyreError::Io(format!(
+                    "invalid session uuid in window_store: {session_id_str}"
+                ))
+            })?;
+
+        // ── Step 1: obtain the layout tree ──────────────────────────────────
+        let tree_opt: Option<LayoutNode> = {
+            let ws = self.window_store.lock().await;
+            ws.get(&window).and_then(|m| m.layout.clone())
+        };
+        let mut tree = if let Some(t) = tree_opt {
+            t
+        } else {
+            // Try to restore from the database (mirrors get_session_layout pattern).
+            match self.store.get_window_layout_json(window).await {
+                Ok(Some(json)) => match serde_json::from_str::<LayoutNode>(&json) {
+                    Ok(t) => {
+                        // Warm the in-memory window_store layout.
+                        let mut ws = self.window_store.lock().await;
+                        if let Some(meta) = ws.get_mut(&window) {
+                            meta.layout = Some(t.clone());
+                        }
+                        t
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            ?window,
+                            "get_window_layout: could not deserialize persisted layout: {e:#}"
+                        );
+                        return self
+                            .window_single_leaf_fallback(session_id, &session_id_str)
+                            .await;
+                    }
+                },
+                _ => {
+                    return self
+                        .window_single_leaf_fallback(session_id, &session_id_str)
+                        .await;
+                }
+            }
+        };
+
+        // ── Step 2: lazy ghost-leaf reconcile (mirrors get_session_layout) ───
+        // Filter the live pane set to only panes belonging to this window.
+        let all_live: std::collections::HashSet<PaneId> = self
+            .registry
+            .live_pane_ids(&session_id_str)
+            .await
+            .into_iter()
+            .collect();
+        let window_panes: std::collections::HashSet<PaneId> = {
+            let pwm = self.pane_window_map.lock().await;
+            pwm.iter()
+                .filter(|(_, &w)| w == window)
+                .map(|(p, _)| *p)
+                .collect()
+        };
+        let live: std::collections::HashSet<PaneId> =
+            all_live.intersection(&window_panes).copied().collect();
+
+        if !live.is_empty() {
+            let all_leaves = tree.all_leaves();
+            let ghost_ids: Vec<PaneId> = all_leaves
+                .into_iter()
+                .filter(|id| !live.contains(id))
+                .collect();
+            if !ghost_ids.is_empty() {
+                tracing::warn!(
+                    ?window,
+                    ghosts = ghost_ids.len(),
+                    "get_window_layout: pruning ghost leaves"
+                );
+                for ghost in &ghost_ids {
+                    tree.close(ghost);
+                }
+                let json = serde_json::to_string(&tree).unwrap_or_default();
+                {
+                    let mut ws = self.window_store.lock().await;
+                    if let Some(meta) = ws.get_mut(&window) {
+                        meta.layout = Some(tree.clone());
+                    }
+                }
+                if let Err(e) = self.store.upsert_window_layout(window, &json).await {
+                    tracing::warn!(
+                        ?window,
+                        "get_window_layout: upsert after ghost prune failed: {e:#}"
+                    );
+                }
+            }
+        }
+        Ok(tree)
+    }
+
     // ── Layout RPCs (M7-C, ADR-0005) ──────────────────────────────────────
 
     async fn open_pane_split(
@@ -1348,18 +1794,53 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
 
         let new_pane_id = PaneId(pane_uuid);
 
-        // Update supervisor's in-memory layout and persist.
-        {
-            let mut ls = self.layout_store.lock().await;
-            let tree = ls
-                .entry(session_id_str.clone())
-                .or_insert_with(|| LayoutNode::Leaf(parent));
+        // Key the layout mutation by the PARENT pane's window — not session_id.
+        // This mirrors what get_window_layout reads, keeping layout scoped per-window.
+        let parent_window = {
+            let pwm = self.pane_window_map.lock().await;
+            pwm.get(&parent).copied()
+        };
+        let target_window = if let Some(wid) = parent_window {
+            wid
+        } else {
+            // Fallback: assign to the session's default window.
+            self.get_or_create_default_window(&session_id_str, sid)
+                .await
+                .unwrap_or_else(WindowId::new)
+        };
+
+        // Update the window's in-memory layout and persist.
+        let layout_json: String = {
+            let mut ws = self.window_store.lock().await;
+            let meta = ws.entry(target_window).or_insert_with(|| WindowMeta {
+                session_id: session_id_str.clone(),
+                name: "1".into(),
+                position: 0,
+                layout: Some(LayoutNode::Leaf(parent)),
+            });
+            let tree = meta.layout.get_or_insert(LayoutNode::Leaf(parent));
             tree.split_focused(&parent, new_pane_id, req.orient);
-            let json = serde_json::to_string(tree).unwrap_or_default();
-            drop(ls);
-            if let Err(e) = self.store.upsert_session_layout(sid, &json).await {
-                tracing::warn!("supervisor: upsert_session_layout after split: {e:#}");
-            }
+            serde_json::to_string(tree).unwrap_or_default()
+        }; // lock dropped here — no layout_store across await
+        if let Err(e) = self
+            .store
+            .upsert_window_layout(target_window, &layout_json)
+            .await
+        {
+            tracing::warn!("supervisor: upsert_window_layout after split: {e:#}");
+        }
+
+        // Assign the new pane to the same window as its parent.
+        if let Err(e) = self
+            .store
+            .assign_pane_window(new_pane_id, sid, target_window)
+            .await
+        {
+            tracing::warn!("open_pane_split: assign_pane_window: {e:#}");
+        }
+        {
+            let mut pwm = self.pane_window_map.lock().await;
+            pwm.insert(new_pane_id, target_window);
         }
 
         // Persist → emit (ADR-0005 invariant).
@@ -1380,134 +1861,83 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
         pane: PaneId,
         weight: u16,
     ) -> Result<(), PyreError> {
-        let (session_id_str, _) = self
-            .registry
-            .lookup_pane(pane.0)
-            .await
-            .ok_or(PyreError::NoSuchPane(pane))?;
-
-        let sid = uuid::Uuid::parse_str(&session_id_str)
-            .map(SessionId)
-            .map_err(|_| PyreError::NoSuchPane(pane))?;
-
-        {
-            let mut ls = self.layout_store.lock().await;
-            let tree = ls
-                .get_mut(&session_id_str)
-                .ok_or(PyreError::NoSuchSession(sid))?;
-            tree.set_weight(&pane, weight);
-            let json = serde_json::to_string(tree).unwrap_or_default();
-            drop(ls);
-            self.store
-                .upsert_session_layout(sid, &json)
-                .await
-                .map_err(|e| PyreError::Io(e.to_string()))?;
+        // Resolve the pane's window — same keying strategy as open_pane_split.
+        let window_id = {
+            let pwm = self.pane_window_map.lock().await;
+            pwm.get(&pane).copied()
         }
+        .ok_or(PyreError::NoSuchPane(pane))?;
+
+        let layout_json: String = {
+            let mut ws = self.window_store.lock().await;
+            let meta = ws.get_mut(&window_id).ok_or(PyreError::NoSuchPane(pane))?;
+            let tree = meta.layout.as_mut().ok_or(PyreError::NoSuchPane(pane))?;
+            tree.set_weight(&pane, weight);
+            serde_json::to_string(tree).unwrap_or_default()
+        }; // lock dropped before async call
+        self.store
+            .upsert_window_layout(window_id, &layout_json)
+            .await
+            .map_err(|e| PyreError::Io(e.to_string()))?;
 
         self.pane_event_bus
             .emit(pane, PaneEventKind::LayoutChanged, None);
         Ok(())
     }
 
+    /// Compat shim: return the first (position-0) window's layout for this
+    /// session. New clients should call `get_window_layout` directly.
+    ///
+    /// **Deprecated** — kept for one release per window-model-plan §5.4.
     async fn get_session_layout(
         self,
         _ctx: context::Context,
         session_id: SessionId,
     ) -> Result<layout::LayoutNode, PyreError> {
         let id_str = session_id.0.to_string();
-
-        // ── Step 1: obtain the layout tree ──────────────────────────────────
-        // Prefer the in-memory store.  If absent (daemon restart / first call
-        // after reattach), try to load the persisted JSON from SQLite.
-        let tree_opt = {
-            let ls = self.layout_store.lock().await;
-            ls.get(&id_str).cloned()
+        // Find the first window in the session.
+        let first_window: Option<WindowId> = {
+            let sw = self.session_windows.lock().await;
+            sw.get(&id_str).and_then(|v| v.first().copied())
         };
-
-        let mut tree = if let Some(t) = tree_opt {
-            t
-        } else {
-            // Try to restore from the database.
-            match self.store.get_session_layout_json(session_id).await {
-                Ok(Some(json)) => match serde_json::from_str::<LayoutNode>(&json) {
-                    Ok(t) => {
-                        // Warm the in-memory store so subsequent calls are free.
-                        self.layout_store
-                            .lock()
-                            .await
-                            .insert(id_str.clone(), t.clone());
-                        t
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            session_id = id_str,
-                            "get_session_layout: could not deserialize persisted layout: {e:#}"
-                        );
-                        // Fall through to single-leaf fallback below.
-                        return self.layout_single_leaf_fallback(session_id, &id_str).await;
-                    }
-                },
-                _ => {
-                    // No persisted layout — build from first live pane.
-                    return self.layout_single_leaf_fallback(session_id, &id_str).await;
-                }
-            }
-        };
-
-        // ── Step 2: lazy ghost-leaf reconcile ────────────────────────────────
-        // Remove any Leaf whose PaneId is no longer in the live pane set.
-        // This guards against panes that died via pane_closed before their
-        // layout entry was pruned (race window at startup or after restart).
-        let live: std::collections::HashSet<PaneId> = self
-            .registry
-            .live_pane_ids(&id_str)
-            .await
-            .into_iter()
-            .collect();
-
-        // Only reconcile when the registry has at least one live pane.  If
-        // the registry is empty we cannot distinguish "all panes closed" from
-        // "we haven't registered panes yet after restart" — leave the tree
-        // intact in that case so we don't wipe a valid persisted layout.
-        if !live.is_empty() {
-            let all_leaves = tree.all_leaves();
-            let ghost_ids: Vec<PaneId> = all_leaves
-                .into_iter()
-                .filter(|id| !live.contains(id))
-                .collect();
-
-            if !ghost_ids.is_empty() {
-                tracing::warn!(
-                    session_id = id_str,
-                    ghosts = ghost_ids.len(),
-                    "get_session_layout: pruning ghost leaves"
-                );
-                for ghost in &ghost_ids {
-                    tree.close(ghost);
-                }
-                // Persist the cleaned tree and update in-memory store.
-                let json = serde_json::to_string(&tree).unwrap_or_default();
-                self.layout_store
-                    .lock()
-                    .await
-                    .insert(id_str.clone(), tree.clone());
-                if let Err(e) = self.store.upsert_session_layout(session_id, &json).await {
-                    tracing::warn!(
-                        session_id = id_str,
-                        "get_session_layout: upsert after ghost prune failed: {e:#}"
-                    );
-                }
-            }
+        if let Some(wid) = first_window {
+            return self.get_window_layout(_ctx, wid).await;
         }
-
-        Ok(tree)
+        // session_windows is cold — load from DB.
+        let rows = self
+            .store
+            .list_windows(session_id)
+            .await
+            .map_err(|e| PyreError::Io(e.to_string()))?;
+        if let Some((wid, name, position)) = rows.into_iter().next() {
+            // Warm the in-memory index.
+            {
+                let mut ws = self.window_store.lock().await;
+                ws.entry(wid).or_insert_with(|| WindowMeta {
+                    session_id: id_str.clone(),
+                    name,
+                    position,
+                    layout: None,
+                });
+            }
+            {
+                let mut sw = self.session_windows.lock().await;
+                let entry = sw.entry(id_str).or_default();
+                if !entry.contains(&wid) {
+                    entry.push(wid);
+                }
+            }
+            return self.get_window_layout(_ctx, wid).await;
+        }
+        // No windows at all — fall back to the single-leaf builder.
+        self.window_single_leaf_fallback(session_id, &id_str).await
     }
 }
 
 impl SupervisorImpl {
-    /// Build a single-Leaf layout from the first pane the worker reports.
-    /// Used as the last-resort fallback in `get_session_layout`.
-    async fn layout_single_leaf_fallback(
+    /// Build a single-Leaf layout from the first live pane the worker reports.
+    /// Used as the last-resort fallback in `get_window_layout` / `get_session_layout`.
+    async fn window_single_leaf_fallback(
         &self,
         session_id: SessionId,
         id_str: &str,
@@ -1530,6 +1960,80 @@ impl SupervisorImpl {
         }
         Err(PyreError::NoSuchSession(session_id))
     }
+
+    /// Return the position-0 window for a session, creating one if none exists.
+    ///
+    /// Used by `list_panes` (lazy assignment) and `open_pane` (nil window
+    /// target) to ensure every pane lands in a valid window.
+    async fn get_or_create_default_window(
+        &self,
+        session_id_str: &str,
+        session_id: SessionId,
+    ) -> Option<WindowId> {
+        // Fast path: already in memory.
+        {
+            let sw = self.session_windows.lock().await;
+            if let Some(v) = sw.get(session_id_str) {
+                if let Some(&wid) = v.first() {
+                    return Some(wid);
+                }
+            }
+        }
+        // Load from DB (cold start after restart).
+        if let Ok(rows) = self.store.list_windows(session_id).await {
+            if let Some((wid, name, position)) = rows.into_iter().next() {
+                // Warm in-memory caches.
+                {
+                    let mut ws = self.window_store.lock().await;
+                    ws.entry(wid).or_insert_with(|| WindowMeta {
+                        session_id: session_id_str.to_owned(),
+                        name,
+                        position,
+                        layout: None,
+                    });
+                }
+                {
+                    let mut sw = self.session_windows.lock().await;
+                    let entry = sw.entry(session_id_str.to_owned()).or_default();
+                    if !entry.contains(&wid) {
+                        entry.insert(0, wid);
+                    }
+                }
+                return Some(wid);
+            }
+        }
+        // No windows in DB either — create a default window now.
+        let wid = WindowId::new();
+        let now_ms = Utc::now().timestamp_millis();
+        if let Err(e) = self
+            .store
+            .upsert_window(wid, session_id, "1", 0, now_ms)
+            .await
+        {
+            tracing::warn!(
+                session_id = session_id_str,
+                "get_or_create_default_window: upsert_window failed: {e:#}"
+            );
+            return None;
+        }
+        {
+            let mut ws = self.window_store.lock().await;
+            ws.insert(
+                wid,
+                WindowMeta {
+                    session_id: session_id_str.to_owned(),
+                    name: "1".into(),
+                    position: 0,
+                    layout: None,
+                },
+            );
+        }
+        {
+            let mut sw = self.session_windows.lock().await;
+            sw.entry(session_id_str.to_owned()).or_default().push(wid);
+        }
+        Some(wid)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1542,8 +2046,12 @@ struct SupervisorWorkerImpl {
     event_tx: mpsc::Sender<BlockEvent>,
     pending_registrations: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
     pane_event_bus: Arc<PaneEventBus>,
-    /// Shared with `SupervisorImpl` so `pane_closed` can prune ghost leaves.
-    layout_store: Arc<Mutex<HashMap<String, LayoutNode>>>,
+    /// Shared with `SupervisorImpl` so `pane_closed` can prune ghost leaves
+    /// from the correct window's layout (was layout_store keyed by session).
+    window_store: Arc<Mutex<HashMap<WindowId, WindowMeta>>>,
+    /// Shared reverse index so `pane_closed` can resolve pane → window and
+    /// remove the entry without holding `window_store` across an await.
+    pane_window_map: Arc<Mutex<HashMap<PaneId, WindowId>>>,
     store: Arc<crate::store::Store>,
 }
 
@@ -1625,30 +2133,43 @@ impl SupervisorWorker for SupervisorWorkerImpl {
             self.registry.remove(&session_id).await;
         }
 
-        // Prune the dead pane from the supervisor's layout tree so that
-        // get_session_layout never returns ghost leaves.  This mirrors what
+        // Prune the dead pane from the supervisor's window layout tree so that
+        // get_window_layout never returns ghost leaves.  This mirrors what
         // SupervisorImpl::close_pane does for the RPC-initiated close path;
         // here we handle the case where the pane exits on its own (e.g. the
         // shell finishes, or Ctrl-B x inside the worker).
         if let Some(uuid) = pane_uuid {
             let pane_id = PaneId(uuid);
-            let persist: Option<(SessionId, String)> = {
-                let mut ls = self.layout_store.lock().await;
-                if let Some(tree) = ls.get_mut(&session_id) {
-                    tree.close(&pane_id);
-                    let json = serde_json::to_string(tree).unwrap_or_default();
-                    uuid::Uuid::parse_str(&session_id)
-                        .ok()
-                        .map(|u| (SessionId(u), json))
+
+            // Resolve window from the reverse index; remove the entry.
+            // Hold the lock only for the lookup + removal — not across awaits.
+            let window_id = {
+                let mut pwm = self.pane_window_map.lock().await;
+                pwm.remove(&pane_id)
+            };
+
+            let persist: Option<(WindowId, String)> = if let Some(wid) = window_id {
+                let mut ws = self.window_store.lock().await;
+                if let Some(meta) = ws.get_mut(&wid) {
+                    if let Some(ref mut tree) = meta.layout {
+                        tree.close(&pane_id);
+                        let json = serde_json::to_string(tree).unwrap_or_default();
+                        Some((wid, json))
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
+            } else {
+                None
             };
-            if let Some((sid, json)) = persist {
-                if let Err(e) = self.store.upsert_session_layout(sid, &json).await {
+
+            if let Some((wid, json)) = persist {
+                if let Err(e) = self.store.upsert_window_layout(wid, &json).await {
                     tracing::warn!(
                         session_id,
-                        "pane_closed: upsert_session_layout failed: {e:#}"
+                        "pane_closed: upsert_window_layout failed: {e:#}"
                     );
                 }
                 self.pane_event_bus
@@ -2071,7 +2592,11 @@ pub async fn run(
 
     let pane_event_bus = PaneEventBus::new();
 
-    let layout_store: Arc<Mutex<HashMap<String, LayoutNode>>> =
+    let window_store: Arc<Mutex<HashMap<WindowId, WindowMeta>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let session_windows: Arc<Mutex<HashMap<String, Vec<WindowId>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let pane_window_map: Arc<Mutex<HashMap<PaneId, WindowId>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
     let supervisor_impl = SupervisorImpl {
@@ -2084,7 +2609,9 @@ pub async fn run(
         mirror_registry: mirror_registry.clone(),
         focus_queue: focus_queue.clone(),
         pane_event_bus: pane_event_bus.clone(),
-        layout_store: layout_store.clone(),
+        window_store: window_store.clone(),
+        session_windows: session_windows.clone(),
+        pane_window_map: pane_window_map.clone(),
     };
 
     // Bind the supervisor callback socket (workers dial here to register).
@@ -2111,7 +2638,8 @@ pub async fn run(
         let sw_event_tx = event_tx.clone();
         let sw_pending = pending_registrations.clone();
         let sw_pane_event_bus = pane_event_bus.clone();
-        let sw_layout_store = layout_store.clone();
+        let sw_window_store = window_store.clone();
+        let sw_pane_window_map = pane_window_map.clone();
         let sw_store = store.clone();
         tokio::spawn(async move {
             loop {
@@ -2122,7 +2650,8 @@ pub async fn run(
                             event_tx: sw_event_tx.clone(),
                             pending_registrations: sw_pending.clone(),
                             pane_event_bus: sw_pane_event_bus.clone(),
-                            layout_store: sw_layout_store.clone(),
+                            window_store: sw_window_store.clone(),
+                            pane_window_map: sw_pane_window_map.clone(),
                             store: sw_store.clone(),
                         };
                         let transport = tarpc::serde_transport::new(

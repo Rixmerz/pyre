@@ -59,7 +59,7 @@ async fn run_capture() -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
 
-    let SpawnResp { session, pane } = client
+    let SpawnResp { session, pane, .. } = client
         .spawn(
             tarpc::context::current(),
             SpawnReq {

@@ -122,6 +122,7 @@ async fn run_cross_session_search() -> anyhow::Result<()> {
     let SpawnResp {
         session: session_a,
         pane: _pane_a,
+        window: _,
     } = rpc
         .spawn(
             tarpc::context::current(),
@@ -141,6 +142,7 @@ async fn run_cross_session_search() -> anyhow::Result<()> {
     let SpawnResp {
         session: session_b,
         pane: _pane_b,
+        window: _,
     } = rpc
         .spawn(
             tarpc::context::current(),
@@ -420,7 +422,7 @@ async fn run_close_pane_eviction() -> anyhow::Result<()> {
     let rpc = connect_control(&sock_path).await?;
 
     // ── 2. Spawn session + worker ──────────────────────────────────────────────
-    let SpawnResp { session, pane } = rpc
+    let SpawnResp { session, pane, .. } = rpc
         .spawn(
             tarpc::context::current(),
             SpawnReq {

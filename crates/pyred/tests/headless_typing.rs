@@ -68,7 +68,7 @@ async fn run_headless_typing() -> anyhow::Result<()> {
     };
 
     // ── 3. Spawn session + pane (bash, 102×44) ──────────────────────────────
-    let SpawnResp { session, pane } = ctrl
+    let SpawnResp { session, pane, .. } = ctrl
         .spawn(
             tarpc::context::current(),
             SpawnReq {

@@ -12,7 +12,10 @@ use crate::MODE_CONTROL;
 /// v4: layout-aware daemon — `LayoutNode` in `pyre_proto::layout`;
 ///     `open_pane_split`, `set_pane_weight`, `get_session_layout` RPCs
 ///     (ADR-0005, M7-B).
-pub const PROTO_VERSION: u32 = 4;
+/// v5: window model — `WindowId`, `WindowInfo`; `list_windows`, `new_window`,
+///     `rename_window`, `close_window`, `get_window_layout` RPCs; `PaneInfo`,
+///     `OpenPaneReq`, `SpawnResp` gain `window: WindowId` field.
+pub const PROTO_VERSION: u32 = 5;
 
 /// Client: write `MODE_CONTROL` + little-endian `PROTO_VERSION`.
 pub async fn write_control_client<W: AsyncWrite + Unpin>(w: &mut W) -> io::Result<()> {

@@ -6,7 +6,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{Block, PaneId, SessionId};
+use crate::{Block, PaneId, SessionId, WindowId};
 
 /// Detected coding-agent or shell kind for a pane (heuristic).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -80,9 +80,21 @@ pub struct SessionInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowInfo {
+    pub id: WindowId,
+    pub session: SessionId,
+    pub name: String,
+    pub position: u32,
+    pub pane_count: u32,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaneInfo {
     pub id: PaneId,
     pub session: SessionId,
+    #[serde(default)]
+    pub window: WindowId,
     pub cols: u16,
     pub rows: u16,
     pub shell: String,
@@ -116,6 +128,7 @@ fn default_seen() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenPaneReq {
     pub session: SessionId,
+    pub window: WindowId,
     pub shell: Option<String>,
     pub cwd: Option<PathBuf>,
     pub cols: u16,
@@ -130,6 +143,7 @@ pub struct OpenPaneReq {
 pub struct SpawnResp {
     pub session: SessionId,
     pub pane: PaneId,
+    pub window: WindowId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

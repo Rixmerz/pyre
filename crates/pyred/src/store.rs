@@ -5,8 +5,8 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, TimeZone, Utc};
-use pyre_proto::{Block, BlockId, PaneId, SessionId};
+use chrono::{DateTime, Local, TimeZone, Utc};
+use pyre_proto::{Block, BlockId, LayoutNode, PaneId, SessionId, WindowId};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Pool, Row, Sqlite};
 use uuid::Uuid;
@@ -42,10 +42,35 @@ impl Store {
             .await
             .context("open sqlite")?;
 
+        // ── Pre-migration backup ───────────────────────────────────────────────
+        // If the database file exists but the `windows` table hasn't been
+        // created yet, this is a pre-v4 schema. Copy it for rollback safety
+        // before applying migration 0004.
+        if db_path.exists() {
+            let n: i64 = sqlx::query(
+                "SELECT COUNT(*) AS n FROM sqlite_master \
+                 WHERE type='table' AND name='windows'",
+            )
+            .fetch_one(&pool)
+            .await
+            .context("check windows table")?
+            .try_get("n")
+            .unwrap_or(0);
+            if n == 0 {
+                let ts = Local::now().format("%Y%m%d-%H%M%S");
+                let bak_name = format!("state.db.bak.{ts}");
+                let bak = data_dir.join(&bak_name);
+                std::fs::copy(&db_path, &bak)
+                    .with_context(|| format!("backup state.db -> {}", bak.display()))?;
+            }
+        }
+
         sqlx::migrate!("./migrations")
             .run(&pool)
             .await
             .context("run migrations")?;
+
+        backfill_windows(&pool).await.context("backfill windows")?;
 
         Ok(Self { pool, data_dir })
     }
@@ -77,6 +102,8 @@ impl Store {
     /// Uses `INSERT OR IGNORE` + `UPDATE` so the row is always present before
     /// the layout column is written — safe to call before `upsert_session` for
     /// sessions whose rows are created elsewhere (e.g. hybrid worker path).
+    // Planned for supervisor layout-restore on attach; not yet wired.
+    #[allow(dead_code)]
     pub async fn upsert_session_layout(&self, id: SessionId, layout_json: &str) -> Result<()> {
         sqlx::query("UPDATE sessions SET layout = ?2 WHERE id = ?1")
             .bind(id.0.to_string())
@@ -88,6 +115,8 @@ impl Store {
 
     /// Return the raw JSON layout string for a single session, or `None` if the
     /// session has no persisted layout.
+    // Planned for supervisor layout-restore on attach; not yet wired.
+    #[allow(dead_code)]
     pub async fn get_session_layout_json(&self, id: SessionId) -> Result<Option<String>> {
         let row = sqlx::query("SELECT layout FROM sessions WHERE id = ?1")
             .bind(id.0.to_string())
@@ -336,6 +365,319 @@ impl Store {
         .await?;
         rows.into_iter().map(row_to_block).collect()
     }
+
+    // ── Window management ────────────────────────────────────────────────────
+
+    /// Upsert a window row.
+    ///
+    /// `created_at` is milliseconds since the Unix epoch (matches the DB column
+    /// type). ON CONFLICT updates `name` and `position` so the method is safe
+    /// to call from both create and re-persist paths.
+    ///
+    /// Mirrors `upsert_session` (INSERT … ON CONFLICT DO UPDATE).
+    pub async fn upsert_window(
+        &self,
+        id: WindowId,
+        session: SessionId,
+        name: &str,
+        position: u32,
+        created_at: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO windows (id, session_id, name, position, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET name = excluded.name, position = excluded.position",
+        )
+        .bind(id.0.to_string())
+        .bind(session.0.to_string())
+        .bind(name)
+        .bind(position as i64)
+        .bind(created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Persist the JSON-encoded `LayoutNode` for a window.
+    ///
+    /// Mirrors `upsert_session_layout` (UPDATE … SET layout=?).
+    pub async fn upsert_window_layout(&self, id: WindowId, layout_json: &str) -> Result<()> {
+        sqlx::query("UPDATE windows SET layout = ?2 WHERE id = ?1")
+            .bind(id.0.to_string())
+            .bind(layout_json)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Return the raw JSON layout string for a window, or `None` if the row is
+    /// missing or the `layout` column is NULL.
+    ///
+    /// Mirrors `get_session_layout_json`.
+    pub async fn get_window_layout_json(&self, id: WindowId) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT layout FROM windows WHERE id = ?1")
+            .bind(id.0.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.and_then(|r| r.try_get::<Option<String>, _>("layout").unwrap_or(None)))
+    }
+
+    /// Return all windows for a session ordered by position ascending.
+    ///
+    /// Each entry is `(WindowId, name, position)`.
+    pub async fn list_windows(&self, session: SessionId) -> Result<Vec<(WindowId, String, u32)>> {
+        let rows = sqlx::query(
+            "SELECT id, name, position FROM windows \
+             WHERE session_id = ?1 ORDER BY position ASC",
+        )
+        .bind(session.0.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id_str: String = row.try_get("id")?;
+            if let Ok(uuid) = Uuid::parse_str(&id_str) {
+                let name: String = row.try_get("name")?;
+                let position: i64 = row.try_get("position")?;
+                out.push((WindowId(uuid), name, position.max(0) as u32));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Set the persisted name for a window.
+    ///
+    /// Uses a plain `UPDATE` — windows are always supervisor-created and will
+    /// have rows before being renamed (unlike panes, which workers can spawn
+    /// without touching the supervisor's `panes` table). If the row is absent
+    /// the UPDATE is a safe no-op.
+    pub async fn rename_window(&self, id: WindowId, name: &str) -> Result<()> {
+        sqlx::query("UPDATE windows SET name = ?2 WHERE id = ?1")
+            .bind(id.0.to_string())
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Return the persisted name for a window, or `None` if the row is missing
+    /// or the `name` column is NULL/empty.
+    ///
+    /// Mirrors `get_pane_name` / `get_session_name`.
+    pub async fn get_window_name(&self, id: WindowId) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT name FROM windows WHERE id = ?1")
+            .bind(id.0.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.and_then(|r| {
+            r.try_get::<Option<String>, _>("name")
+                .unwrap_or(None)
+                .filter(|n| !n.is_empty())
+        }))
+    }
+
+    /// Delete a window row. Call after all its panes have been closed.
+    pub async fn delete_window(&self, id: WindowId) -> Result<()> {
+        sqlx::query("DELETE FROM windows WHERE id = ?1")
+            .bind(id.0.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Assign a pane to a window.
+    ///
+    /// Uses `INSERT OR IGNORE` + `UPDATE` (an UPSERT) so a stub pane row is
+    /// created on first assignment if none exists — mirrors `rename_pane` for
+    /// hybrid mode where workers spawn panes without touching the supervisor's
+    /// `panes` table. `session` is required for the initial stub insert.
+    pub async fn assign_pane_window(
+        &self,
+        pane: PaneId,
+        session: SessionId,
+        window: WindowId,
+    ) -> Result<()> {
+        let now = Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT OR IGNORE INTO panes (id, session_id, argv, cols, rows, created_at)
+             VALUES (?1, ?2, '', 0, 0, ?3)",
+        )
+        .bind(pane.0.to_string())
+        .bind(session.0.to_string())
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("UPDATE panes SET window_id = ?2 WHERE id = ?1")
+            .bind(pane.0.to_string())
+            .bind(window.0.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Return all pane IDs assigned to a window.
+    pub async fn list_panes_for_window(&self, window: WindowId) -> Result<Vec<PaneId>> {
+        let rows = sqlx::query("SELECT id FROM panes WHERE window_id = ?1")
+            .bind(window.0.to_string())
+            .fetch_all(&self.pool)
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id_str: String = row.try_get("id")?;
+            if let Ok(uuid) = Uuid::parse_str(&id_str) {
+                out.push(PaneId(uuid));
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Backfill the `windows` table for databases predating migration 0004.
+///
+/// Called once from `Store::open` after `sqlx::migrate!` completes.
+/// Self-guards on `COUNT(*) FROM windows == 0` — a fresh install with zero
+/// sessions and a database that already ran this function both no-op.
+///
+/// For each session row with a persisted `layout` JSON:
+/// - A default window W0 (named "1", position 0) is created carrying the
+///   session's existing tiling tree verbatim.
+/// - Tree panes (leaves of the layout) are assigned to W0.
+/// - Each standalone pane (window_id IS NULL after the tree assignment) gets
+///   its own single-leaf window, reproducing the prior GUI "standalone tab"
+///   mental model (each extra terminal = its own window).
+async fn backfill_windows(pool: &Pool<Sqlite>) -> Result<()> {
+    // Idempotency guard: skip if windows already exist or there are no sessions.
+    let win_count: i64 = sqlx::query("SELECT COUNT(*) AS n FROM windows")
+        .fetch_one(pool)
+        .await?
+        .try_get("n")?;
+    let sess_count: i64 = sqlx::query("SELECT COUNT(*) AS n FROM sessions")
+        .fetch_one(pool)
+        .await?
+        .try_get("n")?;
+    if win_count > 0 || sess_count == 0 {
+        return Ok(());
+    }
+
+    let sessions = sqlx::query("SELECT id, layout FROM sessions ORDER BY created_at ASC")
+        .fetch_all(pool)
+        .await?;
+
+    for row in sessions {
+        let sid_str: String = row.try_get("id")?;
+        let sid = match Uuid::parse_str(&sid_str) {
+            Ok(u) => SessionId(u),
+            Err(_) => continue,
+        };
+        let layout_json: Option<String> = row.try_get("layout").unwrap_or(None);
+        let now = Utc::now().timestamp_millis();
+
+        // Collect pane IDs present in the tiling tree.
+        let tree_panes: Vec<PaneId> = if let Some(ref json) = layout_json {
+            match serde_json::from_str::<LayoutNode>(json) {
+                Ok(node) => node.all_leaves(),
+                Err(_) => vec![],
+            }
+        } else {
+            vec![]
+        };
+
+        // Create default window W0.
+        let w0 = WindowId::new();
+        sqlx::query(
+            "INSERT INTO windows (id, session_id, name, position, created_at)
+             VALUES (?1, ?2, '1', 0, ?3)
+             ON CONFLICT(id) DO UPDATE SET name = excluded.name",
+        )
+        .bind(w0.0.to_string())
+        .bind(sid.0.to_string())
+        .bind(now)
+        .execute(pool)
+        .await?;
+
+        // Carry the session's tiling tree into W0's layout column.
+        if let Some(ref json) = layout_json {
+            sqlx::query("UPDATE windows SET layout = ?2 WHERE id = ?1")
+                .bind(w0.0.to_string())
+                .bind(json.as_str())
+                .execute(pool)
+                .await?;
+        }
+
+        // Assign tree panes to W0.
+        // UUIDs contain only hex digits and hyphens — safe to embed in SQL.
+        if !tree_panes.is_empty() {
+            let ids: String = tree_panes
+                .iter()
+                .map(|p| format!("'{}'", p.0))
+                .collect::<Vec<_>>()
+                .join(",");
+            sqlx::query(&format!(
+                "UPDATE panes SET window_id = ?1 \
+                 WHERE session_id = ?2 AND id IN ({ids})"
+            ))
+            .bind(w0.0.to_string())
+            .bind(sid.0.to_string())
+            .execute(pool)
+            .await?;
+        }
+
+        // Standalone panes: rows for this session with window_id still NULL.
+        let standalone = sqlx::query(
+            "SELECT id, name FROM panes \
+             WHERE session_id = ?1 AND window_id IS NULL \
+             ORDER BY created_at ASC",
+        )
+        .bind(sid.0.to_string())
+        .fetch_all(pool)
+        .await?;
+
+        for (k, prow) in standalone.iter().enumerate() {
+            let pid_str: String = prow.try_get("id")?;
+            let pid = match Uuid::parse_str(&pid_str) {
+                Ok(u) => PaneId(u),
+                Err(_) => continue,
+            };
+            let pane_name: Option<String> = prow.try_get("name").unwrap_or(None);
+
+            let wk = WindowId::new();
+            // Fall back to sequential window number if the pane has no name.
+            // W0 is "1" so the k-th standalone (0-indexed) defaults to "k+1".
+            let win_name = pane_name
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| (k + 1).to_string());
+
+            sqlx::query(
+                "INSERT INTO windows (id, session_id, name, position, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(id) DO UPDATE SET name = excluded.name",
+            )
+            .bind(wk.0.to_string())
+            .bind(sid.0.to_string())
+            .bind(&win_name)
+            .bind((k + 1) as i64)
+            .bind(now)
+            .execute(pool)
+            .await?;
+
+            // Single-leaf layout for this standalone pane.
+            let leaf_json = serde_json::to_string(&LayoutNode::Leaf(pid))?;
+            sqlx::query("UPDATE windows SET layout = ?2 WHERE id = ?1")
+                .bind(wk.0.to_string())
+                .bind(&leaf_json)
+                .execute(pool)
+                .await?;
+
+            // Assign the pane to its own window.
+            sqlx::query("UPDATE panes SET window_id = ?1 WHERE id = ?2")
+                .bind(wk.0.to_string())
+                .bind(pid.0.to_string())
+                .execute(pool)
+                .await?;
+        }
+    }
+
+    Ok(())
 }
 
 fn row_to_block(row: sqlx::sqlite::SqliteRow) -> Result<Block> {

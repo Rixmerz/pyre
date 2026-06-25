@@ -54,7 +54,9 @@ async fn run_send_keys() -> anyhow::Result<()> {
     };
 
     // --- 3. Spawn session+pane ---
-    let SpawnResp { session: _, pane } = client
+    let SpawnResp {
+        session: _, pane, ..
+    } = client
         .spawn(
             tarpc::context::current(),
             SpawnReq {

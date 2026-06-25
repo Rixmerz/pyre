@@ -35,7 +35,7 @@ use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use chrono::Utc;
 use pyre_proto::shell_integration::BASH_SCRIPT;
-use pyre_proto::{BlockEvent, PaneId, SessionId, SpawnReq};
+use pyre_proto::{BlockEvent, PaneId, SessionId, SpawnReq, WindowId};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
@@ -108,9 +108,11 @@ const IN_CHANNEL_CAP: usize = 256;
 /// `pane_name` is the optional human-readable label for the new pane (distinct
 /// from `req.name` which labels the session).
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 pub async fn spawn_pty(
     req: SpawnReq,
     session_id: SessionId,
+    window_id: WindowId,
     pane_name: Option<String>,
     session_name: Option<&str>,
     store: Arc<crate::store::Store>,
@@ -510,6 +512,7 @@ pub async fn spawn_pty(
     Ok(PaneState::new(
         pane_id,
         session_id,
+        window_id,
         pane_name,
         req.cols,
         req.rows,
@@ -531,6 +534,7 @@ pub async fn spawn_pty(
 pub async fn spawn_pty(
     _req: SpawnReq,
     _session_id: SessionId,
+    _window_id: WindowId,
     _pane_name: Option<String>,
     _session_name: Option<&str>,
     _store: Arc<crate::store::Store>,

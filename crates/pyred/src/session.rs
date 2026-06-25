@@ -1,18 +1,20 @@
 //! Multi-pane session registry for pyred.
 //!
-//! Each `SessionState` owns a set of `PaneState`s. The registry holds all
-//! live sessions and provides the coordination surface used by server.rs.
+//! Each `SessionState` owns an ordered list of `WindowState`s and a flat map
+//! of `PaneState`s.  `WindowState` owns the tiling layout (moved off
+//! `SessionState`).  The registry holds all live sessions and provides the
+//! coordination surface used by server.rs.
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use pyre_proto::{
     AgentKind, BlockEvent, LayoutNode, OpenPaneReq, Orient, PaneEvent, PaneEventKind, PaneId,
-    PaneInfo, PaneStateKind, SessionId, SessionInfo, SpawnReq,
+    PaneInfo, PaneStateKind, SessionId, SessionInfo, SpawnReq, WindowId, WindowInfo,
 };
 use std::collections::HashMap;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicU32, AtomicU64, Ordering},
     Arc, Mutex as StdMutex,
 };
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
@@ -25,10 +27,44 @@ use crate::pty::spawn_pty;
 use crate::state::PaneStateTracker;
 use crate::store::Store;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Window state
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Per-window state — owns the tiling layout that was previously on
+/// `SessionState`.
+///
+/// Each session carries an ordered `Vec<Arc<WindowState>>` (index = display
+/// order, which maps 1:1 to pyre-tui's per-session tab list).
+pub struct WindowState {
+    pub id: WindowId,
+    // Retained for reverse-lookup (supervisor list_windows, future S3 reattach).
+    #[allow(dead_code)]
+    pub session: SessionId,
+    /// Human-readable label; may be changed via `rename_window`.
+    pub name: RwLock<String>,
+    /// Persisted tiling layout for this window (moved off `SessionState`,
+    /// ADR-0005).  Initialised to `Leaf(first_pane_id)` when the first pane
+    /// opens into this window.  Mutations are serialised through this `Mutex`
+    /// to prevent concurrent-split races.
+    pub layout: Mutex<Option<LayoutNode>>,
+    /// Ordering within the session's window list.
+    pub position: AtomicU32,
+    pub created_at: DateTime<Utc>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pane state
+// ─────────────────────────────────────────────────────────────────────────────
+
 pub struct PaneState {
     pub id: PaneId,
     pub session: SessionId,
-    /// Optional human-readable label; may be changed at runtime via `rename_pane`.
+    /// Window this pane belongs to.  Immutable after construction — panes do
+    /// not move between windows in v1.
+    pub window: WindowId,
+    /// Optional human-readable label; may be changed at runtime via
+    /// `rename_pane`.
     pub name: RwLock<Option<String>>,
     pub cols: u16,
     pub rows: u16,
@@ -51,11 +87,13 @@ pub struct PaneState {
     /// can only be sent after `child.lock()` is acquired.
     pub child_pid: u32,
     pub ringbuf: Arc<StdMutex<crate::ringbuf::RingBuf>>,
-    /// State tracker — updated by output path and parser; polled by state engine.
+    /// State tracker — updated by output path and parser; polled by state
+    /// engine.
     pub state_tracker: Arc<StdMutex<PaneStateTracker>>,
-    /// Cancelled when the child process exits; unblocks stream handlers so they
-    /// drop their sockets and clients receive EOF.  Sticky: cancelled() resolves
-    /// immediately if already cancelled, eliminating the Notify edge-trigger race.
+    /// Cancelled when the child process exits; unblocks stream handlers so
+    /// they drop their sockets and clients receive EOF.  Sticky: cancelled()
+    /// resolves immediately if already cancelled, eliminating the Notify
+    /// edge-trigger race.
     pub close_token: CancellationToken,
 }
 
@@ -64,6 +102,7 @@ impl PaneState {
     pub(crate) fn new(
         id: PaneId,
         session: SessionId,
+        window: WindowId,
         name: Option<String>,
         cols: u16,
         rows: u16,
@@ -82,6 +121,7 @@ impl PaneState {
         Self {
             id,
             session,
+            window,
             name: RwLock::new(name),
             cols,
             rows,
@@ -132,19 +172,24 @@ impl PaneState {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Session state
+// ─────────────────────────────────────────────────────────────────────────────
+
 pub struct SessionState {
     pub id: SessionId,
     pub name: RwLock<String>,
     pub created_at: DateTime<Utc>,
     pub last_active_at: Mutex<DateTime<Utc>>,
     pub panes: Mutex<HashMap<PaneId, Arc<PaneState>>>,
-    /// Persisted tiling layout for this session (ADR-0005 M7-C).
-    ///
-    /// Initialised to `LayoutNode::Leaf(first_pane_id)` when the first pane
-    /// is created.  Mutations are serialised through this `Mutex` to prevent
-    /// concurrent-split races (ADR-0005 open question #3).
-    pub layout: Mutex<Option<LayoutNode>>,
+    /// Ordered list of windows for this session.  Index = display order.
+    /// `Vec` (not `HashMap`) because order is load-bearing and N is tiny.
+    pub windows: Mutex<Vec<Arc<WindowState>>>,
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Registry
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// Ring buffer capacity for pane events.  Large enough that a briefly
 /// disconnected client can always catch up; small enough to be free memory.
@@ -244,24 +289,43 @@ impl SessionRegistry {
             .filter(|n| !n.is_empty())
             .unwrap_or_else(|| format!("session-{short8}"));
         let now = Utc::now();
+
+        // Create the default window ("1", position 0).
+        let default_window = Arc::new(WindowState {
+            id: WindowId::new(),
+            session: id,
+            name: RwLock::new("1".to_string()),
+            layout: Mutex::new(None),
+            position: AtomicU32::new(0),
+            created_at: now,
+        });
+
         let state = Arc::new(SessionState {
             id,
             name: RwLock::new(resolved_name.clone()),
             created_at: now,
             last_active_at: Mutex::new(now),
             panes: Mutex::new(HashMap::new()),
-            layout: Mutex::new(None),
+            windows: Mutex::new(vec![default_window.clone()]),
         });
         self.sessions.lock().await.insert(id, state.clone());
-        // Best-effort: persist the new session row. Errors are non-fatal here
-        // because the in-memory registry is the authoritative source in S3.
+
+        // Best-effort: persist session and default window rows.
         if let Err(e) = store.upsert_session(id, &resolved_name).await {
             tracing::warn!("upsert_session {id}: {e:#}");
         }
+        if let Err(e) = store
+            .upsert_window(default_window.id, id, "1", 0, now.timestamp_millis())
+            .await
+        {
+            tracing::warn!("upsert_window default {}: {e:#}", default_window.id);
+        }
+
         state
     }
 
-    /// Open a new pane inside an existing session. Spawns the PTY.
+    /// Open a new pane inside an existing session, inside the window
+    /// identified by `req.window`.  Spawns the PTY.
     pub async fn open_pane(
         self: &Arc<Self>,
         session_id: SessionId,
@@ -278,6 +342,18 @@ impl SessionRegistry {
                 .ok_or_else(|| anyhow!("no such session {session_id}"))?
         };
 
+        // Resolve target window — find or fall back to first.
+        let window = {
+            let wins = session.windows.lock().await;
+            wins.iter()
+                .find(|w| w.id == req.window)
+                .cloned()
+                .or_else(|| wins.first().cloned())
+        }
+        .ok_or_else(|| anyhow!("session {session_id} has no windows"))?;
+
+        let window_id = window.id;
+
         // Convert OpenPaneReq to the SpawnReq shape spawn_pty expects.
         let pane_name = req.name.clone();
         let spawn_req = SpawnReq {
@@ -289,13 +365,13 @@ impl SessionRegistry {
             name: None,
         };
 
-        // Read the session name so spawn_pty can re-persist it correctly
-        // (instead of overwriting with empty string).
+        // Read the session name so spawn_pty can re-persist it correctly.
         let session_name_str = session.name.read().await.clone();
 
         let raw = spawn_pty(
             spawn_req,
             session_id,
+            window_id,
             pane_name,
             Some(&session_name_str),
             store.clone(),
@@ -305,20 +381,29 @@ impl SessionRegistry {
         .await?;
         let pane = Arc::new(raw);
 
+        // Assign the pane to its window in the store.
+        if let Err(e) = store
+            .assign_pane_window(pane.id, session_id, window_id)
+            .await
+        {
+            tracing::warn!("assign_pane_window {}: {e:#}", pane.id);
+        }
+
         session.panes.lock().await.insert(pane.id, pane.clone());
         *session.last_active_at.lock().await = Utc::now();
 
-        // Initialise layout on first pane: Leaf(pane_id).  Subsequent panes
-        // are added via open_pane_split which calls split_focused explicitly.
+        // Initialise layout on first pane in this window: Leaf(pane_id).
+        // Subsequent panes are added via open_pane_split which calls
+        // split_focused explicitly.
         {
-            let mut layout = session.layout.lock().await;
+            let mut layout = window.layout.lock().await;
             if layout.is_none() {
                 *layout = Some(LayoutNode::Leaf(pane.id));
                 let json =
                     serde_json::to_string(layout.as_ref().expect("just set")).unwrap_or_default();
                 drop(layout);
-                if let Err(e) = store.upsert_session_layout(session.id, &json).await {
-                    tracing::warn!("upsert_session_layout {}: {e:#}", session.id);
+                if let Err(e) = store.upsert_window_layout(window_id, &json).await {
+                    tracing::warn!("upsert_window_layout {}: {e:#}", window_id);
                 }
             }
         }
@@ -356,37 +441,67 @@ impl SessionRegistry {
         None
     }
 
+    /// Find the `Arc<WindowState>` for a given `WindowId` by scanning all
+    /// sessions.  Returns `None` if no session owns a window with that id.
+    async fn find_window(&self, window_id: WindowId) -> Option<Arc<WindowState>> {
+        let sessions = self.sessions.lock().await;
+        for sess in sessions.values() {
+            let wins = sess.windows.lock().await;
+            if let Some(w) = wins.iter().find(|w| w.id == window_id) {
+                return Some(w.clone());
+            }
+        }
+        None
+    }
+
     pub async fn close_pane(&self, pane_id: PaneId, store: Option<&Store>) -> Result<()> {
         let (session, pane) = self
             .get_pane(pane_id)
             .await
             .ok_or_else(|| anyhow!("no such pane {pane_id}"))?;
 
+        let window_id = pane.window;
+
         pane.kill()?;
         *pane.closed_at.lock().await = Some(Utc::now());
         session.panes.lock().await.remove(&pane_id);
 
-        // Collapse the layout tree. Drop the layout lock before the async
-        // SQLite write — same pattern as open_pane / open_pane_split — so we
-        // never hold an async mutex guard across an .await point (which would
-        // stall any concurrent caller that also needs session.layout).
+        // Collapse the layout tree for the pane's window.
         //
-        // ADR-0005 write-before-broadcast invariant is preserved: we
-        // persist first, emit LayoutChanged only after the block exits.
-        let (layout_changed, persist_json) = {
-            let mut layout = session.layout.lock().await;
+        // Drop the layout lock before the async SQLite write — same pattern
+        // as open_pane / open_pane_split — so we never hold an async mutex
+        // guard across an .await point.
+        //
+        // ADR-0005 write-before-broadcast invariant: persist first, emit
+        // LayoutChanged only after the block exits.
+        let window = {
+            session
+                .windows
+                .lock()
+                .await
+                .iter()
+                .find(|w| w.id == window_id)
+                .cloned()
+        };
+
+        let (layout_changed, persist_json) = if let Some(ref win) = window {
+            let mut layout = win.layout.lock().await;
             if let Some(ref mut tree) = *layout {
                 tree.close(&pane_id);
                 let json = serde_json::to_string(tree).unwrap_or_default();
-                (true, Some(json))
+                (true, Some((win.id, json)))
             } else {
                 (false, None)
             }
+            // layout lock released here
+        } else {
+            (false, None)
         };
+
         // layout lock is now released — safe to await the SQLite write.
-        if let (Some(s), Some(json)) = (store, persist_json) {
-            if let Err(e) = s.upsert_session_layout(session.id, &json).await {
-                tracing::warn!("upsert_session_layout on close {}: {e:#}", session.id);
+        if let (Some(s), Some((win_id, json))) = (store, persist_json) {
+            if let Err(e) = s.upsert_window_layout(win_id, &json).await {
+                tracing::warn!("upsert_window_layout on close {}: {e:#}", win_id);
             }
         }
         if layout_changed {
@@ -400,9 +515,14 @@ impl SessionRegistry {
 
     /// Retrieve the current `LayoutNode` for a session, falling back to a
     /// single-leaf layout built from the first live pane if none is set.
+    ///
+    /// **Compat shim** — returns the first/default window's layout.  New
+    /// clients should use `get_window_layout` instead.
     pub async fn get_layout(&self, session_id: SessionId) -> Option<LayoutNode> {
         let session = self.get_session(session_id).await?;
-        let layout = session.layout.lock().await;
+        // Get the first window without holding the sessions lock.
+        let window = session.windows.lock().await.first().cloned()?;
+        let layout = window.layout.lock().await;
         if let Some(ref tree) = *layout {
             return Some(tree.clone());
         }
@@ -412,8 +532,29 @@ impl SessionRegistry {
         panes.values().next().map(|p| LayoutNode::Leaf(p.id))
     }
 
+    /// Return the `LayoutNode` for a specific window, falling back to a
+    /// single-leaf layout from the first live pane in that window if none
+    /// is stored.
+    pub async fn get_window_layout(&self, window_id: WindowId) -> Option<LayoutNode> {
+        let window = self.find_window(window_id).await?;
+        let layout = window.layout.lock().await;
+        if let Some(ref tree) = *layout {
+            return Some(tree.clone());
+        }
+        // Fallback: single-leaf from first pane in the window (linear scan).
+        drop(layout);
+        let sessions = self.sessions.lock().await;
+        for sess in sessions.values() {
+            let panes = sess.panes.lock().await;
+            if let Some(p) = panes.values().find(|p| p.window == window_id) {
+                return Some(LayoutNode::Leaf(p.id));
+            }
+        }
+        None
+    }
+
     /// Split `parent_pane` in half, spawn a new sibling pane, update the
-    /// session layout, persist, and emit `LayoutChanged`.
+    /// window layout, persist, and emit `LayoutChanged`.
     ///
     /// Returns the `PaneId` of the newly created sibling pane.
     #[allow(clippy::too_many_arguments)]
@@ -432,9 +573,23 @@ impl SessionRegistry {
             .await
             .ok_or_else(|| anyhow!("no such pane {parent_pane}"))?;
 
-        // Build the open-pane request mirroring the parent pane's settings.
+        let window_id = parent_state.window;
+
+        // Resolve window Arc — needed later for layout mutation.
+        let window = session
+            .windows
+            .lock()
+            .await
+            .iter()
+            .find(|w| w.id == window_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("no window {window_id} in session {}", session.id))?;
+
+        // Build the open-pane request mirroring the parent pane's settings,
+        // targeting the same window.
         let open_req = OpenPaneReq {
             session: session.id,
+            window: window_id,
             shell: cmd.or_else(|| Some(parent_state.shell.clone())),
             cwd,
             cols: parent_state.cols,
@@ -443,20 +598,23 @@ impl SessionRegistry {
             name,
         };
 
-        // Spawn the new pane (registers it in session.panes).
+        // Spawn the new pane (registers it in session.panes and the window's
+        // layout is initialised to Leaf if it was empty — but here the window
+        // already has a Leaf for the parent, so open_pane's init block is a
+        // no-op).
         let new_pane = self
             .open_pane(session.id, open_req, store.clone(), block_index)
             .await?;
 
         // Mutate the layout under the mutex — serialize concurrent splits.
         {
-            let mut layout = session.layout.lock().await;
+            let mut layout = window.layout.lock().await;
             let tree = layout.get_or_insert_with(|| LayoutNode::Leaf(parent_pane));
             tree.split_focused(&parent_pane, new_pane.id, orient);
             let json = serde_json::to_string(tree).unwrap_or_default();
             drop(layout);
-            if let Err(e) = store.upsert_session_layout(session.id, &json).await {
-                tracing::warn!("upsert_session_layout after split {}: {e:#}", session.id);
+            if let Err(e) = store.upsert_window_layout(window_id, &json).await {
+                tracing::warn!("upsert_window_layout after split {}: {e:#}", window_id);
             }
         }
 
@@ -469,43 +627,191 @@ impl SessionRegistry {
     /// Adjust the weight of the split-child containing `pane`, clamp to
     /// `[5, 95]`, rebalance siblings, persist, emit `LayoutChanged`.
     pub async fn set_pane_weight(&self, pane: PaneId, weight: u16, store: &Store) -> Result<()> {
-        let (session, _) = self
+        let (session, pane_state) = self
             .get_pane(pane)
             .await
             .ok_or_else(|| anyhow!("no such pane {pane}"))?;
 
+        let window_id = pane_state.window;
+        let window = session
+            .windows
+            .lock()
+            .await
+            .iter()
+            .find(|w| w.id == window_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("no window {window_id} for pane {pane}"))?;
+
         {
-            let mut layout = session.layout.lock().await;
+            let mut layout = window.layout.lock().await;
             let tree = layout
                 .as_mut()
-                .ok_or_else(|| anyhow!("session has no layout"))?;
+                .ok_or_else(|| anyhow!("window has no layout"))?;
             tree.set_weight(&pane, weight);
             let json = serde_json::to_string(tree).unwrap_or_default();
             drop(layout);
-            store.upsert_session_layout(session.id, &json).await?;
+            store.upsert_window_layout(window_id, &json).await?;
         }
 
         self.emit_event(pane, PaneEventKind::LayoutChanged, None, None);
         Ok(())
     }
 
-    /// Persist a layout JSON string to the store and update the in-memory state.
-    #[allow(dead_code)]
-    pub async fn persist_layout_json(
+    // ── Window management ────────────────────────────────────────────────────
+
+    /// Create a new window in `session_id` and persist it to the store.
+    ///
+    /// `name` defaults to the next integer label (len+1) when absent.
+    pub async fn new_window(
         &self,
         session_id: SessionId,
-        json: &str,
-        store: &Store,
-    ) -> Result<()> {
+        name: Option<String>,
+        store: Arc<Store>,
+    ) -> Result<Arc<WindowState>> {
         let session = self
             .get_session(session_id)
             .await
             .ok_or_else(|| anyhow!("no such session {session_id}"))?;
-        let node: LayoutNode =
-            serde_json::from_str(json).map_err(|e| anyhow!("invalid layout JSON: {e}"))?;
-        *session.layout.lock().await = Some(node);
-        store.upsert_session_layout(session_id, json).await
+
+        let position = session.windows.lock().await.len() as u32;
+        let win_name = name
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| (position + 1).to_string());
+
+        let now = Utc::now();
+        let window = Arc::new(WindowState {
+            id: WindowId::new(),
+            session: session_id,
+            name: RwLock::new(win_name.clone()),
+            layout: Mutex::new(None),
+            position: AtomicU32::new(position),
+            created_at: now,
+        });
+
+        session.windows.lock().await.push(window.clone());
+
+        if let Err(e) = store
+            .upsert_window(
+                window.id,
+                session_id,
+                &win_name,
+                position,
+                now.timestamp_millis(),
+            )
+            .await
+        {
+            tracing::warn!("upsert_window {}: {e:#}", window.id);
+        }
+
+        Ok(window)
     }
+
+    /// Return `Vec<WindowInfo>` for all windows in `session_id`.
+    ///
+    /// `pane_count` is computed from the in-memory pane map.
+    pub async fn list_windows(&self, session_id: SessionId) -> Vec<WindowInfo> {
+        let session = match self.get_session(session_id).await {
+            Some(s) => s,
+            None => return vec![],
+        };
+
+        // Snapshot both lists without holding two locks simultaneously.
+        let wins: Vec<Arc<WindowState>> = session.windows.lock().await.clone();
+        let pane_windows: Vec<WindowId> = session
+            .panes
+            .lock()
+            .await
+            .values()
+            .map(|p| p.window)
+            .collect();
+
+        let mut out = Vec::with_capacity(wins.len());
+        for w in &wins {
+            let pane_count = pane_windows.iter().filter(|&&wid| wid == w.id).count() as u32;
+            out.push(WindowInfo {
+                id: w.id,
+                session: session_id,
+                name: w.name.read().await.clone(),
+                position: w.position.load(Ordering::Relaxed),
+                pane_count,
+                created_at: w.created_at,
+            });
+        }
+        out
+    }
+
+    /// Rename a window in-memory and persist to SQLite.
+    pub async fn rename_window(
+        &self,
+        window_id: WindowId,
+        name: String,
+        store: &Store,
+    ) -> anyhow::Result<()> {
+        let window = self
+            .find_window(window_id)
+            .await
+            .ok_or_else(|| anyhow!("no such window {window_id}"))?;
+        *window.name.write().await = name.clone();
+        store.rename_window(window_id, &name).await?;
+        Ok(())
+    }
+
+    /// Close all panes in `window_id`, remove the window from its session,
+    /// and delete the row from the store.  Evicts the session if no windows
+    /// remain.
+    pub async fn close_window(&self, window_id: WindowId, store: Arc<Store>) -> anyhow::Result<()> {
+        // Step 1: find pane IDs and session_id while holding locks briefly.
+        // We release all locks before calling close_pane to avoid holding
+        // sessions lock across evict_session_if_empty (which also locks sessions).
+        let (session_id, pane_ids) = {
+            let sessions = self.sessions.lock().await;
+            let mut found: Option<(SessionId, Vec<PaneId>)> = None;
+            'outer: for sess in sessions.values() {
+                let wins = sess.windows.lock().await;
+                if wins.iter().any(|w| w.id == window_id) {
+                    let panes = sess.panes.lock().await;
+                    let ids = panes
+                        .values()
+                        .filter(|p| p.window == window_id)
+                        .map(|p| p.id)
+                        .collect();
+                    found = Some((sess.id, ids));
+                    break 'outer;
+                }
+            }
+            found.ok_or_else(|| anyhow!("no such window {window_id}"))?
+            // all locks dropped here
+        };
+
+        // Step 2: close each pane (may call evict_session_if_empty internally).
+        for pane_id in pane_ids {
+            if let Err(e) = self.close_pane(pane_id, Some(&store)).await {
+                tracing::warn!("close_window {window_id}: close_pane {pane_id}: {e:#}");
+            }
+        }
+
+        // Step 3: remove the window from the session's list (session may have
+        // been evicted above if it had no panes in other windows).
+        if let Some(sess) = self.get_session(session_id).await {
+            sess.windows.lock().await.retain(|w| w.id != window_id);
+            // Evict session if it now has no windows.
+            if sess.windows.lock().await.is_empty() {
+                self.sessions.lock().await.remove(&session_id);
+                tracing::info!(
+                    "session {session_id} removed (last window closed via close_window)"
+                );
+            }
+        }
+
+        // Step 4: delete window row from store.
+        if let Err(e) = store.delete_window(window_id).await {
+            tracing::warn!("delete_window {window_id}: {e:#}");
+        }
+
+        Ok(())
+    }
+
+    // ── Misc helpers ─────────────────────────────────────────────────────────
 
     /// Remove `session_id` from the registry if it has no remaining panes.
     ///
@@ -526,7 +832,7 @@ impl SessionRegistry {
         }
     }
 
-    pub async fn list_sessions(&self) -> Vec<SessionInfo> {
+    pub async fn list_sessions(&self) -> Vec<pyre_proto::SessionInfo> {
         let sessions = self.sessions.lock().await;
         let mut out = Vec::with_capacity(sessions.len());
         for s in sessions.values() {
@@ -704,6 +1010,7 @@ async fn pane_info_from_state(p: &Arc<PaneState>) -> PaneInfo {
     PaneInfo {
         id: p.id,
         session: p.session,
+        window: p.window,
         cols: p.cols,
         rows: p.rows,
         shell: p.shell.clone(),
@@ -727,47 +1034,48 @@ async fn pane_info_from_state(p: &Arc<PaneState>) -> PaneInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pyre_proto::{LayoutNode, Orient, PaneId};
+    use pyre_proto::{LayoutNode, Orient, PaneId, WindowId};
 
-    /// A freshly created `SessionState` has no layout until the first pane opens.
+    /// A freshly created `WindowState` has no layout until the first pane
+    /// opens.
     #[tokio::test]
-    async fn default_layout_is_none_before_first_pane() {
-        let sess = SessionState {
-            id: SessionId::new(),
-            name: RwLock::new("test".into()),
-            created_at: Utc::now(),
-            last_active_at: Mutex::new(Utc::now()),
-            panes: Mutex::new(HashMap::new()),
+    async fn default_window_layout_is_none() {
+        let win = WindowState {
+            id: WindowId::new(),
+            session: SessionId::new(),
+            name: RwLock::new("1".into()),
             layout: Mutex::new(None),
+            position: AtomicU32::new(0),
+            created_at: Utc::now(),
         };
-        let layout = sess.layout.lock().await;
+        let layout = win.layout.lock().await;
         assert!(layout.is_none(), "layout must be None before first pane");
     }
 
-    /// Initialising layout to a single Leaf then splitting produces the correct
-    /// tree without touching the real PTY or store.
+    /// Initialising layout to a single Leaf then splitting produces the
+    /// correct tree without touching the real PTY or store.
     #[tokio::test]
     async fn apply_split_updates_layout_node() {
         let pane_a = PaneId::new();
         let pane_b = PaneId::new();
 
-        let sess = SessionState {
-            id: SessionId::new(),
-            name: RwLock::new("test".into()),
-            created_at: Utc::now(),
-            last_active_at: Mutex::new(Utc::now()),
-            panes: Mutex::new(HashMap::new()),
+        let win = WindowState {
+            id: WindowId::new(),
+            session: SessionId::new(),
+            name: RwLock::new("1".into()),
             layout: Mutex::new(Some(LayoutNode::Leaf(pane_a))),
+            position: AtomicU32::new(0),
+            created_at: Utc::now(),
         };
 
         // Simulate what open_pane_split does: split the focused leaf.
         {
-            let mut layout = sess.layout.lock().await;
+            let mut layout = win.layout.lock().await;
             let tree = layout.as_mut().expect("layout set");
             tree.split_focused(&pane_a, pane_b, Orient::Vertical);
         }
 
-        let layout = sess.layout.lock().await;
+        let layout = win.layout.lock().await;
         let tree = layout.as_ref().expect("layout present");
         let vp = pyre_proto::layout::Rect {
             x: 0,
@@ -825,10 +1133,9 @@ mod tests {
         assert!(leaves[1].1.w <= 250, "pane_b should be ~200px wide");
     }
 
-    /// Ghost-leaf prune: closing a dead pane from a VSplit via `LayoutNode::close`
-    /// removes only the dead leaf and collapses the split correctly.
-    /// This is the same operation performed by the lazy reconcile in
-    /// `get_session_layout` (supervisor) and `close_pane` (single-mode).
+    /// Ghost-leaf prune: closing a dead pane from a VSplit via
+    /// `LayoutNode::close` removes only the dead leaf and collapses the
+    /// split correctly.
     #[tokio::test]
     async fn ghost_leaf_prune_collapses_dead_pane() {
         let live = PaneId::new();

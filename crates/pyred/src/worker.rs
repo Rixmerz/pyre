@@ -28,7 +28,7 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use pyre_proto::supervisor::{
     BlockEvent, BlockKind, RpcError, SupervisorWorkerClient, WorkerControl,
 };
-use pyre_proto::{InputFrame, OutputFrame, PaneInfo, PaneStateKind, SessionId};
+use pyre_proto::{InputFrame, OutputFrame, PaneInfo, PaneStateKind, SessionId, WindowId};
 use std::sync::Mutex as StdMutex;
 use tarpc::server::{BaseChannel, Channel};
 use tarpc::tokio_serde::formats::Bincode;
@@ -482,6 +482,9 @@ impl WorkerState {
         Ok(PaneInfo {
             id: pyre_proto::PaneId::default(),
             session: SessionId(session_uuid),
+            // Workers do not know about windows; the supervisor overlays the real
+            // WindowId in list_panes via the pane_window_map index.
+            window: WindowId::default(),
             cols: h.cols,
             rows: h.rows,
             shell: h.shell.clone(),

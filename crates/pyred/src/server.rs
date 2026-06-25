@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex};
 use pyre_proto::{
     layout, AttachAck, Block, BlockHit, BlockId, ListBlocksReq, OpenPaneReq, OpenPaneSplitReq,
     PaneEvent, PaneId, PaneInfo, PaneStateKind, PyreError, ReplayBlocks, ResizePaneReq,
-    ResizePaneRes, SearchBlocksReq, SessionId, SessionInfo, SpawnReq, SpawnResp,
+    ResizePaneRes, SearchBlocksReq, SessionId, SessionInfo, SpawnReq, SpawnResp, WindowId,
+    WindowInfo,
 };
 use tarpc::context;
 
@@ -18,8 +19,9 @@ pub struct DaemonImpl {
     pub registry: Arc<SessionRegistry>,
     pub store: Arc<crate::store::Store>,
     pub block_index: Arc<BlockIndex>,
-    /// Pending focus requests enqueued by `request_focus` and dequeued by `take_focus_request`.
-    /// Shared across all control connections so pyrec and the TUI see the same queue.
+    /// Pending focus requests enqueued by `request_focus` and dequeued by
+    /// `take_focus_request`.  Shared across all control connections so pyrec
+    /// and the TUI see the same queue.
     pub focus_queue: Arc<Mutex<VecDeque<PaneId>>>,
 }
 
@@ -29,8 +31,19 @@ impl pyre_proto::service::PyreDaemon for DaemonImpl {
             .registry
             .new_session(self.store.clone(), req.name.clone())
             .await;
+
+        // Retrieve the default window created by new_session.
+        let default_window_id = session
+            .windows
+            .lock()
+            .await
+            .first()
+            .map(|w| w.id)
+            .ok_or_else(|| PyreError::SpawnFailed("new session has no window".into()))?;
+
         let open_req = OpenPaneReq {
             session: session.id,
+            window: default_window_id,
             shell: req.shell,
             cwd: req.cwd,
             cols: req.cols,
@@ -51,6 +64,7 @@ impl pyre_proto::service::PyreDaemon for DaemonImpl {
         Ok(SpawnResp {
             session: session.id,
             pane: pane.id,
+            window: default_window_id,
         })
     }
 
@@ -514,6 +528,8 @@ impl pyre_proto::service::PyreDaemon for DaemonImpl {
             .map_err(|e| PyreError::Io(e.to_string()))
     }
 
+    /// **Deprecated compat shim** — returns the first/default window's layout.
+    /// New clients should call `get_window_layout` instead.
     async fn get_session_layout(
         self,
         _ctx: context::Context,
@@ -582,5 +598,58 @@ impl pyre_proto::service::PyreDaemon for DaemonImpl {
         }
 
         Ok(collected)
+    }
+
+    // ── Window RPCs (window-model-plan §5.3, §6.2) ────────────────────────
+
+    async fn list_windows(
+        self,
+        _ctx: context::Context,
+        session: SessionId,
+    ) -> Result<Vec<WindowInfo>, PyreError> {
+        Ok(self.registry.list_windows(session).await)
+    }
+
+    async fn new_window(
+        self,
+        _ctx: context::Context,
+        session: SessionId,
+        name: Option<String>,
+    ) -> Result<WindowId, PyreError> {
+        self.registry
+            .new_window(session, name, self.store.clone())
+            .await
+            .map(|w| w.id)
+            .map_err(|_| PyreError::NoSuchSession(session))
+    }
+
+    async fn rename_window(
+        self,
+        _ctx: context::Context,
+        window: WindowId,
+        name: String,
+    ) -> Result<(), PyreError> {
+        self.registry
+            .rename_window(window, name, &self.store)
+            .await
+            .map_err(|e| PyreError::Io(e.to_string()))
+    }
+
+    async fn close_window(self, _ctx: context::Context, window: WindowId) -> Result<(), PyreError> {
+        self.registry
+            .close_window(window, self.store.clone())
+            .await
+            .map_err(|e| PyreError::Io(e.to_string()))
+    }
+
+    async fn get_window_layout(
+        self,
+        _ctx: context::Context,
+        window: WindowId,
+    ) -> Result<layout::LayoutNode, PyreError> {
+        self.registry
+            .get_window_layout(window)
+            .await
+            .ok_or(PyreError::NoSuchSession(SessionId::new()))
     }
 }

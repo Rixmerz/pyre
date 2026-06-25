@@ -21,7 +21,7 @@ pub use service::{
 };
 pub use sessions::{
     AgentKind, OpenPaneReq, PaneInfo, PaneStateKind, ReplayBlocks, ResizePaneReq, ResizePaneRes,
-    SessionInfo, SpawnResp,
+    SessionInfo, SpawnResp, WindowInfo,
 };
 pub use socket::{attach_stream, connect_control, default_socket};
 pub use supervisor::{
@@ -62,6 +62,7 @@ macro_rules! id_newtype {
 id_newtype!(SessionId);
 id_newtype!(PaneId);
 id_newtype!(BlockId);
+id_newtype!(WindowId);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {

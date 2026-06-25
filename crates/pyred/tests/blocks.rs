@@ -107,7 +107,7 @@ async fn run_blocks_test() -> anyhow::Result<()> {
     );
     let rpc_client = PyreDaemonClient::new(client::Config::default(), transport).spawn();
 
-    let SpawnResp { session, pane } = rpc_client
+    let SpawnResp { session, pane, .. } = rpc_client
         .spawn(
             tarpc::context::current(),
             SpawnReq {

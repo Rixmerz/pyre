@@ -166,7 +166,11 @@ async fn run_multi_pane_test() -> anyhow::Result<()> {
     let (handle, rpc) = spawn_pyred().await?;
 
     // 1. Spawn session + first pane.
-    let SpawnResp { session, pane: p1 } = rpc
+    let SpawnResp {
+        session,
+        pane: p1,
+        window,
+    } = rpc
         .spawn(
             tarpc::context::current(),
             SpawnReq {
@@ -188,6 +192,7 @@ async fn run_multi_pane_test() -> anyhow::Result<()> {
             tarpc::context::current(),
             OpenPaneReq {
                 session,
+                window,
                 shell: Some("/bin/sh".into()),
                 cwd: None,
                 cols: 80,
@@ -297,7 +302,7 @@ async fn mirror_two_clients_receive_same_output() {
 async fn run_mirror_test() -> anyhow::Result<()> {
     let (handle, rpc) = spawn_pyred().await?;
 
-    let SpawnResp { session, pane } = rpc
+    let SpawnResp { session, pane, .. } = rpc
         .spawn(
             tarpc::context::current(),
             SpawnReq {
@@ -422,7 +427,7 @@ async fn reattach_first_output_is_ringbuf_replay() {
 async fn run_reattach_test() -> anyhow::Result<()> {
     let (handle, rpc) = spawn_pyred().await?;
 
-    let SpawnResp { session, pane } = rpc
+    let SpawnResp { session, pane, .. } = rpc
         .spawn(
             tarpc::context::current(),
             SpawnReq {

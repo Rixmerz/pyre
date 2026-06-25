@@ -108,6 +108,7 @@ async fn run_prod_smoke() -> anyhow::Result<()> {
     let SpawnResp {
         session,
         pane: pane1,
+        window,
     } = rpc
         .spawn(
             tarpc::context::current(),
@@ -130,6 +131,7 @@ async fn run_prod_smoke() -> anyhow::Result<()> {
             tarpc::context::current(),
             OpenPaneReq {
                 session,
+                window,
                 shell: Some("/bin/sh".into()),
                 cwd: None,
                 cols: 80,
@@ -265,7 +267,7 @@ async fn run_close_pane_eviction() -> anyhow::Result<()> {
     let (child, _sock, rpc) = spawn_daemon(&tmpdir).await?;
 
     // ── 2. Spawn session with one pane ────────────────────────────────────────
-    let SpawnResp { session, pane } = rpc
+    let SpawnResp { session, pane, .. } = rpc
         .spawn(
             tarpc::context::current(),
             SpawnReq {
@@ -358,6 +360,7 @@ async fn run_close_pane_layout_regression() -> anyhow::Result<()> {
     let SpawnResp {
         session,
         pane: pane1,
+        window,
     } = rpc
         .spawn(
             tarpc::context::current(),
@@ -382,6 +385,7 @@ async fn run_close_pane_layout_regression() -> anyhow::Result<()> {
             tarpc::context::current(),
             OpenPaneReq {
                 session,
+                window,
                 shell: Some("/bin/sh".into()),
                 cwd: None,
                 cols: 80,

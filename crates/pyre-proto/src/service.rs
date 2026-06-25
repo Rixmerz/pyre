@@ -23,7 +23,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{layout, PaneId, SessionId};
+use crate::{layout, PaneId, SessionId, WindowId};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Pane event types for the broadcast long-poll RPC
@@ -236,7 +236,32 @@ pub trait PyreDaemon {
     /// Return the persisted `LayoutNode` tree for `session_id`.
     ///
     /// Returns `PyreError::NoSuchSession` if the session is not found.
+    ///
+    /// **Deprecated:** use `get_window_layout` instead. This is a compat shim
+    /// that returns the first/default window's layout for one release.
     async fn get_session_layout(session_id: SessionId) -> Result<layout::LayoutNode, PyreError>;
+
+    // ── Window RPCs (W1, window-model-plan §5.3) ──────────────────────────
+
+    /// List all windows for a session, ordered by position.
+    async fn list_windows(session: SessionId) -> Result<Vec<crate::WindowInfo>, PyreError>;
+
+    /// Create a new window in `session`.  `name` defaults to the next integer
+    /// label when absent.  Returns the new `WindowId`.
+    async fn new_window(session: SessionId, name: Option<String>) -> Result<WindowId, PyreError>;
+
+    /// Rename an existing window.  Persists to SQLite immediately.
+    async fn rename_window(window: WindowId, name: String) -> Result<(), PyreError>;
+
+    /// Close all panes in `window` and remove the window from its session.
+    /// If no windows remain the session is evicted.
+    async fn close_window(window: WindowId) -> Result<(), PyreError>;
+
+    /// Return the persisted `LayoutNode` tree for `window`.
+    ///
+    /// Returns `PyreError::NoSuchSession` if the window (or its session) is
+    /// not found.
+    async fn get_window_layout(window: WindowId) -> Result<layout::LayoutNode, PyreError>;
 }
 
 /// Process metadata returned by `inspect_pid`.
