@@ -41,6 +41,13 @@ export interface PaneStateInfo {
    * back to the pane's title / agent / short id rather than showing nothing.
    */
   name?: string | null;
+  /**
+   * The window this pane belongs to (Session → Window → Pane). Mirrors the
+   * daemon's `PaneInfo.window` (`#[serde(default)]`); wired DEFENSIVELY as
+   * optional so a bridge that predates the window model still decodes — the
+   * tab strip derives windows from `list_windows`, not from this field.
+   */
+  window?: string;
 }
 
 /**
@@ -68,6 +75,21 @@ export interface SessionInfo {
   pane_count: number;
   created_at?: string;
   last_active_at?: string;
+}
+
+/**
+ * Window metadata from `list_windows(session)` — one entry per tab in a
+ * session's tab strip. A window owns its own splittable layout tree (keyed by
+ * `id` in `state.layouts`). `name` is authoritative from the daemon (renamed via
+ * `rename_window`); `position` is the 0-based order within the session.
+ */
+export interface WindowInfo {
+  id: string;
+  session: string;
+  name: string;
+  position: number;
+  pane_count: number;
+  created_at?: string;
 }
 
 /** A command block from `list_blocks(pane)` / `search_blocks(...)`. */

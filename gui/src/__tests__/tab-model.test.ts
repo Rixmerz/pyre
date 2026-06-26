@@ -1,7 +1,8 @@
-// Unit tests for the per-session tab model — the pure derivation that turns the
-// daemon's (single-layout + standalone panes) model into a GUI tab list. The
-// rule: tab 0 = "split" (the layout tree); each pane in pane_states for the
-// session that is NOT a leaf of the layout tree = its own standalone tab.
+// Unit tests for the per-session WINDOW model — the pure reads that turn the
+// daemon's `list_windows` data (held in `state.windows` / `state.activeWindow`)
+// into the GUI tab strip. The rule: the tab strip = a session's windows, ordered
+// by position; each window owns its own layout tree and a daemon-authoritative
+// name; the active window defaults to the first when none is explicitly chosen.
 //
 // These functions read the module-level store, so each test seeds the store via
 // setState and resets it in afterEach to keep tests isolated (no order
@@ -10,108 +11,107 @@
 import { describe, it, expect, afterEach } from "vitest";
 import {
   setState,
-  standalonePanes,
-  sessionTabs,
-  activeTabOf,
-  SPLIT_TAB,
+  windowTabs,
+  windowLabel,
+  activeWindowOf,
 } from "../state";
-import type { LayoutNode, PaneStateInfo } from "../types";
+import type { WindowInfo } from "../types";
 
 const SESSION = "s1";
 
-function paneInfo(pane: string, session = SESSION): PaneStateInfo {
-  return { pane, session, state: "idle", title: null, agent: null };
+function win(over: Partial<WindowInfo> & { id: string }): WindowInfo {
+  return {
+    id: over.id,
+    session: over.session ?? SESSION,
+    name: over.name ?? "",
+    position: over.position ?? 0,
+    pane_count: over.pane_count ?? 1,
+    created_at: over.created_at,
+  };
 }
 
 function seed(opts: {
-  layout?: LayoutNode;
-  panes?: PaneStateInfo[];
-  activeTab?: [string, string][];
+  windows?: WindowInfo[];
+  activeWindow?: [string, string][];
 }): void {
   setState({
-    layouts: opts.layout ? new Map([[SESSION, opts.layout]]) : new Map(),
-    paneStates: new Map((opts.panes ?? []).map((p) => [p.pane, p])),
-    activeTab: new Map(opts.activeTab ?? []),
+    windows: opts.windows ? new Map([[SESSION, opts.windows]]) : new Map(),
+    activeWindow: new Map(opts.activeWindow ?? []),
   });
 }
 
-// A few layout fixtures.
-const leaf = (pane: string): LayoutNode => ({ kind: "leaf", pane });
-const splitOf = (a: string, b: string): LayoutNode => ({
-  kind: "split",
-  dir: "v",
-  children: [leaf(a), leaf(b)],
-  weights: [50, 50],
-});
-
 afterEach(() => {
-  // Reset shared store so cases don't leak into one another.
-  setState({ layouts: new Map(), paneStates: new Map(), activeTab: new Map() });
+  // Reset the shared store so cases don't leak into one another.
+  setState({ windows: new Map(), activeWindow: new Map() });
 });
 
-describe("standalonePanes", () => {
-  it("returns empty when every pane is a layout leaf", () => {
-    seed({ layout: splitOf("a", "b"), panes: [paneInfo("a"), paneInfo("b")] });
-    expect(standalonePanes(SESSION)).toEqual([]);
+describe("windowTabs", () => {
+  it("returns the session's windows in stored order", () => {
+    const a = win({ id: "w1", position: 0 });
+    const b = win({ id: "w2", position: 1 });
+    seed({ windows: [a, b] });
+    expect(windowTabs(SESSION)).toEqual([a, b]);
   });
 
-  it("returns panes present in pane_states but absent from the layout tree", () => {
-    seed({
-      layout: leaf("a"),
-      panes: [paneInfo("a"), paneInfo("standalone1"), paneInfo("standalone2")],
-    });
-    expect(standalonePanes(SESSION)).toEqual(["standalone1", "standalone2"]);
+  it("returns an empty list for a session with no windows loaded", () => {
+    seed({ windows: [] });
+    expect(windowTabs(SESSION)).toEqual([]);
   });
 
-  it("ignores panes belonging to other sessions", () => {
-    seed({
-      layout: leaf("a"),
-      panes: [paneInfo("a"), paneInfo("other", "s2")],
-    });
-    expect(standalonePanes(SESSION)).toEqual([]);
+  it("returns an empty list for a null session", () => {
+    expect(windowTabs(null)).toEqual([]);
   });
 
-  it("treats all panes as standalone when the session has no layout", () => {
-    seed({ panes: [paneInfo("x"), paneInfo("y")] });
-    expect(standalonePanes(SESSION)).toEqual(["x", "y"]);
+  it("does not leak windows from another session", () => {
+    seed({ windows: [win({ id: "w1" })] });
+    expect(windowTabs("other-session")).toEqual([]);
   });
 });
 
-describe("sessionTabs", () => {
-  it("always leads with the split tab", () => {
-    seed({ layout: leaf("a"), panes: [paneInfo("a")] });
-    expect(sessionTabs(SESSION)).toEqual([{ kind: "split" }]);
+describe("windowLabel", () => {
+  it("uses the daemon name when present", () => {
+    expect(windowLabel(win({ id: "w1", name: "backend", position: 0 }))).toBe(
+      "backend",
+    );
   });
 
-  it("appends one pane tab per standalone pane after the split tab", () => {
-    seed({
-      layout: leaf("a"),
-      panes: [paneInfo("a"), paneInfo("p2"), paneInfo("p3")],
-    });
-    expect(sessionTabs(SESSION)).toEqual([
-      { kind: "split" },
-      { kind: "pane", pane: "p2" },
-      { kind: "pane", pane: "p3" },
-    ]);
+  it("falls back to the 1-based position when the name is empty", () => {
+    expect(windowLabel(win({ id: "w1", name: "", position: 2 }))).toBe("3");
+  });
+
+  it("falls back when the name is whitespace only", () => {
+    expect(windowLabel(win({ id: "w1", name: "   ", position: 0 }))).toBe("1");
   });
 });
 
-describe("activeTabOf", () => {
-  it("defaults to the split tab when none is set", () => {
-    seed({ layout: leaf("a"), panes: [paneInfo("a")] });
-    expect(activeTabOf(SESSION)).toBe(SPLIT_TAB);
+describe("activeWindowOf", () => {
+  it("defaults to the first window when none is explicitly selected", () => {
+    seed({ windows: [win({ id: "w1" }), win({ id: "w2", position: 1 })] });
+    expect(activeWindowOf(SESSION)).toBe("w1");
   });
 
-  it("returns the stored active tab for the session", () => {
+  it("returns the explicitly-selected window when it still exists", () => {
     seed({
-      layout: leaf("a"),
-      panes: [paneInfo("a"), paneInfo("p2")],
-      activeTab: [[SESSION, "p2"]],
+      windows: [win({ id: "w1" }), win({ id: "w2", position: 1 })],
+      activeWindow: [[SESSION, "w2"]],
     });
-    expect(activeTabOf(SESSION)).toBe("p2");
+    expect(activeWindowOf(SESSION)).toBe("w2");
   });
 
-  it("returns the split tab for a null session", () => {
-    expect(activeTabOf(null)).toBe(SPLIT_TAB);
+  it("falls back to the first window when the selected one is gone", () => {
+    seed({
+      windows: [win({ id: "w1" }), win({ id: "w2", position: 1 })],
+      activeWindow: [[SESSION, "stale-window-id"]],
+    });
+    expect(activeWindowOf(SESSION)).toBe("w1");
+  });
+
+  it("returns null when the session has no windows", () => {
+    seed({ windows: [] });
+    expect(activeWindowOf(SESSION)).toBeNull();
+  });
+
+  it("returns null for a null session", () => {
+    expect(activeWindowOf(null)).toBeNull();
   });
 });

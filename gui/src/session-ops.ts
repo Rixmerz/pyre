@@ -7,10 +7,11 @@ import {
   detachPaneStream,
   listBlocks,
   listSessions,
+  listWindows,
   paneStates,
-  sessionLayout,
+  windowLayout,
 } from "./api";
-import { getState, setState, standalonePanes, SPLIT_TAB } from "./state";
+import { getState, setState, windowTabs, activeWindowOf } from "./state";
 import { disposePaneTerminal, mountedPanes } from "./terminals";
 import { maybeNotifyTransition, forgetPane } from "./notify";
 import { dlog } from "./debug";
@@ -20,6 +21,7 @@ import type {
   LifecycleEvent,
   PaneStateInfo,
   PaneState,
+  WindowInfo,
 } from "./types";
 
 /** Walk a layout tree and collect every leaf pane id, in render order. */
@@ -32,22 +34,33 @@ export function leafPanes(node: LayoutNode | undefined): string[] {
 /** Reload the session list into the store.
  *
  *  This FULLY REPLACES the list — sessions the daemon no longer reports are
- *  dropped, and their cached layouts are evicted so a removed session can't
- *  linger in the rail or in `state.layouts`. If the active session vanished,
- *  the active pointer is cleared so the caller can pick a new one. */
+ *  dropped, and their cached windows + window-keyed layouts are evicted so a
+ *  removed session can't linger in the rail or in `state.layouts`. If the active
+ *  session vanished, the active pointer is cleared so the caller can pick a new
+ *  one. */
 export async function reloadSessions(): Promise<void> {
   try {
     const sessions = await listSessions();
     const liveIds = new Set(sessions.map((s) => s.id));
 
-    // Evict cached layouts for sessions that no longer exist.
+    // Evict windows + window-keyed layouts for sessions that no longer exist.
+    const windows = new Map(getState().windows);
+    const activeWindow = new Map(getState().activeWindow);
     const layouts = new Map(getState().layouts);
-    for (const id of [...layouts.keys()]) {
-      if (!liveIds.has(id)) layouts.delete(id);
+    for (const sid of [...windows.keys()]) {
+      if (liveIds.has(sid)) continue;
+      for (const w of windows.get(sid) ?? []) layouts.delete(w.id);
+      windows.delete(sid);
+      activeWindow.delete(sid);
     }
 
     const active = getState().activeSession;
-    const patch: Parameters<typeof setState>[0] = { sessions, layouts };
+    const patch: Parameters<typeof setState>[0] = {
+      sessions,
+      windows,
+      activeWindow,
+      layouts,
+    };
     if (active && !liveIds.has(active)) {
       patch.activeSession = null;
       patch.focusedPane = null;
@@ -59,37 +72,63 @@ export async function reloadSessions(): Promise<void> {
   }
 }
 
-/** Reload one session's layout, then ensure each leaf pane has a live stream. */
+/** Reload just the WINDOW list for a session (names, positions, pane counts)
+ *  into the store, reconciling the active-window pointer. Returns the windows so
+ *  callers can iterate them (e.g. to fetch each window's layout). */
+export async function reloadWindows(session: string): Promise<WindowInfo[]> {
+  const windows = await listWindows(session);
+  const winMap = new Map(getState().windows);
+  winMap.set(session, windows);
+
+  // Reconcile the active window: keep it if still present, else fall back to the
+  // first window (or clear it when the session has no windows left).
+  const activeWindow = new Map(getState().activeWindow);
+  const cur = activeWindow.get(session);
+  if (windows.length === 0) {
+    activeWindow.delete(session);
+  } else if (!cur || !windows.some((w) => w.id === cur)) {
+    activeWindow.set(session, windows[0]!.id);
+  }
+
+  setState({ windows: winMap, activeWindow });
+  return windows;
+}
+
+/** Reload a session's windows AND each window's layout tree, then ensure every
+ *  window's leaf panes have a live stream (so hidden window tabs keep buffering
+ *  output, exactly as the old standalone tabs did). */
 export async function reloadSession(session: string): Promise<void> {
   try {
-    const layout = await sessionLayout(session);
+    const windows = await reloadWindows(session);
     const layouts = new Map(getState().layouts);
-    layouts.set(session, layout);
+    for (const w of windows) {
+      try {
+        layouts.set(w.id, await windowLayout(w.id));
+      } catch (err) {
+        console.error(`get_window_layout(${w.id}) failed:`, err);
+      }
+    }
     setState({ layouts });
-    await ensureStreams(session, layout);
+
+    const allLeaves = windows.flatMap((w) => leafPanes(layouts.get(w.id)));
+    await ensureStreams(session, allLeaves);
   } catch (err) {
-    console.error(`session_layout(${session}) failed:`, err);
+    console.error(`reload windows for session(${session}) failed:`, err);
   }
 }
 
 /**
- * Attach a stream for every pane of the session that doesn't already have a
- * terminal — BOTH the layout-tree leaves AND the standalone panes (the ones
- * surfaced as their own tabs). A standalone pane lives in `paneStates` for the
- * session but is not a leaf of the layout tree; without this its tab would mount
- * a terminal that never receives output.
+ * Attach a stream for every given pane of the session that doesn't already have
+ * a terminal. Callers pass the union of every window's layout leaves, so hidden
+ * window tabs keep a live stream and buffer output even while off-screen.
  */
 async function ensureStreams(
   session: string,
-  layout: LayoutNode,
+  panes: string[],
 ): Promise<void> {
   const live = mountedPanes();
-  const leaves = leafPanes(layout);
-  const standalone = standalonePanes(session);
-  // De-dupe (a pane can only be in one set, but be defensive).
-  const all = [...new Set([...leaves, ...standalone])];
   await Promise.all(
-    all
+    [...new Set(panes)]
       .filter((pane) => !live.has(pane))
       .map((pane) =>
         attachPaneStream(session, pane).catch((err) =>
@@ -239,9 +278,11 @@ export async function reloadFocusedBlocks(): Promise<void> {
   }
 }
 
-/** Focus the first leaf pane of a session (after switch/spawn/close). */
+/** Focus the first leaf pane of a session's ACTIVE window (after switch/spawn/
+ *  close / window switch). */
 export function focusFirstLeaf(session: string): void {
-  const layout = getState().layouts.get(session);
+  const win = activeWindowOf(session);
+  const layout = win ? getState().layouts.get(win) : undefined;
   const first = leafPanes(layout)[0] ?? null;
   setState({ focusedPane: first });
 }
@@ -258,12 +299,12 @@ async function removeSessionNow(session: string): Promise<void> {
   const st = getState();
   const wasActive = st.activeSession === session;
 
-  // Tear down terminals + streams for every pane the session held — both layout
-  // leaves AND standalone (tabbed) panes — so nothing lingers.
-  const panes = new Set([
-    ...leafPanes(st.layouts.get(session)),
-    ...standalonePanes(session),
-  ]);
+  // Tear down terminals + streams for every pane the session held — across all
+  // of its windows' layout trees — so nothing lingers.
+  const sessionWindows = windowTabs(session);
+  const panes = new Set(
+    sessionWindows.flatMap((w) => leafPanes(st.layouts.get(w.id))),
+  );
   for (const pane of panes) {
     detachPaneStream(pane).catch(() => {
       /* pane already gone — ignore */
@@ -271,20 +312,23 @@ async function removeSessionNow(session: string): Promise<void> {
     disposePaneTerminal(pane);
   }
 
-  // Drop from the session list, the layout cache, and the per-session active-tab
-  // map in one atomic patch.
+  // Drop from the session list, every window-keyed layout, the per-session
+  // window list, and the active-window map in one atomic patch.
   const sessions = st.sessions.filter((s) => s.id !== session);
   const layouts = new Map(st.layouts);
-  layouts.delete(session);
-  const activeTab = new Map(st.activeTab);
-  activeTab.delete(session);
+  for (const w of sessionWindows) layouts.delete(w.id);
+  const windows = new Map(st.windows);
+  windows.delete(session);
+  const activeWindow = new Map(st.activeWindow);
+  activeWindow.delete(session);
 
   if (wasActive) {
     const next = sessions[0]?.id ?? null;
     setState({
       sessions,
       layouts,
-      activeTab,
+      windows,
+      activeWindow,
       activeSession: next,
       focusedPane: null,
       zoomedPane: null,
@@ -298,26 +342,8 @@ async function removeSessionNow(session: string): Promise<void> {
       await newSession();
     }
   } else {
-    setState({ sessions, layouts, activeTab });
+    setState({ sessions, layouts, windows, activeWindow });
   }
-}
-
-/**
- * If a session's active tab points at a standalone pane that no longer exists
- * (closed), fall back to the split tab so the center never renders a dead pane.
- * Returns true if the active tab was reset.
- */
-function reconcileActiveTab(session: string): boolean {
-  const active = getState().activeTab.get(session);
-  if (!active || active === SPLIT_TAB) return false;
-  // The active tab is a standalone pane id — still present?
-  const stillThere = standalonePanes(session).includes(active);
-  if (stillThere) return false;
-  const activeTab = new Map(getState().activeTab);
-  activeTab.set(session, SPLIT_TAB);
-  setState({ activeTab });
-  if (getState().activeSession === session) focusFirstLeaf(session);
-  return true;
 }
 
 /**
@@ -328,10 +354,10 @@ function reconcileActiveTab(session: string): boolean {
 export async function applyLifecycleEvent(ev: LifecycleEvent): Promise<void> {
   switch (ev.kind) {
     case "spawned": {
-      // A new pane/session appeared. Refresh the session list (so a brand-new
-      // session shows in the rail) and pane_states (so a new STANDALONE pane is
-      // known before ensureStreams runs), then reload the affected session's
-      // layout — which also attaches streams for the standalone set.
+      // A new pane/session/window appeared. Refresh the session list (so a
+      // brand-new session shows in the rail) and pane_states, then reload the
+      // affected session's windows + layouts — which also attaches a stream for
+      // every window's leaves.
       await reloadSessions();
       await reloadPaneStates();
       const session = ev.session ?? getState().activeSession;
@@ -367,20 +393,20 @@ export async function applyLifecycleEvent(ev: LifecycleEvent): Promise<void> {
         // The session has no panes left — remove it from the rail NOW.
         await removeSessionNow(session);
       } else if (session) {
-        // Session survives but lost a pane. Refresh pane_states first so the
-        // standalone set is current, then reload the layout. A standalone pane
-        // closing leaves the layout tree unchanged but must drop its tab.
+        // Session survives but lost a pane. Refresh pane_states, then reload the
+        // session's windows + layouts: the closed pane collapses its window's
+        // tree (or drops the window entirely if it was that window's last pane),
+        // and reloadWindows reconciles the active-window pointer.
         await reloadPaneStates();
         if (getState().activeSession === session) {
           await reloadSession(session);
-          // If the active tab pointed at the closed standalone pane, fall back to
-          // the split tab; otherwise keep focus valid if the closed pane was it.
-          if (!reconcileActiveTab(session) && getState().focusedPane === pane) {
-            focusFirstLeaf(session);
-          }
+          if (getState().focusedPane === pane) focusFirstLeaf(session);
         } else {
-          // Inactive session lost a standalone pane — still reconcile its tab.
-          reconcileActiveTab(session);
+          // Inactive session lost a pane — refresh just its window list so a
+          // dropped window leaves the cached tab strip without a layout fetch.
+          await reloadWindows(session).catch((err) =>
+            console.error(`reload windows(${session}) failed:`, err),
+          );
         }
       }
       break;
@@ -410,6 +436,7 @@ export async function applyLifecycleEvent(ev: LifecycleEvent): Promise<void> {
           title: prev?.title ?? null,
           agent: prev?.agent ?? null,
           name: prev?.name ?? null,
+          window: prev?.window,
         };
         map.set(ev.pane, next);
         applyHeatInPlace(map);

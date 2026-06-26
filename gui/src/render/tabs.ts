@@ -1,47 +1,28 @@
 // Per-session TAB STRIP — disciplined chrome, not a bold element. A thin row of
-// quiet pills above the pane area: the "split" tab (the layout tree), then one
-// pill per STANDALONE pane (a pane in pane_states for this session that is NOT a
-// leaf of the layout tree — see open_pane in api.ts), then a "+" pill to spawn a
-// new standalone pane. The signature stays the heat; the strip is restraint.
+// quiet pills above the pane area: one pill per WINDOW of the active session
+// (from `list_windows`), then a "+" pill to spawn a new window. Each window owns
+// its own splittable layout tree; its name is authoritative from the daemon
+// (renamed in place via `rename_window`). The signature stays the heat; the
+// strip is restraint.
 //
-// Always rendered (even with only the split tab) so the "+" is discoverable.
+// Always rendered (even with a single window) so the "+" is discoverable.
 
 import { h, replaceChildren } from "./dom";
 import { icon } from "./icons";
 import { attachRenameAffordance } from "./inline-edit";
 import {
   getState,
-  paneStateOf,
-  paneDisplayName,
-  sessionTabs,
-  activeTabOf,
-  SPLIT_TAB,
-  type SessionTab,
+  windowTabs,
+  windowLabel,
+  activeWindowOf,
 } from "../state";
-import { heatVar, pulses, stateLabel } from "../heat";
 import {
   newPaneAction,
-  switchTab,
-  closeStandalonePane,
-  renamePaneAction,
+  switchWindow,
+  closeWindowAction,
+  renameWindowAction,
 } from "../actions";
-import type { PaneState } from "../types";
-
-/**
- * Display label for a standalone pane tab. Prefers the user-assigned pane name;
- * falls back to the detected agent, else an 8-char id. The fallback is what the
- * inline editor seeds with when no name has been set yet.
- */
-function paneFallbackLabel(pane: string): string {
-  const info = paneStateOf(pane);
-  const agent = (info?.agent ?? "").trim();
-  if (agent) return agent;
-  return pane.slice(0, 8);
-}
-
-function paneLabel(pane: string): string {
-  return paneDisplayName(pane, paneFallbackLabel(pane));
-}
+import type { WindowInfo } from "../types";
 
 /** Render the tab strip for the active session into `root`. Hidden if no session. */
 export function renderTabs(root: HTMLElement): void {
@@ -56,18 +37,21 @@ export function renderTabs(root: HTMLElement): void {
   }
 
   root.classList.add("has-strip");
-  const tabs = sessionTabs(session);
-  const active = activeTabOf(session);
+  const windows = windowTabs(session);
+  const active = activeWindowOf(session);
 
-  const pills = tabs.map((tab) => pill(tab, active));
+  // Only offer a per-pill close when more than one window exists — the last
+  // window is closed via "Close session" rather than stranding the session.
+  const closeable = windows.length > 1;
+  const pills = windows.map((w) => pill(w, active, closeable));
 
   const addPill = h(
     "button",
     {
       class: "tab tab-add",
       type: "button",
-      title: "New pane in this session",
-      "aria-label": "New pane in this session",
+      title: "New window in this session",
+      "aria-label": "New window in this session",
       onclick: () => void newPaneAction(),
     },
     h("span", { class: "tab-add-icon", html: icon("plus") }),
@@ -76,80 +60,64 @@ export function renderTabs(root: HTMLElement): void {
   replaceChildren(root, h("div", { class: "tabstrip-row" }, ...pills, addPill));
 }
 
-/** One pill: the split tab, or a standalone pane tab (heat dot + label + ×). */
-function pill(tab: SessionTab, active: string): HTMLElement {
-  if (tab.kind === "split") {
-    const isActive = active === SPLIT_TAB;
-    return h(
-      "button",
-      {
-        class: "tab tab-split" + (isActive ? " active" : ""),
-        type: "button",
-        title: "split",
-        "aria-label": "split layout tab",
-        "aria-current": isActive ? "true" : undefined,
-        onclick: () => switchTab(SPLIT_TAB),
-      },
-      h("span", { class: "tab-icon", html: icon("split") }),
-      h("span", { class: "tab-label" }, "split"),
-    );
-  }
+/** One pill: a window (icon + daemon-named label + optional ×). */
+function pill(
+  window: WindowInfo,
+  active: string | null,
+  closeable: boolean,
+): HTMLElement {
+  const isActive = window.id === active;
+  const label = windowLabel(window);
 
-  const pane = tab.pane;
-  const info = paneStateOf(pane);
-  const state: PaneState = info?.state ?? "idle";
-  const isActive = active === pane;
-
-  const dot = h("span", { class: "tab-dot", title: stateLabel(state) });
-  dot.style.setProperty("--dot-heat", heatVar(state));
-
-  const label = paneLabel(pane);
-
-  // Tab label span — double-click swaps it for an inline editor (commit →
-  // rename_pane); single-click switches to the tab. The label OWNS both via
-  // attachRenameAffordance (stops propagation to the pill button + debounces the
-  // single-click) so the two behaviors are consistent with the rail and the
-  // pane-card title, and a double-click never first fires switchTab.
+  // The window label OWNS its double-click rename affordance (commit →
+  // rename_window): single-click switches to the window, double-click opens the
+  // inline editor; the affordance stops propagation so the outer pill's onclick
+  // never fires mid-rename and no destructive re-render tears the span out.
   const labelSpan = h("span", { class: "tab-label" }, label);
   attachRenameAffordance({
     label: labelSpan,
-    value: () => label,
-    onSingleClick: () => switchTab(pane),
+    value: () => windowLabel(window),
+    onSingleClick: () => switchWindow(window.id),
     inputClass: "inline-edit-tab",
-    ariaLabel: "Rename pane",
-    onCommit: (name) => renamePaneAction(pane, name),
+    ariaLabel: "Rename window",
+    onCommit: (name) => renameWindowAction(window.id, name),
   });
 
-  const close = h(
-    "button",
-    {
-      class: "tab-close",
-      type: "button",
-      title: "Close pane",
-      "aria-label": "Close pane",
-      onclick: (e: Event) => {
-        e.stopPropagation();
-        void closeStandalonePane(pane);
-      },
-    },
-    h("span", { html: icon("cross") }),
-  );
+  const children: (HTMLElement | undefined)[] = [
+    h("span", { class: "tab-icon", html: icon("split") }),
+    labelSpan,
+  ];
+
+  if (closeable) {
+    children.push(
+      h(
+        "button",
+        {
+          class: "tab-close",
+          type: "button",
+          title: "Close window",
+          "aria-label": "Close window",
+          onclick: (e: Event) => {
+            e.stopPropagation();
+            void closeWindowAction(window.id);
+          },
+        },
+        h("span", { html: icon("cross") }),
+      ),
+    );
+  }
 
   return h(
     "button",
     {
-      class:
-        "tab tab-pane" +
-        (isActive ? " active" : "") +
-        (pulses(state) ? " pulse" : ""),
+      class: "tab tab-window" + (isActive ? " active" : ""),
       type: "button",
-      title: `${label} — ${stateLabel(state)}`,
+      title: label,
+      "aria-label": "window tab",
       "aria-current": isActive ? "true" : undefined,
-      "data-pane": pane,
-      onclick: () => switchTab(pane),
+      "data-window": window.id,
+      onclick: () => switchWindow(window.id),
     },
-    dot,
-    labelSpan,
-    close,
+    ...children,
   );
 }

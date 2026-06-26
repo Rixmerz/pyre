@@ -18,6 +18,7 @@ import type {
   SplitOrient,
   ThemeMeta,
   ThemePalette,
+  WindowInfo,
 } from "./types";
 
 // ── Connectivity ──────────────────────────────────────────────────────────
@@ -43,8 +44,44 @@ export const renameSession = (session: string, name: string): Promise<void> =>
 export const closeSession = (session: string): Promise<void> =>
   invoke("close_session", { session });
 
+/**
+ * DEPRECATED compat shim — returns the session's first/default window layout.
+ * New code uses `windowLayout(window)`. Kept while the bridge still exposes the
+ * `session_layout` command for one release.
+ */
 export const sessionLayout = (session: string): Promise<LayoutNode> =>
   invoke("session_layout", { session });
+
+// ── Windows ───────────────────────────────────────────────────────────────
+/**
+ * The windows of a session (its tab strip), ordered by position. A parallel
+ * Rust agent implements the `list_windows` bridge command; callers wire it
+ * DEFENSIVELY — if the command is missing the promise rejects and the caller
+ * catches + dlogs, leaving the strip intact.
+ */
+export const listWindows = (session: string): Promise<WindowInfo[]> =>
+  invoke("list_windows", { session });
+
+/**
+ * Create a NEW (empty) window in a session and return its id. The daemon's
+ * `new_window` does NOT spawn a pane, so callers follow it with `openPane(window,
+ * session)` to give the window its first terminal. `name` defaults to the next
+ * 1-based position on the daemon when omitted.
+ */
+export const newWindow = (session: string, name?: string): Promise<string> =>
+  invoke("new_window", { session, name: name ?? null });
+
+/** Rename a window (sets its daemon-authoritative display name). */
+export const renameWindow = (window: string, name: string): Promise<void> =>
+  invoke("rename_window", { window, name });
+
+/** Close a window: kills all its panes and removes it from the session. */
+export const closeWindow = (window: string): Promise<void> =>
+  invoke("close_window", { window });
+
+/** The layout tree for one window (Session → Window → Pane). */
+export const windowLayout = (window: string): Promise<LayoutNode> =>
+  invoke("get_window_layout", { window });
 
 // ── Panes ─────────────────────────────────────────────────────────────────
 export const paneStates = (): Promise<PaneStateInfo[]> => invoke("pane_states");
@@ -74,10 +111,10 @@ export const openSplit = (
 ): Promise<{ pane: string }> => invoke("open_split", { pane, direction: orient });
 
 /**
- * Open a STANDALONE pane in a session — a pane that exists in `pane_states` but
- * is NOT inserted into the session's split-layout tree (see the daemon model:
- * `open_pane` leaves `session.layout` untouched on an existing layout). The GUI
- * surfaces each such pane as its own tab.
+ * Open a pane INTO a window — the daemon inserts it as that window's first leaf
+ * (a fresh window) or returns it standalone for the GUI to place. `window` is
+ * required by the daemon's `OpenPaneReq`; `session` is kept so the bridge can
+ * validate window ∈ session.
  *
  * A parallel Rust agent implements the `open_pane` command; callers wire it
  * DEFENSIVELY — if the command is missing or the daemon predates it, the promise
@@ -85,11 +122,12 @@ export const openSplit = (
  * pill simply does nothing rather than crashing the UI).
  */
 export const openPane = (
+  window: string,
   session: string,
   cols = 80,
   rows = 24,
 ): Promise<{ pane: string }> =>
-  invoke("open_pane", { session, cols, rows });
+  invoke("open_pane", { window, session, cols, rows });
 
 export const setWeight = (pane: string, weight: number): Promise<void> =>
   invoke("set_weight", { pane, weight });

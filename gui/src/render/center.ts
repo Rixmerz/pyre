@@ -24,14 +24,12 @@ import {
   getState,
   paneStateOf,
   paneDisplayName,
-  sessionTabs,
-  activeTabOf,
-  SPLIT_TAB,
+  windowTabs,
+  activeWindowOf,
 } from "../state";
 import { heatVar, pulses, stateLabel } from "../heat";
 import {
   closePaneAction,
-  closeStandalonePane,
   focusPane,
   newSession,
   renamePaneAction,
@@ -43,7 +41,7 @@ import { mountPaneTerminal, refitAll } from "../terminals";
 import { setWeight } from "../api";
 import { chipKind } from "./agents";
 import { dlog } from "../debug";
-import type { LayoutNode, PaneState } from "../types";
+import type { LayoutNode, PaneState, WindowInfo } from "../types";
 
 /** First leaf pane id under a node — the representative weight target. */
 function firstLeaf(node: LayoutNode): string {
@@ -51,25 +49,29 @@ function firstLeaf(node: LayoutNode): string {
 }
 
 /**
- * Canonical string of the rendered structure: layout tree + the standalone pane
- * set + the active tab + zoom/focus. Changes to ANY of these force a structural
+ * Canonical string of the rendered structure: EVERY window's layout tree + the
+ * active window + zoom/focus. Changes to ANY of these force a structural
  * re-render; a heat-only tick (same structure) skips it so xterms survive.
  */
-function layoutFingerprint(
-  layout: LayoutNode | undefined,
-  standalone: string[],
-  activeTab: string,
+function windowsFingerprint(
+  windows: WindowInfo[],
+  activeWindowId: string | null,
+  layouts: Map<string, LayoutNode>,
   zoomedPane: string | null,
   focusedPane: string | null,
   connected: boolean,
 ): string {
   if (!connected) return "__disconnected__";
-  if (!layout) return "__no-layout__";
-  const tabsFp = `tabs:[${standalone.join(",")}]:active:${activeTab}`;
-  if (zoomedPane) {
-    return `zoom:${zoomedPane}:focus:${focusedPane ?? ""}:${tabsFp}`;
-  }
-  return `tree:${fingerprintNode(layout)}:focus:${focusedPane ?? ""}:${tabsFp}`;
+  if (windows.length === 0) return "__no-windows__";
+  const parts = windows.map((w) => {
+    const layout = layouts.get(w.id);
+    return `${w.id}=${layout ? fingerprintNode(layout) : "0"}`;
+  });
+  const zoom = zoomedPane ? `:zoom:${zoomedPane}` : "";
+  return (
+    `wins:[${parts.join("|")}]:active:${activeWindowId ?? ""}` +
+    `:focus:${focusedPane ?? ""}${zoom}`
+  );
 }
 
 function fingerprintNode(node: LayoutNode): string {
@@ -84,26 +86,22 @@ let lastFingerprint = "";
 export function renderCenter(root: HTMLElement): void {
   const s = getState();
   const session = s.activeSession;
-  const layout = session ? s.layouts.get(session) : undefined;
-  const tabs = session ? sessionTabs(session) : [{ kind: "split" as const }];
-  const activeTab = activeTabOf(session);
-  const standalone = tabs
-    .filter((t): t is { kind: "pane"; pane: string } => t.kind === "pane")
-    .map((t) => t.pane);
+  const windows = windowTabs(session);
+  const activeWin = activeWindowOf(session);
 
-  const fp = layoutFingerprint(
-    layout,
-    standalone,
-    activeTab,
+  const fp = windowsFingerprint(
+    windows,
+    activeWin,
+    s.layouts,
     s.zoomedPane,
     s.focusedPane,
     s.connected,
   );
 
   if (fp === lastFingerprint) {
-    // Structure, tabs, focus, and zoom are all unchanged. Heat/state updates are
-    // applied in-place by session-ops.ts — skip the full tear-down to prevent
-    // xterm re-parenting and focus-blur.
+    // Window set, every tree, active window, focus, and zoom are all unchanged.
+    // Heat/state updates are applied in-place by session-ops.ts — skip the full
+    // tear-down to prevent xterm re-parenting and focus-blur.
     dlog("[pyre-render] skip structural re-render — fingerprint unchanged");
     return;
   }
@@ -115,8 +113,8 @@ export function renderCenter(root: HTMLElement): void {
     replaceChildren(root, daemonDownPanel());
     return;
   }
-  if (!layout) {
-    dlog("[pyre-session] new-session: rendered empty-state (activeSession=", s.activeSession, ")");
+  if (windows.length === 0) {
+    dlog("[pyre-session] rendered empty-state (activeSession=", s.activeSession, ")");
     replaceChildren(
       root,
       h(
@@ -133,22 +131,24 @@ export function renderCenter(root: HTMLElement): void {
     return;
   }
 
-  // Render EVERY tab's view into the pane area; only the active tab's view is
-  // visible (display:block), the rest are display:none. This keeps hidden tabs'
-  // terminals mounted and buffering output rather than disposing on switch.
+  // Render EVERY window's tree into its own view; only the active window's view
+  // is visible (display:flex), the rest are display:none. This keeps hidden
+  // windows' terminals mounted and buffering output rather than disposing them
+  // on a window switch.
   const views: HTMLElement[] = [];
-
-  // Split tab view — the recursive layout tree (or the zoomed pane full-bleed).
-  const splitActive = activeTab === SPLIT_TAB;
-  const splitInner = s.zoomedPane && splitActive
-    ? renderNode({ kind: "leaf", pane: s.zoomedPane })
-    : renderNode(layout);
-  views.push(tabView(SPLIT_TAB, splitActive, splitInner));
-
-  // One full-area pane card per standalone pane tab.
-  for (const pane of standalone) {
-    const active = activeTab === pane;
-    views.push(tabView(pane, active, standalonePaneCard(pane)));
+  for (const w of windows) {
+    const isActive = w.id === activeWin;
+    const layout = s.layouts.get(w.id);
+    let inner: HTMLElement;
+    if (!layout) {
+      inner = h("div", { class: "center-empty" }, h("p", {}, "Loading…"));
+    } else if (s.zoomedPane && isActive) {
+      // Zoom applies to the active window: render only the zoomed pane full-bleed.
+      inner = renderNode({ kind: "leaf", pane: s.zoomedPane });
+    } else {
+      inner = renderNode(layout);
+    }
+    views.push(tabView(w.id, isActive, inner));
   }
 
   replaceChildren(root, ...views);
@@ -290,14 +290,7 @@ function divider(
   return handle;
 }
 
-/** A single full-area pane card for a STANDALONE pane (its own tab). Reuses the
- *  same card + xterm mount as a split leaf, minus the split-toolbar buttons; its
- *  close routes to closeStandalonePane so the tab (not a layout leaf) is removed. */
-function standalonePaneCard(pane: string): HTMLElement {
-  return renderLeaf(pane, true);
-}
-
-function renderLeaf(pane: string, standalone = false): HTMLElement {
+function renderLeaf(pane: string): HTMLElement {
   const s = getState();
   const info = paneStateOf(pane);
   const state: PaneState = info?.state ?? "idle";
@@ -362,28 +355,20 @@ function renderLeaf(pane: string, standalone = false): HTMLElement {
       agent,
     ),
     h("span", { class: "pane-state-label" }, stateLabel(state)),
-    // Standalone panes are a single full-area terminal (not splittable for now):
-    // their toolbar drops the split buttons and routes close to the tab path.
-    standalone
-      ? h(
-          "div",
-          { class: "pane-toolbar" },
-          toolBtn("Close pane", icon("close"), () =>
-            void closeStandalonePane(pane),
-          ),
-        )
-      : h(
-          "div",
-          { class: "pane-toolbar" },
-          toolBtn("Split down", icon("splitDown"), () => void splitDown(pane)),
-          toolBtn("Split right", icon("splitRight"), () => void splitRight(pane)),
-          toolBtn(
-            s.zoomedPane === pane ? "Restore" : "Zoom",
-            icon("zoom"),
-            () => zoomPane(pane),
-          ),
-          toolBtn("Close pane", icon("close"), () => void closePaneAction(pane)),
-        ),
+    // Every pane in every window is splittable: the full toolbar is always
+    // present (split down/right, zoom, close).
+    h(
+      "div",
+      { class: "pane-toolbar" },
+      toolBtn("Split down", icon("splitDown"), () => void splitDown(pane)),
+      toolBtn("Split right", icon("splitRight"), () => void splitRight(pane)),
+      toolBtn(
+        s.zoomedPane === pane ? "Restore" : "Zoom",
+        icon("zoom"),
+        () => zoomPane(pane),
+      ),
+      toolBtn("Close pane", icon("close"), () => void closePaneAction(pane)),
+    ),
   );
 
   const body = h("div", { class: "pane-body" });

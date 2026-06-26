@@ -5,11 +5,14 @@
 import {
   closePane,
   closeSession,
+  closeWindow,
   detachPaneStream,
+  newWindow,
   openPane,
   openSplit,
   renamePane,
   renameSession,
+  renameWindow,
   searchBlocks,
   sendKeys,
   spawnSession,
@@ -17,8 +20,8 @@ import {
 import {
   getState,
   setState,
-  SPLIT_TAB,
-  activeTabOf,
+  windowTabs,
+  activeWindowOf,
 } from "./state";
 import {
   disposePaneTerminal,
@@ -30,6 +33,7 @@ import {
   leafPanes,
   reloadSession,
   reloadSessions,
+  reloadWindows,
   reloadPaneStates,
   focusFirstLeaf,
 } from "./session-ops";
@@ -106,8 +110,12 @@ export async function renameSessionAction(
 export async function closeSessionAction(session: string): Promise<void> {
   dlog("[pyre-session] closeSession action fired:", session);
 
-  // Capture the leaves BEFORE we drop the layout, so we can detach each stream.
-  const leaves = leafPanes(getState().layouts.get(session));
+  // Capture the leaves across ALL of the session's windows BEFORE we drop the
+  // layouts, so we can detach each stream.
+  const sessionWindows = windowTabs(session);
+  const leaves = sessionWindows.flatMap((w) =>
+    leafPanes(getState().layouts.get(w.id)),
+  );
   const wasActive = getState().activeSession === session;
 
   try {
@@ -127,10 +135,15 @@ export async function closeSessionAction(session: string): Promise<void> {
     disposePaneTerminal(pane);
   }
 
-  // Drop the closed session's cached layout.
+  // Drop the closed session's cached per-window layouts, its window list, and
+  // its active-window pointer.
   const layouts = new Map(getState().layouts);
-  layouts.delete(session);
-  setState({ layouts });
+  for (const w of sessionWindows) layouts.delete(w.id);
+  const windows = new Map(getState().windows);
+  windows.delete(session);
+  const activeWindow = new Map(getState().activeWindow);
+  activeWindow.delete(session);
+  setState({ layouts, windows, activeWindow });
 
   // Reload the session list from the daemon (authoritative post-close view).
   await reloadSessions();
@@ -183,8 +196,11 @@ async function doSplit(pane: string, orient: "h" | "v"): Promise<void> {
     const result = await openSplit(pane, orient);
     const newPane = result.pane;
     dlog("[pyre-split] daemon new pane=", newPane);
+    // The split mutated the ACTIVE window's tree on the daemon; reload the
+    // session's windows + layouts and inspect the active window's new tree.
     await reloadSession(session);
-    const layout = getState().layouts.get(session);
+    const win = activeWindowOf(session);
+    const layout = win ? getState().layouts.get(win) : undefined;
     logLayoutTree(layout, 0);
     setState({ focusedPane: newPane });
     refitAll();
@@ -293,79 +309,127 @@ export async function renamePaneAction(
   }
 }
 
-// ── Tab actions (split tab + standalone panes) ────────────────────────────────
+// ── Window actions (tab strip = a session's windows) ──────────────────────────
 
-/** Switch the active session's tab. `tab` is SPLIT_TAB or a standalone paneId. */
-export function switchTab(tab: string): void {
+/** Switch the active session's visible WINDOW. Each window owns its own
+ *  splittable layout tree; the center re-renders to show it and focus its first
+ *  leaf so keystrokes route. */
+export function switchWindow(windowId: string): void {
   const session = getState().activeSession;
   if (!session) return;
-  const activeTab = new Map(getState().activeTab);
-  activeTab.set(session, tab);
-  setState({ activeTab });
-  if (tab === SPLIT_TAB) {
-    // Returning to the split tab: focus its first leaf so keystrokes route.
-    focusFirstLeaf(session);
-  } else {
-    // A standalone pane tab is a single full-area pane — focus it directly.
-    focusPane(tab);
-  }
-  // The center render mounts the tab's terminal(s); refit once it settles.
+  const activeWindow = new Map(getState().activeWindow);
+  activeWindow.set(session, windowId);
+  setState({ activeWindow });
+  // Focus the new active window's first leaf so keystrokes route there.
+  focusFirstLeaf(session);
+  // The center render mounts the window's terminal(s); refit once it settles.
   requestAnimationFrame(() => refitAll());
 }
 
 /**
- * Open a NEW standalone pane in the active session and switch to its tab. Wired
- * DEFENSIVELY: if the daemon lacks `open_pane` the invoke rejects, we catch +
- * dlog, and the tab strip is unaffected (the `+` pill simply did nothing).
+ * Create a NEW window in the active session and switch to it. The daemon's
+ * `new_window` makes an EMPTY window, so we immediately `open_pane` it to give
+ * the window its first terminal. Wired DEFENSIVELY: if the bridge lacks
+ * `new_window`/`open_pane` the invoke rejects, we catch + dlog, and the tab
+ * strip is unaffected (the `+` pill simply did nothing).
+ *
+ * Named `newPaneAction` for call-site compatibility (keybind Ctrl+Shift+T and
+ * the command palette) — "another terminal" now means "another window".
  */
 export async function newPaneAction(): Promise<void> {
   const session = getState().activeSession;
   if (!session) return;
-  dlog("[pyre-tab] new-pane: start session=", session);
+  dlog("[pyre-window] new-window: start session=", session);
   try {
-    const res = await openPane(session, 80, 24);
-    const pane = res.pane;
-    dlog("[pyre-tab] new-pane: daemon pane=", pane);
-    // Refresh pane_states so the new standalone pane is known, then refresh the
-    // session layout + streams (covers the standalone set too). The lifecycle
-    // "spawned" event will also fire, but we update eagerly for instant feedback.
+    const windowId = await newWindow(session);
+    dlog("[pyre-window] new-window: daemon window=", windowId);
+    // Give the fresh (empty) window its first terminal.
+    await openPane(windowId, session, 80, 24);
+    // Refresh pane_states + the session's windows/layouts so the new window and
+    // its pane are known, then switch to it. The "spawned" lifecycle event also
+    // fires, but we update eagerly for instant feedback.
     await reloadPaneStates();
     await reloadSession(session);
-    switchTab(pane);
+    switchWindow(windowId);
   } catch (err) {
-    // open_pane not implemented yet (parallel agent) — degrade gracefully.
-    dlog("[pyre-tab] new-pane: open_pane unavailable, no-op:", err);
+    // new_window / open_pane not implemented yet (parallel bridge agent) —
+    // degrade gracefully.
+    dlog("[pyre-window] new-window: unavailable, no-op:", err);
   }
 }
 
 /**
- * Close a standalone pane tab. Kills the pane on the daemon, disposes its
- * terminal, and — if it was the active tab — falls back to the split tab.
+ * Rename a window via the daemon-authoritative `rename_window`, then refresh the
+ * session's window list so the new name appears at once. Wired DEFENSIVELY: a
+ * missing/failed command keeps the old name rather than crashing.
  */
-export async function closeStandalonePane(pane: string): Promise<void> {
+export async function renameWindowAction(
+  windowId: string,
+  name: string,
+): Promise<void> {
+  const next = name.trim();
+  if (!next) return;
   const session = getState().activeSession;
+  dlog("[pyre-rename] commit window=", windowId, 'name="' + next + '"');
   try {
-    await closePane(pane);
+    await renameWindow(windowId, next);
+    if (session) {
+      await reloadWindows(session).catch((err) =>
+        console.error(`reload windows(${session}) failed:`, err),
+      );
+    }
   } catch (err) {
-    console.error("close_pane (standalone) failed:", pane, err);
+    dlog("[pyre-rename] window rpc FAILED window=", windowId, err);
   }
-  disposePaneTerminal(pane);
-  detachPaneStream(pane).catch(() => {
-    /* pane already gone — ignore */
-  });
+}
 
-  // If this was the active tab, return to the split tab (the safe default).
-  if (session && activeTabOf(session) === pane) {
-    const activeTab = new Map(getState().activeTab);
-    activeTab.set(session, SPLIT_TAB);
-    setState({ activeTab });
-    focusFirstLeaf(session);
+/**
+ * Close a window: kills all its panes on the daemon, tears down their terminals
+ * + streams locally, drops the cached layout, and — if it was active — falls
+ * back to another window (or another session, spawning a fresh one if the close
+ * left the session, and the app, with none).
+ */
+export async function closeWindowAction(windowId: string): Promise<void> {
+  const session = getState().activeSession;
+  // Capture the window's leaves BEFORE we drop its layout so we can detach.
+  const leaves = leafPanes(getState().layouts.get(windowId));
+  try {
+    await closeWindow(windowId);
+  } catch (err) {
+    console.error("close_window failed:", windowId, err);
+  }
+  for (const pane of leaves) {
+    detachPaneStream(pane).catch(() => {
+      /* pane already gone — ignore */
+    });
+    disposePaneTerminal(pane);
   }
 
-  // Authoritative refresh so the closed pane drops from pane_states + the strip.
-  await reloadPaneStates();
+  // Drop the closed window's cached layout + clear it if it was active.
+  const layouts = new Map(getState().layouts);
+  layouts.delete(windowId);
+  const activeWindow = new Map(getState().activeWindow);
+  if (session && activeWindow.get(session) === windowId) {
+    activeWindow.delete(session);
+  }
+  setState({ layouts, activeWindow });
+
+  // Authoritative refresh: the daemon may have evicted the session if that was
+  // its last window.
+  await reloadSessions();
   if (session && getState().sessions.some((s) => s.id === session)) {
     await reloadSession(session);
+    focusFirstLeaf(session);
+  } else if (session) {
+    // The session is gone (its last window closed). Pick another, or spawn one.
+    const first = getState().sessions[0]?.id ?? null;
+    setState({ activeSession: first, focusedPane: null, zoomedPane: null });
+    if (first) {
+      await reloadSession(first);
+      focusFirstLeaf(first);
+    } else {
+      await newSession();
+    }
   }
   refitAll();
 }
@@ -486,8 +550,8 @@ export function buildCommands(): Command[] {
   const cmds: Command[] = [
     { id: "new-session", title: "New session", hint: "spawn", run: newSession },
     {
-      id: "new-pane",
-      title: "New pane in this session",
+      id: "new-window",
+      title: "New window in this session",
       hint: "Ctrl+Shift+T",
       run: () => newPaneAction(),
     },

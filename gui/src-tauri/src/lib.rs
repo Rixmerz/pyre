@@ -19,8 +19,8 @@ use futures::StreamExt;
 use pyre_proto::{
     blocks::{ListBlocksReq, SearchBlocksReq},
     layout::{LayoutNode, Orient},
-    OpenPaneReq, OpenPaneSplitReq, OutputFrame, PaneId, PyreDaemonClient, ResizePaneReq,
-    SessionId, SpawnReq, SpawnResp,
+    OpenPaneReq, OpenPaneSplitReq, OutputFrame, PaneId, PyreDaemonClient, ResizePaneReq, SessionId,
+    SpawnReq, SpawnResp, WindowId,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -34,22 +34,13 @@ use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// All mutable state for the GUI bridge, held behind a single async mutex.
+#[derive(Default)]
 struct Inner {
     client: Option<PyreDaemonClient>,
     /// Per-pane pump tasks keyed by PaneId.  Aborted on detach or pane close.
     stream_tasks: HashMap<PaneId, JoinHandle<()>>,
     /// Pane forwarded by legacy `start_pane` / `send_keys` (kept for compat).
     legacy_pane: Option<PaneId>,
-}
-
-impl Default for Inner {
-    fn default() -> Self {
-        Self {
-            client: None,
-            stream_tasks: HashMap::new(),
-            legacy_pane: None,
-        }
-    }
 }
 
 pub struct AppState {
@@ -113,6 +104,12 @@ fn parse_session(s: &str) -> Result<SessionId, String> {
     uuid::Uuid::parse_str(s)
         .map(SessionId)
         .map_err(|e| format!("invalid session id {s:?}: {e}"))
+}
+
+fn parse_window(s: &str) -> Result<WindowId, String> {
+    uuid::Uuid::parse_str(s)
+        .map(WindowId)
+        .map_err(|e| format!("invalid window id {s:?}: {e}"))
 }
 
 fn parse_block_id(s: &str) -> Result<pyre_proto::BlockId, String> {
@@ -380,7 +377,7 @@ async fn spawn_session(
         env: std::env::vars().collect(),
         name: None,
     };
-    let SpawnResp { session, pane } = client
+    let SpawnResp { session, pane, .. } = client
         .spawn(tarpc::context::current(), req)
         .await
         .map_err(|e| format!("spawn transport error: {e}"))?
@@ -410,11 +407,7 @@ async fn rename_session(
 }
 
 #[tauri::command]
-async fn rename_pane(
-    state: State<'_, AppState>,
-    pane: String,
-    name: String,
-) -> Result<(), String> {
+async fn rename_pane(state: State<'_, AppState>, pane: String, name: String) -> Result<(), String> {
     let pid = parse_pane(&pane)?;
     let client = {
         let mut guard = state.inner.lock().await;
@@ -553,10 +546,7 @@ async fn inspect_pid(state: State<'_, AppState>, pane: String) -> Result<PidInsp
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[tauri::command]
-async fn session_layout(
-    state: State<'_, AppState>,
-    session: String,
-) -> Result<LayoutDto, String> {
+async fn session_layout(state: State<'_, AppState>, session: String) -> Result<LayoutDto, String> {
     let sid = parse_session(&session)?;
     let client = {
         let mut guard = state.inner.lock().await;
@@ -580,7 +570,11 @@ async fn open_split(
     let orient = match direction.as_str() {
         "h" => Orient::Horizontal,
         "v" => Orient::Vertical,
-        other => return Err(format!("invalid direction {other:?}: expected \"h\" or \"v\"")),
+        other => {
+            return Err(format!(
+                "invalid direction {other:?}: expected \"h\" or \"v\""
+            ))
+        }
     };
     let req = OpenPaneSplitReq {
         parent_pane: pid,
@@ -603,22 +597,24 @@ async fn open_split(
     })
 }
 
-/// Open a standalone pane in a session WITHOUT modifying the layout tree.
+/// Open a pane into `window` within `session`.
 ///
-/// Unlike `open_split` (which creates a sibling in the split topology), this
-/// calls the daemon's `open_pane` RPC which spawns a pane and registers it
-/// in the session as an orphaned/standalone pane.  Returns the new `PaneId`
-/// as a UUID string.
+/// The daemon's `OpenPaneReq` now requires both `window` and `session` so the
+/// pane is registered inside the correct window's layout tree.  Returns the new
+/// `PaneId` as a UUID string.
 #[tauri::command]
 async fn open_pane(
     state: State<'_, AppState>,
+    window: String,
     session: String,
     cols: Option<u16>,
     rows: Option<u16>,
 ) -> Result<OpenPaneDto, String> {
+    let wid = parse_window(&window)?;
     let sid = parse_session(&session)?;
     let req = OpenPaneReq {
         session: sid,
+        window: wid,
         shell: None,
         cwd: std::env::current_dir().ok(),
         cols: cols.unwrap_or(80),
@@ -641,11 +637,7 @@ async fn open_pane(
 }
 
 #[tauri::command]
-async fn set_weight(
-    state: State<'_, AppState>,
-    pane: String,
-    weight: f32,
-) -> Result<(), String> {
+async fn set_weight(state: State<'_, AppState>, pane: String, weight: f32) -> Result<(), String> {
     let pid = parse_pane(&pane)?;
     // Clamp [5, 95] then convert to u16 as the RPC expects.
     let clamped = weight.clamp(5.0, 95.0) as u16;
@@ -658,6 +650,124 @@ async fn set_weight(
         .await
         .map_err(|e| format!("set_pane_weight transport error: {e}"))?
         .map_err(|e| format!("set_pane_weight daemon error: {e}"))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Commands: windows
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct WindowInfoDto {
+    pub id: String,
+    pub session: String,
+    pub name: String,
+    pub position: u32,
+    pub pane_count: u32,
+    pub created_at: String,
+}
+
+/// List all windows for a session, ordered by position.
+#[tauri::command]
+async fn list_windows(
+    state: State<'_, AppState>,
+    session: String,
+) -> Result<Vec<WindowInfoDto>, String> {
+    let sid = parse_session(&session)?;
+    let client = {
+        let mut guard = state.inner.lock().await;
+        ensure_client(&mut guard).await?
+    };
+    let windows = client
+        .list_windows(tarpc::context::current(), sid)
+        .await
+        .map_err(|e| format!("list_windows transport error: {e}"))?
+        .map_err(|e| format!("list_windows daemon error: {e}"))?;
+    Ok(windows
+        .iter()
+        .map(|w| WindowInfoDto {
+            id: w.id.0.to_string(),
+            session: w.session.0.to_string(),
+            name: w.name.clone(),
+            position: w.position,
+            pane_count: w.pane_count,
+            created_at: w.created_at.to_rfc3339(),
+        })
+        .collect())
+}
+
+/// Create a new (empty) window in a session. Returns the new WindowId as a UUID string.
+/// `name` defaults to the next 1-based integer label on the daemon when `None`.
+#[tauri::command]
+async fn new_window(
+    state: State<'_, AppState>,
+    session: String,
+    name: Option<String>,
+) -> Result<String, String> {
+    let sid = parse_session(&session)?;
+    let client = {
+        let mut guard = state.inner.lock().await;
+        ensure_client(&mut guard).await?
+    };
+    let window_id = client
+        .new_window(tarpc::context::current(), sid, name)
+        .await
+        .map_err(|e| format!("new_window transport error: {e}"))?
+        .map_err(|e| format!("new_window daemon error: {e}"))?;
+    Ok(window_id.0.to_string())
+}
+
+/// Rename a window (sets its daemon-authoritative display name).
+#[tauri::command]
+async fn rename_window(
+    state: State<'_, AppState>,
+    window: String,
+    name: String,
+) -> Result<(), String> {
+    let wid = parse_window(&window)?;
+    let client = {
+        let mut guard = state.inner.lock().await;
+        ensure_client(&mut guard).await?
+    };
+    client
+        .rename_window(tarpc::context::current(), wid, name)
+        .await
+        .map_err(|e| format!("rename_window transport error: {e}"))?
+        .map_err(|e| format!("rename_window daemon error: {e}"))
+}
+
+/// Close a window: kills all its panes and removes it from the session.
+/// If the session has no windows left it is also evicted.
+#[tauri::command]
+async fn close_window(state: State<'_, AppState>, window: String) -> Result<(), String> {
+    let wid = parse_window(&window)?;
+    let client = {
+        let mut guard = state.inner.lock().await;
+        ensure_client(&mut guard).await?
+    };
+    client
+        .close_window(tarpc::context::current(), wid)
+        .await
+        .map_err(|e| format!("close_window transport error: {e}"))?
+        .map_err(|e| format!("close_window daemon error: {e}"))
+}
+
+/// Return the layout tree for a single window (Session → Window → Pane model).
+#[tauri::command]
+async fn get_window_layout(
+    state: State<'_, AppState>,
+    window: String,
+) -> Result<LayoutDto, String> {
+    let wid = parse_window(&window)?;
+    let client = {
+        let mut guard = state.inner.lock().await;
+        ensure_client(&mut guard).await?
+    };
+    let node = client
+        .get_window_layout(tarpc::context::current(), wid)
+        .await
+        .map_err(|e| format!("get_window_layout transport error: {e}"))?
+        .map_err(|e| format!("get_window_layout daemon error: {e}"))?;
+    Ok(layout_to_dto(&node))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -906,10 +1016,7 @@ fn pane_event_kind_label(kind: &pyre_proto::PaneEventKind) -> &'static str {
 /// On daemon error returns a clean `Err(String)` so the frontend can fall
 /// back gracefully without a JS exception.
 #[tauri::command]
-async fn poll_events(
-    state: State<'_, AppState>,
-    after_seq: u64,
-) -> Result<EventsDto, String> {
+async fn poll_events(state: State<'_, AppState>, after_seq: u64) -> Result<EventsDto, String> {
     let client = {
         let mut guard = state.inner.lock().await;
         ensure_client(&mut guard).await?
@@ -989,10 +1096,7 @@ fn get_theme(name: String) -> Result<ThemeDetailDto, String> {
 /// its output stream.  The webview's existing `start_pane` call still works
 /// as-is.  New code should prefer `spawn_session` + `attach_pane_stream`.
 #[tauri::command]
-async fn start_pane(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-) -> Result<String, String> {
+async fn start_pane(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<String, String> {
     let socket = resolve_socket();
 
     let client = {
@@ -1010,7 +1114,7 @@ async fn start_pane(
         env: std::env::vars().collect(),
         name: Some("gui-spike".to_string()),
     };
-    let SpawnResp { session, pane } = client
+    let SpawnResp { session, pane, .. } = client
         .spawn(tarpc::context::current(), req)
         .await
         .map_err(|e| format!("spawn RPC transport error: {e}"))?
@@ -1116,6 +1220,12 @@ pub fn run() {
             spawn_session,
             rename_session,
             close_session,
+            // windows
+            list_windows,
+            new_window,
+            rename_window,
+            close_window,
+            get_window_layout,
             // panes
             close_pane,
             resize_pane,
