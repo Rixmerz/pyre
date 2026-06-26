@@ -918,4 +918,389 @@ mod tests {
         let _store2 = Store::open().await?; // second open — must not error
         Ok(())
     }
+
+    // ── Window migration tests (0004_windows.sql + backfill_windows) ──────────
+
+    /// Open a raw SQLite pool in `dir` with all migrations applied but WITHOUT
+    /// the backfill or backup side-effects of `Store::open`.  Used by
+    /// backfill_windows tests to set up a pre-backfill state.
+    async fn open_raw_pool(dir: &std::path::Path) -> Result<Pool<Sqlite>> {
+        std::fs::create_dir_all(dir)?;
+        let db_path = dir.join("state.db");
+        let opts = SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(4)
+            .connect_with(opts)
+            .await?;
+        sqlx::migrate!("./migrations").run(&pool).await?;
+        Ok(pool)
+    }
+
+    /// Insert a session row directly into `pool` with an optional layout JSON.
+    async fn insert_session_row(
+        pool: &Pool<Sqlite>,
+        id: SessionId,
+        layout_json: Option<&str>,
+    ) -> Result<()> {
+        let now = Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO sessions (id, name, created_at, last_active_at, layout) \
+             VALUES (?1, 'test', ?2, ?2, ?3)",
+        )
+        .bind(id.0.to_string())
+        .bind(now)
+        .bind(layout_json)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Insert a pane row directly into `pool` with an optional name.
+    async fn insert_pane_row(
+        pool: &Pool<Sqlite>,
+        id: PaneId,
+        session: SessionId,
+        name: Option<&str>,
+    ) -> Result<()> {
+        let now = Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO panes (id, session_id, argv, cols, rows, created_at, name) \
+             VALUES (?1, ?2, '/bin/sh', 80, 24, ?3, ?4)",
+        )
+        .bind(id.0.to_string())
+        .bind(session.0.to_string())
+        .bind(now)
+        .bind(name)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn count_windows_in(pool: &Pool<Sqlite>) -> i64 {
+        sqlx::query("SELECT COUNT(*) AS n FROM windows")
+            .fetch_one(pool)
+            .await
+            .expect("count query")
+            .try_get("n")
+            .expect("n column")
+    }
+
+    async fn get_pane_window_id(pool: &Pool<Sqlite>, pane: PaneId) -> Option<String> {
+        sqlx::query("SELECT window_id FROM panes WHERE id = ?1")
+            .bind(pane.0.to_string())
+            .fetch_optional(pool)
+            .await
+            .expect("pane query")
+            .and_then(|r| r.try_get::<Option<String>, _>("window_id").unwrap_or(None))
+    }
+
+    /// THE critical test: `backfill_windows` on a realistic pre-v4 DB with a
+    /// tiling layout (2 panes) plus 2 standalone panes not present in the tree.
+    ///
+    /// Asserts:
+    /// - A default window named "1" (position 0) is created, carrying the
+    ///   original session layout JSON verbatim.
+    /// - The two tree panes both get window_id = W0.
+    /// - Each standalone pane becomes its own single-leaf window (position ≥ 1,
+    ///   distinct window_id, leaf layout over that pane).
+    /// - All panes have a non-NULL window_id after backfill.
+    #[tokio::test]
+    async fn backfill_windows_on_pre_v4_db_with_layout_and_standalone_panes() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let pool = open_raw_pool(tmp.path()).await?;
+
+        let sid = SessionId(Uuid::new_v4());
+        let pane_a = PaneId(Uuid::new_v4());
+        let pane_b = PaneId(Uuid::new_v4());
+        let standalone_1 = PaneId(Uuid::new_v4());
+        let standalone_2 = PaneId(Uuid::new_v4());
+
+        // Layout: HSplit with pane_a (top) and pane_b (bottom).
+        let layout = pyre_proto::LayoutNode::HSplit(vec![
+            (pyre_proto::LayoutNode::Leaf(pane_a), 50),
+            (pyre_proto::LayoutNode::Leaf(pane_b), 50),
+        ]);
+        let layout_json = serde_json::to_string(&layout)?;
+
+        insert_session_row(&pool, sid, Some(&layout_json)).await?;
+        insert_pane_row(&pool, pane_a, sid, None).await?;
+        insert_pane_row(&pool, pane_b, sid, None).await?;
+        // standalone_1 has a name; standalone_2 does not.
+        insert_pane_row(&pool, standalone_1, sid, Some("my-shell")).await?;
+        insert_pane_row(&pool, standalone_2, sid, None).await?;
+
+        // Pre-condition: no windows yet.
+        assert_eq!(count_windows_in(&pool).await, 0, "no windows before backfill");
+
+        backfill_windows(&pool).await?;
+
+        // 3 windows total: W0 (default for layout) + Wk for each standalone pane.
+        assert_eq!(
+            count_windows_in(&pool).await,
+            3,
+            "expected 3 windows: 1 default + 2 standalone"
+        );
+
+        // Fetch windows ordered by position.
+        let wins = sqlx::query(
+            "SELECT id, name, position, layout FROM windows ORDER BY position ASC",
+        )
+        .fetch_all(&pool)
+        .await?;
+
+        // W0 — default window.
+        let w0_id: String = wins[0].try_get("id")?;
+        let w0_name: String = wins[0].try_get("name")?;
+        let w0_pos: i64 = wins[0].try_get("position")?;
+        let w0_layout: Option<String> = wins[0].try_get("layout").unwrap_or(None);
+        assert_eq!(w0_name, "1", "default window must be named '1'");
+        assert_eq!(w0_pos, 0, "default window must be at position 0");
+        assert_eq!(
+            w0_layout.as_deref(),
+            Some(layout_json.as_str()),
+            "W0 layout must carry original session layout JSON verbatim"
+        );
+
+        // Tree panes assigned to W0.
+        let pane_a_wid = get_pane_window_id(&pool, pane_a).await;
+        let pane_b_wid = get_pane_window_id(&pool, pane_b).await;
+        assert_eq!(
+            pane_a_wid.as_deref(),
+            Some(w0_id.as_str()),
+            "pane_a (tree pane) must be in W0"
+        );
+        assert_eq!(
+            pane_b_wid.as_deref(),
+            Some(w0_id.as_str()),
+            "pane_b (tree pane) must be in W0"
+        );
+
+        // Standalone windows (positions 1 and 2).
+        let w1_pos: i64 = wins[1].try_get("position")?;
+        let w2_pos: i64 = wins[2].try_get("position")?;
+        assert!(w1_pos >= 1, "first standalone window must be at position >= 1");
+        assert!(w2_pos > w1_pos, "second standalone must have higher position");
+
+        // standalone_1 named "my-shell" (name inherited from pane.name).
+        let w1_name: String = wins[1].try_get("name")?;
+        assert_eq!(w1_name, "my-shell", "standalone window name must come from pane name");
+
+        // Each standalone pane has its own distinct window.
+        let s1_wid = get_pane_window_id(&pool, standalone_1).await;
+        let s2_wid = get_pane_window_id(&pool, standalone_2).await;
+        let w1_id: String = wins[1].try_get("id")?;
+        let w2_id: String = wins[2].try_get("id")?;
+        assert_eq!(
+            s1_wid.as_deref(),
+            Some(w1_id.as_str()),
+            "standalone_1 must be in its own window"
+        );
+        assert_eq!(
+            s2_wid.as_deref(),
+            Some(w2_id.as_str()),
+            "standalone_2 must be in its own window"
+        );
+
+        // Standalone windows must have single-leaf layout pointing at the pane.
+        let w1_layout: Option<String> = wins[1].try_get("layout").unwrap_or(None);
+        let w2_layout: Option<String> = wins[2].try_get("layout").unwrap_or(None);
+        let expected_leaf_1 = serde_json::to_string(&pyre_proto::LayoutNode::Leaf(standalone_1))?;
+        let expected_leaf_2 = serde_json::to_string(&pyre_proto::LayoutNode::Leaf(standalone_2))?;
+        assert_eq!(
+            w1_layout.as_deref(),
+            Some(expected_leaf_1.as_str()),
+            "standalone_1 window must have a Leaf layout"
+        );
+        assert_eq!(
+            w2_layout.as_deref(),
+            Some(expected_leaf_2.as_str()),
+            "standalone_2 window must have a Leaf layout"
+        );
+
+        // All panes must have a non-NULL window_id.
+        let null_count: i64 = sqlx::query(
+            "SELECT COUNT(*) AS n FROM panes WHERE session_id = ?1 AND window_id IS NULL",
+        )
+        .bind(sid.0.to_string())
+        .fetch_one(&pool)
+        .await?
+        .try_get("n")?;
+        assert_eq!(null_count, 0, "all panes must have window_id after backfill");
+
+        Ok(())
+    }
+
+    /// Backup file `state.db.bak.<timestamp>` is created in the data dir the
+    /// first time `Store::open` runs (the fresh db has no `windows` table yet,
+    /// so the guard fires).
+    #[tokio::test]
+    async fn store_open_creates_backup_file_when_windows_table_absent() -> Result<()> {
+        let _g = ENV_LOCK.lock().await;
+        let tmp = TempDir::new()?;
+        unsafe {
+            std::env::set_var("PYRE_DATA_DIR", tmp.path());
+        }
+        let _store = Store::open().await?;
+        drop(_store);
+
+        let bak_count = std::fs::read_dir(tmp.path())?
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("state.db.bak.")
+            })
+            .count();
+        assert_eq!(bak_count, 1, "exactly one backup file must exist after first Store::open");
+
+        Ok(())
+    }
+
+    /// Calling `backfill_windows` a second time (or re-opening the store) must
+    /// be a no-op — the idempotency guard is `COUNT(*) FROM windows == 0`.
+    #[tokio::test]
+    async fn backfill_windows_is_noop_on_second_call() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let pool = open_raw_pool(tmp.path()).await?;
+
+        let sid = SessionId(Uuid::new_v4());
+        let pane = PaneId(Uuid::new_v4());
+        let layout = pyre_proto::LayoutNode::Leaf(pane);
+        let layout_json = serde_json::to_string(&layout)?;
+        insert_session_row(&pool, sid, Some(&layout_json)).await?;
+        insert_pane_row(&pool, pane, sid, None).await?;
+
+        // First call creates one window.
+        backfill_windows(&pool).await?;
+        let count_first = count_windows_in(&pool).await;
+        assert_eq!(count_first, 1, "first backfill must create 1 window");
+
+        // Second call must not add any more windows.
+        backfill_windows(&pool).await?;
+        let count_second = count_windows_in(&pool).await;
+        assert_eq!(
+            count_second, 1,
+            "second backfill must be a no-op — window count unchanged"
+        );
+
+        Ok(())
+    }
+
+    /// Store::open on a freshly created db with no session rows must leave the
+    /// windows table empty (the backfill guard short-circuits on sess_count == 0).
+    #[tokio::test]
+    async fn backfill_windows_fresh_install_with_no_sessions_creates_no_windows() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let pool = open_raw_pool(tmp.path()).await?;
+
+        // No sessions inserted — backfill should be a no-op.
+        backfill_windows(&pool).await?;
+
+        let window_count = count_windows_in(&pool).await;
+        assert_eq!(window_count, 0, "fresh install: no sessions => no windows created");
+
+        Ok(())
+    }
+
+    /// Full window CRUD roundtrip through `Store` public API:
+    /// upsert → list → rename → get_name → layout_upsert/get → delete.
+    #[tokio::test]
+    async fn window_crud_roundtrip() -> Result<()> {
+        let _g = ENV_LOCK.lock().await;
+        let tmp = TempDir::new()?;
+        unsafe {
+            std::env::set_var("PYRE_DATA_DIR", tmp.path());
+        }
+        let store = Store::open().await?;
+
+        let sid = SessionId(Uuid::new_v4());
+        store.upsert_session(sid, "test").await?;
+
+        let wid = WindowId::new();
+        let now = Utc::now().timestamp_millis();
+
+        // ── upsert ──────────────────────────────────────────────────────────────
+        store.upsert_window(wid, sid, "my-window", 0, now).await?;
+
+        // ── list (ordered by position) ───────────────────────────────────────
+        let windows = store.list_windows(sid).await?;
+        assert_eq!(windows.len(), 1, "one window after upsert");
+        assert_eq!(windows[0].0, wid, "window id must match");
+        assert_eq!(windows[0].1, "my-window", "window name must match");
+        assert_eq!(windows[0].2, 0, "position must be 0");
+
+        // ── rename → get_name ────────────────────────────────────────────────
+        store.rename_window(wid, "renamed").await?;
+        let name = store.get_window_name(wid).await?;
+        assert_eq!(name.as_deref(), Some("renamed"), "get_window_name must reflect rename");
+
+        // ── layout upsert / get ──────────────────────────────────────────────
+        let pane = PaneId(Uuid::new_v4());
+        let layout = pyre_proto::LayoutNode::Leaf(pane);
+        let json = serde_json::to_string(&layout)?;
+        store.upsert_window_layout(wid, &json).await?;
+        let got = store.get_window_layout_json(wid).await?;
+        assert_eq!(
+            got.as_deref(),
+            Some(json.as_str()),
+            "get_window_layout_json must return what was upserted"
+        );
+
+        // ── delete ───────────────────────────────────────────────────────────
+        store.delete_window(wid).await?;
+        let after_delete = store.list_windows(sid).await?;
+        assert!(after_delete.is_empty(), "list_windows must be empty after delete_window");
+
+        // get_window_name must return None for a deleted window.
+        let name_after_delete = store.get_window_name(wid).await?;
+        assert!(
+            name_after_delete.is_none(),
+            "get_window_name must return None for deleted window"
+        );
+
+        Ok(())
+    }
+
+    /// `assign_pane_window` is idempotent: calling it twice with the same
+    /// (pane, window) pair must not create a duplicate row.
+    #[tokio::test]
+    async fn assign_pane_window_calling_twice_keeps_single_assignment() -> Result<()> {
+        let _g = ENV_LOCK.lock().await;
+        let tmp = TempDir::new()?;
+        unsafe {
+            std::env::set_var("PYRE_DATA_DIR", tmp.path());
+        }
+        let store = Store::open().await?;
+
+        let sid = SessionId(Uuid::new_v4());
+        store.upsert_session(sid, "test").await?;
+
+        let wid = WindowId::new();
+        store
+            .upsert_window(wid, sid, "w0", 0, Utc::now().timestamp_millis())
+            .await?;
+
+        let pane = PaneId(Uuid::new_v4());
+
+        // First assignment.
+        store.assign_pane_window(pane, sid, wid).await?;
+        let panes_first = store.list_panes_for_window(wid).await?;
+        assert_eq!(panes_first.len(), 1, "one pane after first assign");
+        assert_eq!(panes_first[0], pane);
+
+        // Second assignment — must be idempotent (INSERT OR IGNORE + UPDATE).
+        store.assign_pane_window(pane, sid, wid).await?;
+        let panes_second = store.list_panes_for_window(wid).await?;
+        assert_eq!(
+            panes_second.len(),
+            1,
+            "assign_pane_window twice must not create duplicate pane row"
+        );
+
+        Ok(())
+    }
 }
