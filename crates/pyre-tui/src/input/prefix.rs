@@ -245,6 +245,18 @@ pub(crate) async fn handle_prefix_key(state: &mut AppState, code: KeyCode) -> Pr
             });
         }
 
+        // Rename active window/tab (Ctrl-Space . — mirrors tmux rename-window)
+        KeyCode::Char('.') => {
+            let sv = &state.sessions[state.active_session];
+            let tab = &sv.tabs[sv.active_tab];
+            let current_name = tab.window_name.clone();
+            let window_id = tab.window_id;
+            state.prompt = Some(NamePrompt {
+                kind: PromptKind::RenameWindow(window_id),
+                input: current_name,
+            });
+        }
+
         // Toggle toast notifications (Ctrl-Space N)
         KeyCode::Char('N') => {
             state.toast_deck.enabled = !state.toast_deck.enabled;

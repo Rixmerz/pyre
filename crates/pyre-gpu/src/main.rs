@@ -212,6 +212,11 @@ struct App {
     rows: usize,
     needs_redraw: bool,
     session: SessionId,
+    /// The window whose layout is currently rendered. `None` until `list_windows`
+    /// returns at least one window for the session.
+    // ponytail: stored for the planned window-switcher UI; not read until W3c.
+    #[allow(dead_code)]
+    active_window: Option<pyre_proto::WindowId>,
     socket: PathBuf,
     /// Shell override from `--shell` CLI flag.  Retained for future use when
     /// `open_pane_split` gains an optional cmd override; not consumed by the
@@ -1489,7 +1494,11 @@ async fn spawn_default(
         env: std::env::vars().collect(),
         name: None,
     };
-    let SpawnResp { session, pane } = client
+    let SpawnResp {
+        session,
+        pane,
+        window: _,
+    } = client
         .spawn(tarpc::context::current(), req)
         .await
         .context("rpc")?
@@ -1561,22 +1570,51 @@ async fn main() -> Result<()> {
     let (cols, rows) = (80usize, 24usize);
     let term = Arc::new(Mutex::new(TermView::new(cols, rows)));
 
-    // Fetch the authoritative layout from the daemon (M7-F).  Fall back to a
-    // single-leaf placeholder if the RPC fails (e.g. older daemon without M7-B).
-    let layout = match client
-        .get_session_layout(tarpc::context::current(), session)
+    // Fetch the authoritative layout from the daemon (M7-F / W1).
+    // Prefer per-window layout (W1); fall back to session-level compat shim.
+    let initial_window: Option<pyre_proto::WindowId> = client
+        .list_windows(tarpc::context::current(), session)
         .await
-    {
-        Ok(Ok(node)) => node,
-        Ok(Err(e)) => {
-            tracing::warn!("get_session_layout error: {e}; falling back to single-pane layout");
-            LayoutNode::Leaf(pane)
+        .ok()
+        .and_then(|r| r.ok())
+        .and_then(|ws| ws.into_iter().next().map(|w| w.id));
+
+    let layout = if let Some(win_id) = initial_window {
+        match client
+            .get_window_layout(tarpc::context::current(), win_id)
+            .await
+        {
+            Ok(Ok(node)) => node,
+            Ok(Err(e)) => {
+                tracing::warn!("get_window_layout error: {e}; falling back to session layout");
+                client
+                    .get_session_layout(tarpc::context::current(), session)
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+                    .unwrap_or(LayoutNode::Leaf(pane))
+            }
+            Err(e) => {
+                tracing::warn!("get_window_layout transport: {e:#}; falling back");
+                LayoutNode::Leaf(pane)
+            }
         }
-        Err(e) => {
-            tracing::warn!(
-                "get_session_layout transport: {e:#}; falling back to single-pane layout"
-            );
-            LayoutNode::Leaf(pane)
+    } else {
+        match client
+            .get_session_layout(tarpc::context::current(), session)
+            .await
+        {
+            Ok(Ok(node)) => node,
+            Ok(Err(e)) => {
+                tracing::warn!("get_session_layout error: {e}; falling back to single-pane layout");
+                LayoutNode::Leaf(pane)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "get_session_layout transport: {e:#}; falling back to single-pane layout"
+                );
+                LayoutNode::Leaf(pane)
+            }
         }
     };
     let mut terms: HashMap<PaneId, Arc<Mutex<TermView>>> = HashMap::new();
@@ -1631,17 +1669,30 @@ async fn main() -> Result<()> {
                             }
                         }
                         // On LayoutChanged, re-fetch the authoritative layout
-                        // from the daemon and push it into layout_rx (M7-F).
+                        // from the daemon and push it into layout_rx (M7-F / W1).
+                        // Prefer per-window layout; fall back to session compat shim.
                         if layout_changed {
-                            match layout_push_client
-                                .get_session_layout(tarpc::context::current(), session)
+                            let win_id: Option<pyre_proto::WindowId> = layout_push_client
+                                .list_windows(tarpc::context::current(), session)
                                 .await
-                            {
+                                .ok()
+                                .and_then(|r| r.ok())
+                                .and_then(|ws| ws.into_iter().next().map(|w| w.id));
+                            let fetch = if let Some(wid) = win_id {
+                                layout_push_client
+                                    .get_window_layout(tarpc::context::current(), wid)
+                                    .await
+                            } else {
+                                layout_push_client
+                                    .get_session_layout(tarpc::context::current(), session)
+                                    .await
+                            };
+                            match fetch {
                                 Ok(Ok(node)) => {
                                     let _ = layout_tx.send(node);
                                 }
-                                Ok(Err(e)) => tracing::warn!("get_session_layout error: {e}"),
-                                Err(e) => tracing::warn!("get_session_layout transport: {e:#}"),
+                                Ok(Err(e)) => tracing::warn!("layout fetch error: {e}"),
+                                Err(e) => tracing::warn!("layout fetch transport: {e:#}"),
                             }
                         }
                     }
@@ -1673,6 +1724,7 @@ async fn main() -> Result<()> {
         rows,
         needs_redraw: true,
         session,
+        active_window: initial_window,
         socket,
         shell: cli.shell,
         modifiers: ModifiersState::default(),

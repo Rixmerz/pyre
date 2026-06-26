@@ -176,6 +176,38 @@ pub(crate) async fn handle_key(
                                 }
                             }
                         }
+                        PromptKind::RenameWindow(window_id) => {
+                            if let Some(new_name) = input {
+                                match state
+                                    .control
+                                    .rename_window(
+                                        tarpc::context::current(),
+                                        window_id,
+                                        new_name.clone(),
+                                    )
+                                    .await
+                                {
+                                    Ok(Ok(())) => {
+                                        let si = state.active_session;
+                                        if let Some(tab) = state.sessions[si]
+                                            .tabs
+                                            .iter_mut()
+                                            .find(|t| t.window_id == window_id)
+                                        {
+                                            tab.window_name = new_name;
+                                        }
+                                    }
+                                    Ok(Err(e)) => {
+                                        tracing::warn!("rename_window rpc error: {e}");
+                                        state.status_msg = Some(format!("rename failed: {e}"));
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("rename_window transport: {e}");
+                                        state.status_msg = Some(format!("rename rpc: {e}"));
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }

@@ -1,4 +1,4 @@
-use pyre_proto::{layout::LayoutNode, PaneId, SessionId};
+use pyre_proto::{layout::LayoutNode, PaneId, SessionId, WindowId};
 
 use crate::model::layout::{pane_leaves_in_order, pane_to_slot_idx};
 use crate::model::pane::PaneSlot;
@@ -28,6 +28,8 @@ impl SessionView {
                 zoomed: None,
                 boundaries: Vec::new(),
                 drag: None,
+                window_id: WindowId(uuid::Uuid::nil()),
+                window_name: String::new(),
             }],
             active_tab: 0,
         }

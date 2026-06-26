@@ -278,8 +278,18 @@ pub(crate) async fn open_new_tab(state: &mut AppState, label: Option<String>) ->
     let (term_cols, term_rows) = term_size();
     let (cols, rows) = compute_pane_inner_size(term_cols, term_rows);
     let session_id = state.active_session_id();
+
+    // Create a daemon window for this tab first (1:1 mapping).
+    let window_id = state
+        .control
+        .new_window(tarpc::context::current(), session_id, label.clone())
+        .await
+        .context("rpc transport")?
+        .map_err(|e| anyhow!("daemon new_window: {e}"))?;
+
     let req = OpenPaneReq {
         session: session_id,
+        window: window_id,
         shell: state.shell.clone(),
         cwd: std::env::current_dir().ok(),
         cols,
@@ -299,15 +309,17 @@ pub(crate) async fn open_new_tab(state: &mut AppState, label: Option<String>) ->
 
     let sv = state.active_session_view_mut();
     let tab_n = sv.tabs.len() + 1;
-    let _label = label
+    let window_name = label
         .filter(|l| !l.is_empty())
-        .unwrap_or_else(|| format!("tab-{tab_n}"));
+        .unwrap_or_else(|| format!("{tab_n}"));
     sv.tabs.push(Tab {
         root: LayoutNode::Leaf(new_pane_id),
         focus_pane: new_pane_id,
         zoomed: None,
         boundaries: Vec::new(),
         drag: None,
+        window_id,
+        window_name,
     });
     sv.active_tab = sv.tabs.len() - 1;
 
@@ -327,7 +339,11 @@ pub(crate) async fn open_new_session(state: &mut AppState, name: Option<String>)
         env: std::env::vars().collect(),
         name: resolved_name.clone(),
     };
-    let SpawnResp { session, pane } = state
+    let SpawnResp {
+        session,
+        pane,
+        window,
+    } = state
         .control
         .spawn(tarpc::context::current(), req)
         .await
@@ -349,6 +365,8 @@ pub(crate) async fn open_new_session(state: &mut AppState, name: Option<String>)
             zoomed: None,
             boundaries: Vec::new(),
             drag: None,
+            window_id: window,
+            window_name: "1".to_string(),
         }],
         active_tab: 0,
     });
@@ -490,7 +508,7 @@ mod tests {
     use bytes::Bytes;
     use futures::StreamExt;
     use pyre_proto::{
-        layout::LayoutNode, PaneId, PyreDaemon, PyreDaemonClient, PyreError, SessionId,
+        layout::LayoutNode, PaneId, PyreDaemon, PyreDaemonClient, PyreError, SessionId, WindowId,
     };
     use tarpc::server::{BaseChannel, Channel};
     use tokio::sync::{mpsc, watch};
@@ -737,6 +755,51 @@ mod tests {
         ) -> Result<LayoutNode, PyreError> {
             Err(PyreError::NoSuchSession(_session))
         }
+        async fn rename_pane(
+            self,
+            _ctx: tarpc::context::Context,
+            _pane: PaneId,
+            _name: String,
+        ) -> Result<(), PyreError> {
+            Ok(())
+        }
+        async fn list_windows(
+            self,
+            _ctx: tarpc::context::Context,
+            _session: SessionId,
+        ) -> Result<Vec<pyre_proto::WindowInfo>, PyreError> {
+            Ok(vec![])
+        }
+        async fn new_window(
+            self,
+            _ctx: tarpc::context::Context,
+            _session: SessionId,
+            _name: Option<String>,
+        ) -> Result<WindowId, PyreError> {
+            Ok(WindowId::new())
+        }
+        async fn rename_window(
+            self,
+            _ctx: tarpc::context::Context,
+            _window: WindowId,
+            _name: String,
+        ) -> Result<(), PyreError> {
+            Ok(())
+        }
+        async fn close_window(
+            self,
+            _ctx: tarpc::context::Context,
+            _window: WindowId,
+        ) -> Result<(), PyreError> {
+            Ok(())
+        }
+        async fn get_window_layout(
+            self,
+            _ctx: tarpc::context::Context,
+            _window: WindowId,
+        ) -> Result<LayoutNode, PyreError> {
+            Err(PyreError::NoSuchSession(SessionId::new()))
+        }
     }
 
     // ── Test helpers ─────────────────────────────────────────────────────────
@@ -808,6 +871,8 @@ mod tests {
             zoomed: None,
             boundaries: vec![],
             drag: None,
+            window_id: WindowId(uuid::Uuid::nil()),
+            window_name: String::new(),
         };
 
         AppState {
@@ -1021,6 +1086,8 @@ mod tests {
             zoomed: None,
             boundaries: vec![],
             drag: None,
+            window_id: WindowId(uuid::Uuid::nil()),
+            window_name: String::new(),
         };
 
         let mut state = AppState {

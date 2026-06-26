@@ -51,6 +51,7 @@ fn render_name_prompt(
         PromptKind::NewSession => " new session name ",
         PromptKind::NewTab => " new tab label ",
         PromptKind::RenameSession(_) => " rename session ",
+        PromptKind::RenameWindow(_) => " rename window ",
     };
 
     let outer = RatatuiBlock::default()
@@ -203,9 +204,14 @@ pub fn draw_frame(
             let mut x_cursor: u16 = tabs_area.x;
             let mut new_tab_chip_rects: Vec<(usize, Rect)> = Vec::new();
 
-            for (i, _) in sv.tabs.iter().enumerate() {
-                // Each chip: " N ×" — label + close button.
-                let label = format!(" {} ×", i + 1);
+            for (i, tab) in sv.tabs.iter().enumerate() {
+                // Each chip: " N ×" or " name ×" — label + close button.
+                let win_label = if tab.window_name.is_empty() {
+                    format!("{}", i + 1)
+                } else {
+                    tab.window_name.clone()
+                };
+                let label = format!(" {win_label} ×");
                 let len = label.chars().count() as u16;
                 let style = if i == sv.active_tab {
                     t.tab_active()

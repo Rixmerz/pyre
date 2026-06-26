@@ -1,4 +1,4 @@
-use pyre_proto::{layout::LayoutNode, PaneId};
+use pyre_proto::{layout::LayoutNode, PaneId, WindowId};
 
 use crate::model::pane::SplitBoundary;
 
@@ -14,6 +14,12 @@ pub struct Tab {
     pub boundaries: Vec<SplitBoundary>,
     /// Active drag state (set on mouse-down near a boundary).
     pub drag: Option<crate::model::pane::DragState>,
+    /// Daemon window this tab maps to. `WindowId(Default::default())` (nil UUID)
+    /// until the first `list_windows` resync populates it.
+    pub window_id: WindowId,
+    /// Human-readable window name from the daemon (e.g. "1", "2"). Empty until
+    /// the first `list_windows` resync populates it.
+    pub window_name: String,
 }
 
 /// Reorder tabs: move tab at `from` to position `to` (0-based), shifting others.

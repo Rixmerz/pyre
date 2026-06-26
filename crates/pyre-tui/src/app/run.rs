@@ -144,7 +144,11 @@ pub(crate) async fn run_tui(
                 env: std::env::vars().collect(),
                 name: None,
             };
-            let SpawnResp { session, pane } = control
+            let SpawnResp {
+                session,
+                pane,
+                window: _,
+            } = control
                 .spawn(tarpc::context::current(), req)
                 .await
                 .context("rpc transport")?
@@ -566,6 +570,8 @@ pub(crate) async fn run_tui(
                                             zoomed: None,
                                             boundaries: Vec::new(),
                                             drag: None,
+                                            window_id: pane_info.window,
+                                            window_name: format!("{tab_n}"),
                                         });
                                         tracing::warn!(
                                             "pane-sync: fallback — new pane {} added as tab-{} \
@@ -635,9 +641,17 @@ pub(crate) async fn run_tui(
         if state.layout_resync_last_poll.elapsed() >= Duration::from_secs(5) {
             state.layout_resync_last_poll = Instant::now();
             let active_session_id = state.sessions[state.active_session].id;
-            if let Some(fresh_layout) =
+            let active_window_id = state.sessions[state.active_session].tabs
+                [state.sessions[state.active_session].active_tab]
+                .window_id;
+            // Prefer per-window layout; fall back to the session-level compat shim
+            // when window_id is nil (not yet populated by list_windows resync).
+            let fresh_layout = if active_window_id.0 != uuid::Uuid::nil() {
+                crate::rpc::layout::get_window_layout(&state.control, active_window_id).await
+            } else {
                 crate::rpc::layout::get_session_layout(&state.control, active_session_id).await
-            {
+            };
+            if let Some(fresh_layout) = fresh_layout {
                 let si = state.active_session;
                 let at = state.sessions[si].active_tab;
                 let daemon_leaves = pane_leaves_in_order(&fresh_layout);
