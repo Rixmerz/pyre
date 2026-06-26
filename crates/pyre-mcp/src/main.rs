@@ -14,7 +14,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use pyre_proto::{
     connect_control, default_socket, ListBlocksReq, OpenPaneReq, OpenPaneSplitReq, Orient,
-    PaneStateKind, PyreDaemonClient, SearchBlocksReq, SessionId, SpawnReq,
+    PaneStateKind, PyreDaemonClient, SearchBlocksReq, SessionId, SpawnReq, WindowId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1270,6 +1270,7 @@ impl Server {
                 // Open an additional pane in the session.
                 let req = OpenPaneReq {
                     session: session_id,
+                    window: WindowId::default(),
                     shell: std::env::var("SHELL").ok(),
                     cwd,
                     cols: 80,
@@ -1515,6 +1516,7 @@ impl Server {
         let pane_name = args["name"].as_str().map(str::to_owned);
         let req = OpenPaneReq {
             session: session_id,
+            window: WindowId::default(),
             shell,
             cwd,
             cols,

@@ -31,7 +31,7 @@ use pyre_proto::shell_integration::{BASH_SCRIPT, FISH_SCRIPT, ZSH_SCRIPT};
 use pyre_proto::{
     attach_stream, connect_control, default_socket, BlockHit, InputFrame, ListBlocksReq,
     OpenPaneReq, OutputFrame, PaneId, PaneStateKind, PyreDaemonClient, SearchBlocksReq, SessionId,
-    SpawnReq, SpawnResp, PROTO_VERSION,
+    SpawnReq, SpawnResp, WindowId, PROTO_VERSION,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_serde::formats::SymmetricalBincode;
@@ -590,7 +590,7 @@ async fn run_default(socket: PathBuf, shell: Option<String>) -> Result<()> {
         env: std::env::vars().collect(),
         name: None,
     };
-    let SpawnResp { session, pane } = client
+    let SpawnResp { session, pane, window: _ } = client
         .spawn(tarpc::context::current(), req)
         .await
         .context("rpc transport")?
@@ -670,6 +670,7 @@ async fn run_new_pane(
     let session = resolve_session(&client, &session_prefix).await?;
     let req = OpenPaneReq {
         session,
+        window: WindowId::default(),
         shell,
         cwd: std::env::current_dir().ok(),
         cols,
@@ -1055,7 +1056,7 @@ async fn run_session_new(
         env: std::env::vars().collect(),
         name: Some(name),
     };
-    let SpawnResp { session, pane } = client
+    let SpawnResp { session, pane, window: _ } = client
         .spawn(tarpc::context::current(), req)
         .await
         .context("rpc transport")?
@@ -1327,6 +1328,7 @@ async fn run_split_window(socket: PathBuf, session_prefix: String) -> Result<()>
     let (cols, rows) = term_size();
     let req = OpenPaneReq {
         session,
+        window: WindowId::default(),
         shell: std::env::var("SHELL").ok(),
         cwd: std::env::current_dir().ok(),
         cols,
@@ -1423,7 +1425,7 @@ async fn main() -> Result<()> {
                 env: std::env::vars().collect(),
                 name: None,
             };
-            let SpawnResp { session, pane } = client
+            let SpawnResp { session, pane, window: _ } = client
                 .spawn(tarpc::context::current(), req)
                 .await
                 .context("rpc transport")?
