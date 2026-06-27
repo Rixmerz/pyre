@@ -9,10 +9,14 @@
 // `api.ts` wrappers, a GUI-side bug reproduces here exactly as in production.
 //
 // Constraints honored: dependency-free, single file, no `Math.random`/`Date.now`
-// at module top (ids come from an incrementing counter; timestamps from a fixed
-// seed constant), strict TS (no `any`, no non-null `!`). The whole module is
-// side-effect-free at the top level (the model is built lazily on first call),
-// so when VITE_MOCK is unset it tree-shakes out of the production bundle.
+// at module top (ids come from an incrementing counter; finished-block timestamps
+// derive from a fixed seed constant), strict TS (no `any`, no non-null `!`). The
+// one running block is the exception: its start time is relative to load and a
+// dev-only timer completes it shortly after boot, so the running→done lifecycle
+// is visibly demonstrated — but both `Date.now()` calls run lazily inside
+// `seed()` / its timer, never at module top, so the module stays side-effect-free
+// at the top level (the model is built lazily on first call) and still tree-shakes
+// out of the production bundle when VITE_MOCK is unset.
 
 import type {
   Block,
@@ -77,6 +81,14 @@ interface MockState {
 /** Fixed seed timestamp (no Date.now at module top). */
 const SEED_TS = "2026-06-20T09:00:00.000Z";
 const SOCKET = "/run/user/1000/pyre/mock.sock";
+
+/** How long before load the demo's one running block started — keeps its elapsed
+ *  time sane ("0m Ns") instead of days-since the fixed seed. Computed lazily
+ *  inside `seed()`, never at module top. */
+const RUNNING_STARTED_MS_AGO = 4_000;
+/** Dev-only: how long after boot that running block completes, so the demo
+ *  visibly shows the running→done lifecycle on the next 750 ms poll tick. */
+const RUNNING_COMPLETES_AFTER_MS = 6_000;
 
 // Lazily built so the module body stays side-effect-free → tree-shakeable.
 let state: MockState | null = null;
@@ -253,16 +265,24 @@ function makeBlock(
   stdout: string,
   exitCode: number | null,
   durationMs: number | null,
+  startedAt: string = SEED_TS,
 ): MockBlock {
   const running = exitCode === null;
+  // Derive ended_at from start + duration so the inspector shows a realistic
+  // elapsed: blockDurationMs (render/dom.ts) reads the timestamps, not
+  // duration_ms. Without this, finished demo blocks rendered "0ms" because
+  // started_at === ended_at (both SEED_TS).
+  const endedAt = running
+    ? null
+    : new Date(Date.parse(startedAt) + (durationMs ?? 0)).toISOString();
   const block: Block = {
     id,
     pane: pane.id,
     session: pane.session,
     command,
     cwd: "/home/dev/pyre",
-    started_at: SEED_TS,
-    ended_at: running ? null : SEED_TS,
+    started_at: startedAt,
+    ended_at: endedAt,
     exit_code: exitCode,
     duration_ms: durationMs,
     running,
@@ -313,6 +333,12 @@ function seed(): MockState {
     agent: "shell",
     title: null,
   });
+  // The one RUNNING block: started a few seconds before load (sane elapsed) and
+  // completed shortly after boot by completeBlockSoon — demonstrating running→done.
+  const runStartedAt = new Date(Date.now() - RUNNING_STARTED_MS_AGO).toISOString();
+  const runningBlock = makeBlock(devA, "blk-dev-a-3", "cargo test -p pyred",
+    "running 42 tests\ntest store::tests::window_migration ... ok\ntest store::tests::crud ... ok\n",
+    null, null, runStartedAt);
   devA.blocks = [
     makeBlock(devA, "blk-dev-a-1", "cargo check",
       "    Checking pyre-proto v0.4.0\n    Checking pyred v0.4.0\n     Finished dev [unoptimized + debuginfo] in 2.41s\n",
@@ -320,10 +346,9 @@ function seed(): MockState {
     makeBlock(devA, "blk-dev-a-2", "git status",
       "On branch main\nYour branch is up to date with 'origin/main'.\n\nnothing to commit, working tree clean\n",
       0, 38),
-    makeBlock(devA, "blk-dev-a-3", "cargo test -p pyred",
-      "running 42 tests\ntest store::tests::window_migration ... ok\ntest store::tests::crud ... ok\n",
-      null, null),
+    runningBlock,
   ];
+  completeBlockSoon(devA, runningBlock);
   s.windows.set("win-dev-1", {
     id: "win-dev-1",
     session: "sess-dev",
@@ -413,6 +438,33 @@ function seed(): MockState {
   });
 
   return s;
+}
+
+/**
+ * Dev-only: finish the seeded running block a few seconds after boot so the demo
+ * shows a real running→done transition — the 750 ms block poll in main.ts
+ * (reloadFocusedBlocks → list_blocks) picks up the mutation on its next tick.
+ * Mutates the model in place; no production effect (the whole module is dev-only
+ * and tree-shaken when VITE_MOCK is unset). Self-guarding: only completes a block
+ * still running, and the timer is unref'd so it never keeps a test process alive.
+ */
+function completeBlockSoon(pane: MockPane, mb: MockBlock): void {
+  if (typeof setTimeout !== "function") return;
+  const handle = setTimeout(() => {
+    if (!mb.block.running) return; // already finished / superseded
+    const endedAt = new Date().toISOString();
+    const startMs = Date.parse(mb.block.started_at);
+    const endMs = Date.parse(endedAt);
+    mb.block.running = false;
+    mb.block.exit_code = 0;
+    mb.block.ended_at = endedAt;
+    mb.block.duration_ms = Number.isNaN(startMs) ? null : Math.max(0, endMs - startMs);
+    mb.stdout += "test result: ok. 42 passed; 0 failed; 0 ignored\n";
+    // The pane that was running the command returns to idle once it completes.
+    pane.state = "idle";
+  }, RUNNING_COMPLETES_AFTER_MS);
+  // In Node (vitest), don't let the pending timer keep the process alive.
+  (handle as { unref?: () => void }).unref?.();
 }
 
 // ── Themes ───────────────────────────────────────────────────────────────────
