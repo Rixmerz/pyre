@@ -15,6 +15,7 @@ import {
   windowTabs,
   windowLabel,
   activeWindowOf,
+  type AppState,
 } from "../state";
 import {
   newPaneAction,
@@ -24,10 +25,38 @@ import {
 } from "../actions";
 import type { WindowInfo } from "../types";
 
+/**
+ * Canonical string of the rendered tab strip — the active session + per window:
+ * id, name, position. The ACTIVE WINDOW is EXCLUDED: switching windows must not
+ * rebuild the strip (that would flicker the pills and could lose a click). The
+ * active pill class is moved IN-PLACE by applyActiveWindowInPlace. Mirrors
+ * center.ts windowsFingerprint. `__none__` covers the no-session/disconnected
+ * case so the clear-out runs exactly once on the transition into it.
+ */
+function tabsFingerprint(s: Readonly<AppState>): string {
+  const session = s.activeSession;
+  if (!session || !s.connected) return "__none__";
+  const parts = windowTabs(session).map(
+    (w) => `${w.id}:${w.name}:${w.position}`,
+  );
+  return `${session}|[${parts.join(",")}]`;
+}
+
+/** Last fingerprint that triggered a full tab-strip rebuild. */
+let lastTabsFingerprint = "";
+
 /** Render the tab strip for the active session into `root`. Hidden if no session. */
 export function renderTabs(root: HTMLElement): void {
   const s = getState();
   const session = s.activeSession;
+
+  const fp = tabsFingerprint(s);
+  if (fp === lastTabsFingerprint && root.childElementCount > 0) {
+    // Window set, names and positions unchanged. Only the active window may have
+    // moved — applied in-place by applyActiveWindowInPlace (render/index.ts).
+    return;
+  }
+  lastTabsFingerprint = fp;
 
   // No active session (or disconnected) → nothing to tab over.
   if (!session || !s.connected) {
@@ -120,4 +149,25 @@ function pill(
     },
     ...children,
   );
+}
+
+/**
+ * Move the `.active` pill highlight to the current active window IN-PLACE — no
+ * rebuild. Mirrors applyActiveSessionInPlace: query the live pills by data-window
+ * and toggle `.active` + `aria-current` so only the active window's pill carries
+ * them. Because the pill node is NOT replaced (active was dropped from
+ * tabsFingerprint), switching windows never flickers the strip or loses a click.
+ * Called from render/index.ts after every render so it lands even when renderTabs
+ * early-returns on an unchanged fingerprint. Idempotent.
+ */
+export function applyActiveWindowInPlace(): void {
+  const active = activeWindowOf(getState().activeSession);
+  document
+    .querySelectorAll<HTMLElement>(".tab-window[data-window]")
+    .forEach((pill) => {
+      const isActive = pill.dataset["window"] === active;
+      pill.classList.toggle("active", isActive);
+      if (isActive) pill.setAttribute("aria-current", "true");
+      else pill.removeAttribute("aria-current");
+    });
 }

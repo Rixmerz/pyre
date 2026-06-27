@@ -70,7 +70,7 @@ describe("attachRenameAffordance — double-click opens the editor", () => {
 });
 
 describe("attachRenameAffordance — single vs double click", () => {
-  it("doubleClick_doesNotFireSingleClickAction", () => {
+  it("singleClick_firesSwitchImmediately_noDebounce", () => {
     const label = makeLabel("p");
     const onSingleClick = vi.fn();
     attachRenameAffordance({
@@ -80,30 +80,46 @@ describe("attachRenameAffordance — single vs double click", () => {
       onCommit: () => {},
     });
 
-    // A real double-click: two clicks then the dblclick. The dblclick must
-    // cancel the pending debounced single-click.
+    dispatch(label, "click");
+
+    // No grace window: the select fires synchronously. Selection is applied
+    // in-place (active-class toggle), so it never rebuilds the surface — the row
+    // that owns this span survives, which is what makes the immediate fire safe.
+    expect(
+      onSingleClick,
+      "a click switches/focuses immediately, with no debounce",
+    ).toHaveBeenCalledTimes(1);
+  });
+
+  it("doubleClick_stillOpensEditor_afterImmediateSelect", () => {
+    const label = makeLabel("p");
+    const parent = label.parentNode as HTMLElement;
+    const onSingleClick = vi.fn();
+    attachRenameAffordance({
+      label,
+      value: () => "p",
+      onSingleClick,
+      onCommit: () => {},
+    });
+
+    // A real double-click: two clicks then the dblclick. Each click selects
+    // immediately (harmless — in-place active toggle never tears out the row),
+    // and the dblclick STILL opens the inline editor. This is the critical
+    // rename-a-non-active edge case: the immediate select must not destroy the
+    // span before dblclick lands.
     dispatch(label, "click");
     dispatch(label, "click");
     dispatch(label, "dblclick");
-    vi.runAllTimers();
 
-    expect(onSingleClick, "rename must not also switch/focus").not.toHaveBeenCalled();
-  });
-
-  it("singleClick_firesSwitchAfterGraceWindow", () => {
-    const label = makeLabel("p");
-    const onSingleClick = vi.fn();
-    attachRenameAffordance({
-      label,
-      value: () => "p",
+    const input = parent.querySelector("input.inline-edit-input");
+    expect(
+      input,
+      "dblclick opens the editor even though the click already selected",
+    ).not.toBeNull();
+    expect(
       onSingleClick,
-      onCommit: () => {},
-    });
-
-    dispatch(label, "click");
-    vi.runAllTimers();
-
-    expect(onSingleClick, "a lone click still switches/focuses").toHaveBeenCalledTimes(1);
+      "the first click selects (in-place active makes this harmless)",
+    ).toHaveBeenCalled();
   });
 
   it("clickOnLabel_stopsPropagationToParent", () => {

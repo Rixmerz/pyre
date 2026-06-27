@@ -3,10 +3,10 @@
 
 import { getState, subscribe } from "../state";
 import { renderTopbar } from "./topbar";
-import { renderRail } from "./rail";
+import { renderRail, applyActiveSessionInPlace } from "./rail";
 import { renderCenter, applyFocusInPlace } from "./center";
-import { renderTabs } from "./tabs";
-import { renderBlocks } from "./blocks";
+import { renderTabs, applyActiveWindowInPlace } from "./tabs";
+import { renderBlocks, applyBlockElapsedInPlace } from "./blocks";
 import { renderStatusbar } from "./statusbar";
 import { renderPalette, resetPalette, handlePaletteKey } from "./palette";
 import { renderThemePicker } from "./themepicker";
@@ -81,12 +81,20 @@ export function renderAll(): void {
     renderTabs(regions.tabs);
     renderCenter(regions.paneArea);
   }
-  // Apply the focus glow IN-PLACE on every render, even when renderCenter early-
-  // returns (focusedPane was dropped from its structural fingerprint, so a focus-
-  // only change no longer rebuilds the pane area). This is what moves `.focused`
-  // between cards and lets the CSS transition play. Idempotent.
+  // Apply the in-place selection/focus passes on EVERY render, even when the
+  // region renderers early-return on an unchanged fingerprint (active session,
+  // active window and focused pane are all excluded from their fingerprints so a
+  // selection change no longer rebuilds the region). These move the `.active` /
+  // `.focused` highlights between the EXISTING nodes — preserving node identity
+  // so hover survives, clicks aren't lost mid-rebuild, and CSS transitions play.
+  // All three are idempotent.
+  applyActiveSessionInPlace();
+  applyActiveWindowInPlace();
   applyFocusInPlace();
   renderBlocks(regions.right);
+  // Advance running blocks' elapsed-time text in place (excluded from the block
+  // list fingerprint so a tick doesn't rebuild the cards). Idempotent.
+  applyBlockElapsedInPlace();
   renderStatusbar(regions.statusbar);
 
   const s = getState();

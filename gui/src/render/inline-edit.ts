@@ -32,11 +32,6 @@ export function isInlineEditing(): boolean {
   return activeEditors > 0;
 }
 
-/** Delay (ms) a single click waits to see if it's actually the first half of a
- *  double-click. Just under the OS double-click window so a real double-click
- *  always lands inside it. */
-const DBLCLICK_GRACE_MS = 250;
-
 export interface RenameAffordanceOpts {
   /** The label span the affordance is attached to (becomes the editor target). */
   label: HTMLElement;
@@ -57,23 +52,26 @@ export interface RenameAffordanceOpts {
  * Wire the SHARED rename affordance onto a label span so all three surfaces
  * (rail session name, tab pill label, pane-card title) behave identically:
  *
- *   - single-click  → onSingleClick (debounced; cancelled if a double-click follows)
+ *   - single-click  → onSingleClick fires IMMEDIATELY (no debounce)
  *   - double-click  → open the inline editor seeded with value()
  *   - mousedown/click/dblclick → stopPropagation, so the parent's own
  *     click/mousedown handler (row switch, card focus) never fires on this span
  *     and never triggers a destructive re-render that would tear the span out
  *     from under the pending double-click.
  *
- * The label OWNS its single-click here rather than letting it bubble to the
- * parent, which is the fix for the rail + subpane: the parent's switch/focus
- * setState used to rebuild the surface between the two clicks of a double-click,
- * destroying the span before `dblclick` could fire on it.
+ * Single-click is no longer debounced. It previously waited a grace window so a
+ * double-click wouldn't first fire switchSession/switchWindow — whose async
+ * reload rebuilt the surface between the two clicks and destroyed this span
+ * before `dblclick` could land. Selection is now applied IN-PLACE (rail/tabs
+ * toggle the active class on the existing rows via applyActiveSessionInPlace /
+ * applyActiveWindowInPlace), so a single-click never rebuilds the surface; the
+ * span survives the first click of a double-click and the editor still opens on
+ * dblclick. The first click of a genuine double-click therefore selects
+ * harmlessly (idempotent when already active), then dblclick opens rename.
  */
 export function attachRenameAffordance(opts: RenameAffordanceOpts): void {
   const { label, onSingleClick, value, onCommit } = opts;
   label.title = "Double-click to rename";
-
-  let clickTimer: number | undefined;
 
   // Stop mousedown so a parent's onmousedown (e.g. the pane card's focusPane)
   // can't fire a structural re-render mid-double-click.
@@ -81,23 +79,12 @@ export function attachRenameAffordance(opts: RenameAffordanceOpts): void {
 
   label.addEventListener("click", (e) => {
     e.stopPropagation();
-    if (!onSingleClick) return;
-    // Defer the single-click action; a following dblclick clears this timer so
-    // the switch/focus never runs when the user meant to rename.
-    if (clickTimer !== undefined) window.clearTimeout(clickTimer);
-    clickTimer = window.setTimeout(() => {
-      clickTimer = undefined;
-      onSingleClick();
-    }, DBLCLICK_GRACE_MS);
+    if (onSingleClick) onSingleClick();
   });
 
   label.addEventListener("dblclick", (e) => {
     e.stopPropagation();
     e.preventDefault();
-    if (clickTimer !== undefined) {
-      window.clearTimeout(clickTimer);
-      clickTimer = undefined;
-    }
     beginInlineEdit({
       label,
       value: value(),

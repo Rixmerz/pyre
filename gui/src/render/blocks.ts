@@ -35,6 +35,16 @@ let searchInputEl: HTMLInputElement | null = null;
 let headerEl: HTMLElement | null = null;
 let listEl: HTMLElement | null = null;
 
+// Last fingerprints that triggered a header / list rebuild. The header tracks
+// only the failures-only toggle; the list tracks the focused pane + each block's
+// STABLE fields (id, status, exit code, command, expanded) but NOT the volatile
+// elapsed time of a running block — that ticks every poll and is updated in
+// place by applyBlockElapsedInPlace instead, so a running block no longer forces
+// a full list replaceChildren (the source of the "never finishes loading"
+// flicker). Reset to "" in buildShell so a fresh shell always paints once.
+let lastHeaderFp = "";
+let lastListFp = "";
+
 export function renderBlocks(root: HTMLElement): void {
   const s = getState();
   root.classList.toggle("collapsed", s.rightCollapsed);
@@ -100,12 +110,23 @@ function buildShell(root: HTMLElement, s: Readonly<AppState>): void {
   searchInputEl = input;
   headerEl = header;
   listEl = list;
+  // Fresh, empty header + list hosts — force the next renderHeader/renderList to
+  // paint once rather than skip on a stale fingerprint left from a prior shell.
+  lastHeaderFp = "";
+  lastListFp = "";
 }
 
 /** Render the panel header (section label + failures toggle) into its host. */
 function renderHeader(s: Readonly<AppState>): void {
   const host = headerEl;
   if (!host) return;
+
+  // The header's only stateful bit is the failures-only toggle. Skip the rebuild
+  // (which would recreate the toggle button and flicker its hover state) on the
+  // common no-op poll tick where that flag is unchanged.
+  const fp = s.blocksFailuresOnly ? "1" : "0";
+  if (fp === lastHeaderFp && host.childElementCount > 0) return;
+  lastHeaderFp = fp;
 
   const failBtn = h(
     "button",
@@ -124,6 +145,27 @@ function renderHeader(s: Readonly<AppState>): void {
   replaceChildren(host, h("span", { class: "section-label" }, "Blocks"), failBtn);
 }
 
+/**
+ * Canonical string of the rendered card list — focused pane + filter/search mode
+ * + per block its STABLE fields (id, status, exit code, command, expanded). The
+ * running-block elapsed time is deliberately excluded (it ticks every poll and is
+ * patched in place by applyBlockElapsedInPlace), so a no-op tick keeps the same
+ * string and skips the rebuild — killing the per-poll flicker. A genuine change
+ * (block finishes, new/closed block, expand toggled, focus moves) changes the
+ * string and forces a rebuild.
+ */
+function listFingerprint(s: Readonly<AppState>, items: readonly Block[]): string {
+  const focused = s.focusedPane ?? "";
+  const mode = `${s.blocksFailuresOnly ? 1 : 0}${s.searchResults ? 1 : 0}`;
+  const parts = items.map((b) => {
+    const running = b.exit_code == null && b.ended_at == null;
+    const status = running ? "run" : String(b.exit_code ?? "?");
+    const expanded = s.expandedBlocks.has(b.id) ? "1" : "0";
+    return `${b.id}~${status}~${expanded}~${b.command}`;
+  });
+  return `${focused}|${mode}|[${parts.join("\n")}]`;
+}
+
 /** Render the filtered block cards into the persistent list container only. */
 function renderList(s: Readonly<AppState>): void {
   const list = listEl;
@@ -133,6 +175,15 @@ function renderList(s: Readonly<AppState>): void {
   // failures-only filter client-side on top (works for both sources).
   let items = s.searchResults ?? s.blocks;
   if (s.blocksFailuresOnly) items = items.filter(blockFailed);
+
+  const fp = listFingerprint(s, items);
+  if (fp === lastListFp && list.childElementCount > 0) {
+    // Nothing structural changed; only a running block's elapsed time may have
+    // advanced — applyBlockElapsedInPlace (render/index.ts) patches that text
+    // node in place. Skip the replaceChildren tear-down.
+    return;
+  }
+  lastListFp = fp;
 
   if (items.length === 0) {
     const msg = s.blocksFailuresOnly
@@ -214,7 +265,10 @@ function blockCard(b: Block, cool: number, expanded: boolean): HTMLElement {
 
   const card = h(
     "div",
-    { class: `block-card ${statusClass}` + (expanded ? " expanded" : "") },
+    {
+      class: `block-card ${statusClass}` + (expanded ? " expanded" : ""),
+      "data-block": b.id,
+    },
     head,
     meta,
     actions,
@@ -257,6 +311,36 @@ function outputBlock(b: Block): HTMLElement {
       });
   }
   return pre;
+}
+
+/**
+ * Advance the elapsed-time text of each RUNNING block's card IN-PLACE — no
+ * rebuild. Mirrors applyHeatInPlace / applyFocusInPlace: query the live cards by
+ * data-block and patch only the `.block-dur` text node. Because elapsed time is
+ * excluded from listFingerprint, a no-op poll tick skips the list rebuild; this
+ * keeps the running clock advancing without recreating the card (which was the
+ * per-poll flicker). Called from render/index.ts after every render so it lands
+ * even when renderList early-returns on an unchanged fingerprint. Idempotent —
+ * it only writes when the formatted text actually changed.
+ */
+export function applyBlockElapsedInPlace(): void {
+  const s = getState();
+  if (s.rightCollapsed) return;
+  let items = s.searchResults ?? s.blocks;
+  if (s.blocksFailuresOnly) items = items.filter(blockFailed);
+
+  for (const b of items) {
+    const running = b.exit_code == null && b.ended_at == null;
+    if (!running) continue;
+    const card = document.querySelector<HTMLElement>(
+      `.block-card[data-block="${CSS.escape(b.id)}"]`,
+    );
+    if (!card) continue;
+    const durEl = card.querySelector<HTMLElement>(".block-dur");
+    if (!durEl) continue;
+    const dur = fmtDuration(blockDurationMs(b.started_at, b.ended_at));
+    if (durEl.textContent !== dur) durEl.textContent = dur;
+  }
 }
 
 function iconAction(

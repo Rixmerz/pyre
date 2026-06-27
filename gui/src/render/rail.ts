@@ -4,7 +4,7 @@
 import { h, replaceChildren } from "./dom";
 import { icon } from "./icons";
 import { attachRenameAffordance } from "./inline-edit";
-import { getState, panesOfSession } from "../state";
+import { getState, panesOfSession, type AppState } from "../state";
 import { heatVar, hottest } from "../heat";
 import {
   closeSessionAction,
@@ -15,9 +15,40 @@ import {
 } from "../actions";
 import type { PaneState } from "../types";
 
+/**
+ * Canonical string of everything the rail rows RENDER from — per session: id,
+ * name, pane-count and hottest pane state — plus the collapsed flag. The ACTIVE
+ * session is deliberately EXCLUDED: selecting a session must not rebuild the rail
+ * (it would destroy hover state and lose clicks that land mid-rebuild). The
+ * active class is moved IN-PLACE by applyActiveSessionInPlace instead. Mirrors
+ * center.ts windowsFingerprint: a no-op poll tick keeps the same string and skips
+ * the replaceChildren tear-down; a genuine change (rename, new/closed session,
+ * heat shift) changes the string and forces a rebuild.
+ */
+function railFingerprint(s: Readonly<AppState>): string {
+  const rows = s.sessions.map((sess) => {
+    const states = panesOfSession(sess.id).map((p) => p.state as PaneState);
+    return `${sess.id}${sess.name}${sess.pane_count}${hottest(states)}`;
+  });
+  return `c:${s.railCollapsed ? 1 : 0}|[${rows.join("")}]`;
+}
+
+/** Last fingerprint that triggered a full rail rebuild. */
+let lastRailFingerprint = "";
+
 export function renderRail(root: HTMLElement): void {
   const s = getState();
   root.classList.toggle("collapsed", s.railCollapsed);
+
+  const fp = railFingerprint(s);
+  if (fp === lastRailFingerprint && root.childElementCount > 0) {
+    // Session set, names, counts, heat and collapse are all unchanged. Only the
+    // active selection may have moved — that is applied in-place by
+    // applyActiveSessionInPlace (render/index.ts). Skip the rebuild so hover
+    // state survives and a click never lands on a node being replaced.
+    return;
+  }
+  lastRailFingerprint = fp;
 
   const header = h(
     "div",
@@ -83,6 +114,7 @@ export function renderRail(root: HTMLElement): void {
       "button",
       {
         class: "rail-row" + (isActive ? " active" : ""),
+        "data-session": sess.id,
         title: `${sess.name} · ${sess.pane_count} pane${sess.pane_count === 1 ? "" : "s"}`,
         onclick: () => void switchSession(sess.id),
       },
@@ -117,6 +149,25 @@ export function renderRail(root: HTMLElement): void {
   );
 
   replaceChildren(root, header, list, newBtn);
+}
+
+/**
+ * Move the `.active` highlight to the current session's rail row IN-PLACE — no
+ * rebuild. Mirrors applyFocusInPlace (center.ts): query the live rows by
+ * data-session and toggle `.active` so only state.activeSession's row carries it.
+ * Because the row node is NOT replaced (active was dropped from railFingerprint),
+ * selecting a session never tears out the row — hover survives and a click can't
+ * be lost to a mid-rebuild node swap. Called from render/index.ts after every
+ * render so it lands even when renderRail early-returns on an unchanged
+ * fingerprint. Idempotent.
+ */
+export function applyActiveSessionInPlace(): void {
+  const active = getState().activeSession;
+  document
+    .querySelectorAll<HTMLElement>(".rail-row[data-session]")
+    .forEach((row) => {
+      row.classList.toggle("active", row.dataset["session"] === active);
+    });
 }
 
 function heatDot(state: PaneState): HTMLElement {
