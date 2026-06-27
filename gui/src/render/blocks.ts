@@ -6,7 +6,7 @@
 
 import { blockDurationMs, fmtDuration, h, replaceChildren } from "./dom";
 import { icon } from "./icons";
-import { getState, setState } from "../state";
+import { getState, setState, type AppState } from "../state";
 import { runBlockSearch, toggleBlockExpanded, toggleFailuresOnly, rerunBlock } from "../actions";
 import { blockStdout } from "../api";
 import type { Block } from "../types";
@@ -22,13 +22,90 @@ function blockFailed(b: Block): boolean {
   return b.exit_code != null && b.exit_code !== 0;
 }
 
+// Persistent panel shell refs. The search <input> is created ONCE and reused
+// across renders — poll ticks AND keystrokes — so the browser keeps its caret,
+// focus and value. renderBlocks rebuilds ONLY the header contents and the block
+// list in place, never the input. This prevents the reversed-characters bug:
+// typing fires runBlockSearch → setState → renderAll → renderBlocks, and the
+// old code rebuilt the whole panel (a fresh <input>) on every keystroke, which
+// destroyed the live input node and reset the caret to index 0. Refs are
+// dropped when the panel collapses so a re-expand builds a fresh input.
+let shellRoot: HTMLElement | null = null;
+let searchInputEl: HTMLInputElement | null = null;
+let headerEl: HTMLElement | null = null;
+let listEl: HTMLElement | null = null;
+
 export function renderBlocks(root: HTMLElement): void {
   const s = getState();
   root.classList.toggle("collapsed", s.rightCollapsed);
   if (s.rightCollapsed) {
     replaceChildren(root);
+    // Drop refs so the next expand rebuilds a fresh input.
+    shellRoot = null;
+    searchInputEl = null;
+    headerEl = null;
+    listEl = null;
     return;
   }
+
+  // Build the shell (header host + persistent search input + list host) only
+  // when it doesn't yet exist for this root. Keystrokes never reach here — they
+  // re-render the header + list only — so the live <input> survives intact.
+  if (searchInputEl === null || shellRoot !== root) buildShell(root, s);
+
+  renderHeader(s);
+
+  // Keep the input's value in sync with state WITHOUT clobbering the caret: only
+  // write when the field isn't focused (e.g. an external reset of blockQuery),
+  // never mid-keystroke (the user's own value is already in the field).
+  const input = searchInputEl;
+  if (input && document.activeElement !== input && input.value !== s.blockQuery) {
+    input.value = s.blockQuery;
+  }
+
+  renderList(s);
+}
+
+/** Build the panel shell with the persistent search input. Created once per open. */
+function buildShell(root: HTMLElement, s: Readonly<AppState>): void {
+  const header = h("div", { class: "panel-header" });
+
+  const input = h("input", {
+    class: "block-search-input",
+    type: "text",
+    placeholder: "Search blocks…",
+    value: s.blockQuery,
+    spellcheck: false,
+    oninput: (e: Event) => {
+      void runBlockSearch((e.target as HTMLInputElement).value);
+    },
+  }) as HTMLInputElement;
+
+  const search = h(
+    "div",
+    { class: "block-search" },
+    h(
+      "div",
+      { class: "block-search-wrap" },
+      h("span", { class: "block-search-icon", html: icon("search") }),
+      input,
+    ),
+  );
+
+  const list = h("div", { class: "block-list" });
+
+  replaceChildren(root, header, search, list);
+
+  shellRoot = root;
+  searchInputEl = input;
+  headerEl = header;
+  listEl = list;
+}
+
+/** Render the panel header (section label + failures toggle) into its host. */
+function renderHeader(s: Readonly<AppState>): void {
+  const host = headerEl;
+  if (!host) return;
 
   const failBtn = h(
     "button",
@@ -44,16 +121,13 @@ export function renderBlocks(root: HTMLElement): void {
     h("span", { class: "block-filter-label" }, "Failures"),
   );
 
-  const header = h(
-    "div",
-    { class: "panel-header" },
-    h("span", { class: "section-label" }, "Blocks"),
-    failBtn,
-  );
+  replaceChildren(host, h("span", { class: "section-label" }, "Blocks"), failBtn);
+}
 
-  const search = h("div", { class: "block-search" }, searchInput(s.blockQuery));
-
-  const listEl = h("div", { class: "block-list" });
+/** Render the filtered block cards into the persistent list container only. */
+function renderList(s: Readonly<AppState>): void {
+  const list = listEl;
+  if (!list) return;
 
   // Source: search results when searching, else live blocks. Apply the
   // failures-only filter client-side on top (works for both sources).
@@ -66,36 +140,17 @@ export function renderBlocks(root: HTMLElement): void {
       : s.searchResults
         ? "No matching blocks."
         : "No blocks yet — run a command to see it here.";
-    listEl.appendChild(h("div", { class: "block-empty" }, msg));
-  } else {
-    const total = items.length;
-    items.forEach((b, i) => {
-      // Recency cooling: newest = full color, older = progressively desaturated.
-      const cool = total > 1 ? (i / (total - 1)) * 0.4 : 0;
-      listEl.appendChild(blockCard(b, cool, s.expandedBlocks.has(b.id)));
-    });
+    replaceChildren(list, h("div", { class: "block-empty" }, msg));
+    return;
   }
 
-  replaceChildren(root, header, search, listEl);
-}
-
-function searchInput(value: string): HTMLElement {
-  const input = h("input", {
-    class: "block-search-input",
-    type: "text",
-    placeholder: "Search blocks…",
-    value,
-    spellcheck: false,
-    oninput: (e: Event) => {
-      void runBlockSearch((e.target as HTMLInputElement).value);
-    },
+  const total = items.length;
+  const cards = items.map((b, i) => {
+    // Recency cooling: newest = full color, older = progressively desaturated.
+    const cool = total > 1 ? (i / (total - 1)) * 0.4 : 0;
+    return blockCard(b, cool, s.expandedBlocks.has(b.id));
   });
-  return h(
-    "div",
-    { class: "block-search-wrap" },
-    h("span", { class: "block-search-icon", html: icon("search") }),
-    input,
-  );
+  replaceChildren(list, ...cards);
 }
 
 function blockCard(b: Block, cool: number, expanded: boolean): HTMLElement {

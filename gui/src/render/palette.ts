@@ -13,6 +13,17 @@ let submenu: Command | null = null;
 /** True while the layer is playing its exit animation (guards re-entry). */
 let closing = false;
 
+// Persistent shell refs. The <input> is created ONCE per open and reused across
+// keystrokes, so the browser preserves its caret/focus/value naturally. Typing
+// re-renders ONLY the results list — never the input — which is what fixes the
+// reversed-characters bug (a full rebuild used to destroy the live input node and
+// reset the caret to index 0, prepending every new char). Refs are dropped on
+// close so the next open builds a fresh, focused input.
+let shellRoot: HTMLElement | null = null;
+let inputEl: HTMLElement | null = null;
+let listEl: HTMLElement | null = null;
+let shellSubmenu: Command | null = null;
+
 /** Reset transient palette UI state when it opens. */
 export function resetPalette(): void {
   selectedIndex = 0;
@@ -31,6 +42,11 @@ export function renderPalette(root: HTMLElement): void {
   const s = getState();
   if (!s.paletteOpen) {
     closePaletteOverlay(root);
+    // Drop shell refs so the next open rebuilds a fresh, focused input.
+    shellRoot = null;
+    inputEl = null;
+    listEl = null;
+    shellSubmenu = null;
     return;
   }
 
@@ -40,9 +56,19 @@ export function renderPalette(root: HTMLElement): void {
   root.style.removeProperty("display");
   root.classList.add("is-open");
 
-  const cmds = activeCommands();
-  if (selectedIndex >= cmds.length) selectedIndex = Math.max(0, cmds.length - 1);
+  // Rebuild the shell (backdrop + modal + persistent input) only when it does not
+  // yet exist for this root, or the submenu context changed (placeholder + back
+  // button differ and the filter is reset). Keystrokes never reach here — the
+  // oninput handler re-renders the list only — so the live <input> survives intact.
+  const needsShell =
+    inputEl === null || shellRoot !== root || shellSubmenu !== submenu;
+  if (needsShell) buildShell(root);
 
+  renderList(root);
+}
+
+/** Build the palette container with the persistent input. Focuses the input once. */
+function buildShell(root: HTMLElement): void {
   const input = h("input", {
     class: "palette-input",
     type: "text",
@@ -52,37 +78,13 @@ export function renderPalette(root: HTMLElement): void {
     oninput: (e: Event) => {
       filter = (e.target as HTMLInputElement).value;
       selectedIndex = 0;
-      renderPalette(root);
+      // Re-render ONLY the results list — never the input — so the caret, focus
+      // and value the browser is tracking survive the keystroke.
+      renderList(root);
     },
   });
 
   const list = h("div", { class: "palette-list", role: "listbox" });
-  cmds.forEach((c, i) => {
-    const row = h(
-      "div",
-      {
-        class: "palette-row" + (i === selectedIndex ? " selected" : ""),
-        role: "option",
-        onmouseenter: () => {
-          selectedIndex = i;
-          markSelected(list, i);
-        },
-        onclick: () => runCommand(c, root),
-      },
-      h("span", { class: "palette-title" }, c.title),
-      c.children &&
-        h("span", {
-          class: "palette-submenu-hint",
-          html: icon("chevronRight"),
-        }),
-      c.hint && !c.children && h("span", { class: "palette-hint" }, c.hint),
-    );
-    list.appendChild(row);
-  });
-
-  if (cmds.length === 0) {
-    list.appendChild(h("div", { class: "palette-empty" }, "No matching commands."));
-  }
 
   const modal = h(
     "div",
@@ -117,7 +119,51 @@ export function renderPalette(root: HTMLElement): void {
   );
 
   replaceChildren(root, backdrop);
+
+  shellRoot = root;
+  inputEl = input;
+  listEl = list;
+  shellSubmenu = submenu;
+
+  // Focus the input ONCE on open. Subsequent keystrokes keep focus naturally.
   requestAnimationFrame(() => input.focus());
+}
+
+/** Render the filtered command rows into the persistent list container only. */
+function renderList(root: HTMLElement): void {
+  const list = listEl;
+  if (!list) return;
+
+  const cmds = activeCommands();
+  if (selectedIndex >= cmds.length) selectedIndex = Math.max(0, cmds.length - 1);
+
+  const rows: Node[] = cmds.map((c, i) =>
+    h(
+      "div",
+      {
+        class: "palette-row" + (i === selectedIndex ? " selected" : ""),
+        role: "option",
+        onmouseenter: () => {
+          selectedIndex = i;
+          markSelected(list, i);
+        },
+        onclick: () => runCommand(c, root),
+      },
+      h("span", { class: "palette-title" }, c.title),
+      c.children &&
+        h("span", {
+          class: "palette-submenu-hint",
+          html: icon("chevronRight"),
+        }),
+      c.hint && !c.children && h("span", { class: "palette-hint" }, c.hint),
+    ),
+  );
+
+  if (cmds.length === 0) {
+    rows.push(h("div", { class: "palette-empty" }, "No matching commands."));
+  }
+
+  list.replaceChildren(...rows);
 }
 
 /** Keyboard handler wired globally while the palette is open. */
