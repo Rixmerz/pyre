@@ -11,11 +11,16 @@
 // fires blur on the hidden textarea and silently kills keyboard input.
 //
 // To avoid this, renderCenter tracks a "layout fingerprint" — a canonical string
-// of the leaf pane IDs in tree order, the zoomed pane, and the focused pane.
-// When only heat/state changes (paneStates updated, layout fingerprint unchanged)
-// the function returns early and lets the in-place heat updates in session-ops.ts
-// handle the visual change. Full replaceChildren only runs when the layout
-// structure truly changes (pane added/removed/split/weight or focus/zoom changed).
+// of the leaf pane IDs in tree order and the zoomed pane. When only heat/state OR
+// focus changes (paneStates updated or focusedPane moved, layout fingerprint
+// unchanged) the function returns early: heat is repainted in-place in
+// session-ops.ts and the `.focused` glow is moved in-place via applyFocusInPlace
+// (called from render/index.ts). Full replaceChildren only runs when the layout
+// structure truly changes (pane added/removed/split/weight or zoom changed).
+//
+// Focus is deliberately NOT in the fingerprint: when it was, every click / Ctrl+
+// HJKL focus move re-mounted every xterm and re-flashed every card, and the
+// `.focused` transition never played (it was applied to a newborn node).
 
 import { h, replaceChildren } from "./dom";
 import { icon } from "./icons";
@@ -50,15 +55,16 @@ function firstLeaf(node: LayoutNode): string {
 
 /**
  * Canonical string of the rendered structure: EVERY window's layout tree + the
- * active window + zoom/focus. Changes to ANY of these force a structural
- * re-render; a heat-only tick (same structure) skips it so xterms survive.
+ * active window + zoom. Changes to ANY of these force a structural re-render; a
+ * heat- OR focus-only tick (same structure) skips it so xterms survive and the
+ * `.focused` glow transition can play (focus is applied in-place — see
+ * applyFocusInPlace + render/index.ts). Focus is intentionally excluded.
  */
 function windowsFingerprint(
   windows: WindowInfo[],
   activeWindowId: string | null,
   layouts: Map<string, LayoutNode>,
   zoomedPane: string | null,
-  focusedPane: string | null,
   connected: boolean,
 ): string {
   if (!connected) return "__disconnected__";
@@ -68,10 +74,7 @@ function windowsFingerprint(
     return `${w.id}=${layout ? fingerprintNode(layout) : "0"}`;
   });
   const zoom = zoomedPane ? `:zoom:${zoomedPane}` : "";
-  return (
-    `wins:[${parts.join("|")}]:active:${activeWindowId ?? ""}` +
-    `:focus:${focusedPane ?? ""}${zoom}`
-  );
+  return `wins:[${parts.join("|")}]:active:${activeWindowId ?? ""}${zoom}`;
 }
 
 function fingerprintNode(node: LayoutNode): string {
@@ -94,14 +97,14 @@ export function renderCenter(root: HTMLElement): void {
     activeWin,
     s.layouts,
     s.zoomedPane,
-    s.focusedPane,
     s.connected,
   );
 
   if (fp === lastFingerprint) {
-    // Window set, every tree, active window, focus, and zoom are all unchanged.
-    // Heat/state updates are applied in-place by session-ops.ts — skip the full
-    // tear-down to prevent xterm re-parenting and focus-blur.
+    // Window set, every tree, active window, and zoom are all unchanged. Heat/
+    // state updates are applied in-place by session-ops.ts and the focus glow by
+    // applyFocusInPlace (render/index.ts) — skip the full tear-down to prevent
+    // xterm re-parenting and focus-blur.
     dlog("[pyre-render] skip structural re-render — fingerprint unchanged");
     return;
   }
@@ -152,6 +155,26 @@ export function renderCenter(root: HTMLElement): void {
   }
 
   replaceChildren(root, ...views);
+}
+
+/**
+ * Move the `.focused` glow to the active pane IN-PLACE — no structural rebuild.
+ * Mirrors applyHeatInPlace (session-ops.ts): query the live pane-card DOM keyed
+ * by data-pane and toggle `.focused` so only state.focusedPane's card carries it.
+ * Because the card node is NOT replaced (focus was dropped from the structural
+ * fingerprint), the CSS box-shadow/border transition on `.pane-card.focused`
+ * actually plays. Called from render/index.ts after renderCenter on EVERY render
+ * so it lands even when renderCenter early-returns on an unchanged fingerprint.
+ * Idempotent: re-running with the same focus is a no-op (classList.toggle with an
+ * explicit boolean).
+ */
+export function applyFocusInPlace(): void {
+  const focused = getState().focusedPane;
+  document
+    .querySelectorAll<HTMLElement>(".pane-card[data-pane]")
+    .forEach((card) => {
+      card.classList.toggle("focused", card.dataset["pane"] === focused);
+    });
 }
 
 /** Wrap a tab's content in a view container that's only shown when active. */
@@ -250,6 +273,19 @@ function divider(
 
     document.body.classList.add(horizontal ? "resizing-col" : "resizing-row");
 
+    // Coalesce terminal refits to ONE per animation frame while dragging so the
+    // xterm grid reflows smoothly with the divider instead of stretching/clipping
+    // and snapping only on mouseup. xterm's fit emits a resize_pane only when the
+    // char grid actually changes, so sub-cell pixel moves don't spam the daemon.
+    let pendingRefit = 0;
+    const scheduleRefit = (): void => {
+      if (pendingRefit !== 0) return; // a refit is already queued for next frame
+      pendingRefit = requestAnimationFrame(() => {
+        pendingRefit = 0;
+        refitAll();
+      });
+    };
+
     const onMove = (me: MouseEvent): void => {
       const delta = (horizontal ? me.clientX : me.clientY) - startPos;
       let newLeft = leftSize + delta;
@@ -259,11 +295,16 @@ function divider(
       lastRightW = weightSum - lastLeftW;
       leftWrap.style.flex = `${lastLeftW} 1 0%`;
       rightWrap.style.flex = `${lastRightW} 1 0%`;
+      scheduleRefit();
     };
 
     const onUp = (): void => {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
+      if (pendingRefit !== 0) {
+        cancelAnimationFrame(pendingRefit);
+        pendingRefit = 0;
+      }
       document.body.classList.remove("resizing-col", "resizing-row");
       // Commit the final weights to the daemon. Mutate the cached node so the
       // next structural render keeps the new sizes, and refit terminals to the

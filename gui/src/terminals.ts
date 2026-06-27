@@ -212,11 +212,19 @@ export function mountPaneTerminal(
   entry = { term, fit, search, el, session };
   terms.set(pane, entry);
 
+  // DEV-ONLY: under `pnpm dev:mock` there is no real PTY, so paint a banner +
+  // fake prompt so the pane isn't blank. Strictly gated behind VITE_MOCK — this
+  // whole branch constant-folds away in production builds.
+  if (import.meta.env.VITE_MOCK) writeMockBanner(term, pane);
+
   // Webview → daemon: forward keystrokes as UTF-8 bytes, tagged with this pane.
   term.onData((d) => {
     const bytes = Array.from(new TextEncoder().encode(d));
     dlog("[pyre-input] onData", pane, d.length); // (c) onData stage
     dlog("[pyre-input] send_keys ->", pane, bytes.length); // (d) sendKeys invocation
+    // DEV-ONLY: local echo so typing is visible (the mock send_keys is a no-op
+    // with no output stream to echo back). Gated behind VITE_MOCK.
+    if (import.meta.env.VITE_MOCK) term.write(d === "\r" ? "\r\n$ " : d);
     void sendKeys(pane, bytes)
       .then(() => {
         dlog("[pyre-input] send_keys ok", pane); // (e-ok)
@@ -248,6 +256,21 @@ export function mountPaneTerminal(
 
   queueFit(entry);
   return entry;
+}
+
+/**
+ * DEV-ONLY: paint a mock banner + fake prompt into a freshly mounted terminal so
+ * panes look alive under `pnpm dev:mock` (no real PTY). Never called in
+ * production — its only caller is guarded by `import.meta.env.VITE_MOCK`, which
+ * constant-folds the call (and this function) out of the production bundle.
+ */
+function writeMockBanner(term: Terminal, pane: string): void {
+  term.writeln("\x1b[38;5;208mpyre\x1b[0m \x1b[2m·\x1b[0m mock \x1b[2m·\x1b[0m pane \x1b[36m" + pane + "\x1b[0m");
+  term.writeln("\x1b[2mno real daemon — VITE_MOCK in-memory harness\x1b[0m");
+  term.writeln("");
+  term.writeln("\x1b[32m$\x1b[0m ls");
+  term.writeln("Cargo.toml  README.md  \x1b[34msrc\x1b[0m  \x1b[34mtarget\x1b[0m");
+  term.write("\x1b[32m$\x1b[0m ");
 }
 
 /** Write daemon output bytes into a pane's terminal, if it exists. */

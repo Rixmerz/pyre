@@ -345,17 +345,61 @@ function doFocus(pane: string): void {
 
 // ── Cheatsheet overlay ────────────────────────────────────────────────────
 
+/** Fallback when `animationend` never fires (matches --dur-fast). */
+const CHEAT_FALLBACK_MS = 120;
+
 function openCheatsheet(): void {
   if (cheatsheetOpen) return;
   cheatsheetOpen = true;
   cheatEl = buildCheatsheet();
   document.body.appendChild(cheatEl);
+  // CSS plays the enter animation off `.is-open` (keyframe runs from first paint
+  // on the freshly-inserted node).
+  cheatEl.classList.add("is-open");
 }
 
+/** Close the cheatsheet: play the exit animation (add `.is-closing`, keep
+ *  `.is-open`), then remove the node on animationend / fallback. Reduced motion
+ *  removes immediately. */
 function closeCheatsheet(): void {
   cheatsheetOpen = false;
-  cheatEl?.remove();
+  const el = cheatEl;
   cheatEl = null;
+  if (!el) return;
+
+  if (prefersReducedMotion()) {
+    el.remove();
+    return;
+  }
+
+  el.classList.add("is-closing");
+  onceAnimationEnd(el, () => el.remove(), CHEAT_FALLBACK_MS);
+}
+
+/** True when the user asked the OS to reduce motion. */
+function prefersReducedMotion(): boolean {
+  return (
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(prefers-reduced-motion: reduce)").matches
+  );
+}
+
+/** Run `cb` once on the next `animationend`, or after `fallbackMs` — whichever
+ *  comes first. Tolerant of jsdom (no animations) via the fallback timer. */
+function onceAnimationEnd(
+  el: HTMLElement,
+  cb: () => void,
+  fallbackMs: number,
+): void {
+  let done = false;
+  const run = (): void => {
+    if (done) return;
+    done = true;
+    el.removeEventListener("animationend", run);
+    cb();
+  };
+  el.addEventListener("animationend", run, { once: true });
+  window.setTimeout(run, fallbackMs);
 }
 
 /** Build the themed cheatsheet overlay DOM. */

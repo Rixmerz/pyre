@@ -4,7 +4,7 @@
 import { getState, subscribe } from "../state";
 import { renderTopbar } from "./topbar";
 import { renderRail } from "./rail";
-import { renderCenter } from "./center";
+import { renderCenter, applyFocusInPlace } from "./center";
 import { renderTabs } from "./tabs";
 import { renderBlocks } from "./blocks";
 import { renderStatusbar } from "./statusbar";
@@ -81,6 +81,11 @@ export function renderAll(): void {
     renderTabs(regions.tabs);
     renderCenter(regions.paneArea);
   }
+  // Apply the focus glow IN-PLACE on every render, even when renderCenter early-
+  // returns (focusedPane was dropped from its structural fingerprint, so a focus-
+  // only change no longer rebuilds the pane area). This is what moves `.focused`
+  // between cards and lets the CSS transition play. Idempotent.
+  applyFocusInPlace();
   renderBlocks(regions.right);
   renderStatusbar(regions.statusbar);
 

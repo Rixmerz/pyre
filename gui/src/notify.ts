@@ -12,7 +12,7 @@
 //     A Waiting pane still notifies even if focused, because "needs input" is
 //     actionable regardless of visibility.
 
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./invoke";
 import { getState } from "./state";
 import type { PaneState } from "./types";
 

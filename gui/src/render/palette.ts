@@ -10,6 +10,8 @@ import { buildCommands, closePalette, type Command } from "../actions";
 let selectedIndex = 0;
 let filter = "";
 let submenu: Command | null = null;
+/** True while the layer is playing its exit animation (guards re-entry). */
+let closing = false;
 
 /** Reset transient palette UI state when it opens. */
 export function resetPalette(): void {
@@ -28,11 +30,15 @@ function activeCommands(): Command[] {
 export function renderPalette(root: HTMLElement): void {
   const s = getState();
   if (!s.paletteOpen) {
-    replaceChildren(root);
-    root.classList.remove("open");
+    closePaletteOverlay(root);
     return;
   }
-  root.classList.add("open");
+
+  // Opening / staying open: cancel any in-flight exit and reveal the layer.
+  closing = false;
+  root.classList.remove("is-closing");
+  root.style.removeProperty("display");
+  root.classList.add("is-open");
 
   const cmds = activeCommands();
   if (selectedIndex >= cmds.length) selectedIndex = Math.max(0, cmds.length - 1);
@@ -169,4 +175,71 @@ function fuzzy(hay: string, needle: string): boolean {
     if (i === needle.length) return true;
   }
   return needle.length === 0;
+}
+
+// ── Overlay open/close animation (shared class contract) ─────────────────────
+// CSS adds the enter animation off `.is-open`; on close we add `.is-closing`
+// (keeping `.is-open` so it stays visible) and wait for the exit animation to end
+// before clearing the layer. Reduced motion hides immediately.
+
+/** Fallback when `animationend` never fires (matches --dur-fast). */
+const OVERLAY_FALLBACK_MS = 120;
+
+/** Play the exit animation, then clear + hide the palette layer. */
+function closePaletteOverlay(root: HTMLElement): void {
+  if (!root.classList.contains("is-open")) {
+    closing = false; // already hidden — nothing to animate
+    return;
+  }
+  if (closing) return; // exit already in flight
+
+  if (prefersReducedMotion()) {
+    hidePaletteNow(root);
+    return;
+  }
+
+  closing = true;
+  root.classList.add("is-closing");
+  onceAnimationEnd(root, () => {
+    // Re-opened mid-close — the open path already restored the layer; abort.
+    if (getState().paletteOpen) {
+      closing = false;
+      return;
+    }
+    hidePaletteNow(root);
+    closing = false;
+  }, OVERLAY_FALLBACK_MS);
+}
+
+/** Clear the layer's contents and fully hide it (end-of-exit state). */
+function hidePaletteNow(root: HTMLElement): void {
+  replaceChildren(root);
+  root.style.display = "none";
+  root.classList.remove("is-open", "is-closing");
+}
+
+/** True when the user asked the OS to reduce motion. */
+function prefersReducedMotion(): boolean {
+  return (
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(prefers-reduced-motion: reduce)").matches
+  );
+}
+
+/** Run `cb` once on the next `animationend`, or after `fallbackMs` — whichever
+ *  comes first. Tolerant of jsdom (no animations) via the fallback timer. */
+function onceAnimationEnd(
+  el: HTMLElement,
+  cb: () => void,
+  fallbackMs: number,
+): void {
+  let done = false;
+  const run = (): void => {
+    if (done) return;
+    done = true;
+    el.removeEventListener("animationend", run);
+    cb();
+  };
+  el.addEventListener("animationend", run, { once: true });
+  window.setTimeout(run, fallbackMs);
 }

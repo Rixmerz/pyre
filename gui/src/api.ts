@@ -3,8 +3,10 @@
 // app never touches `invoke` strings directly. A parallel agent implements the
 // Rust side; we code against these names (see the task brief's command list).
 
-import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+// Transport seam: `./invoke` re-exports the real Tauri `invoke`/`listen` in
+// production and swaps in the in-memory mock daemon under VITE_MOCK (pnpm
+// dev:mock). The rest of the app keeps importing the wrappers below unchanged.
+import { invoke, listen, type UnlistenFn } from "./invoke";
 import type {
   Block,
   DaemonStatus,

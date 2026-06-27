@@ -16,7 +16,7 @@ import "@fontsource/jetbrains-mono/600.css";
 import "@fontsource/jetbrains-mono/700.css";
 import "./styles.css";
 
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./invoke";
 import { daemonStatus, pollEvents, reconnect, onPaneClosed, onPtyClosedLegacy, onPtyOutput } from "./api";
 import { getState, setState } from "./state";
 import { mountShell } from "./render/index";

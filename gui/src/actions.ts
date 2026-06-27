@@ -38,6 +38,7 @@ import {
   focusFirstLeaf,
 } from "./session-ops";
 import { dlog } from "./debug";
+import { toast } from "./toast";
 
 // ── Session actions ─────────────────────────────────────────────────────────
 
@@ -54,6 +55,7 @@ export async function newSession(): Promise<void> {
     dlog("[pyre-session] new-session: rendered session=", s.session);
   } catch (err) {
     console.error("spawn_session failed:", err);
+    toast("Couldn't create the session — the daemon rejected it.", "error");
   }
 }
 
@@ -99,6 +101,7 @@ export async function renameSessionAction(
     }
   } catch (err) {
     dlog("[pyre-rename] rpc FAILED session=", session, err);
+    toast("Rename failed.", "error");
   }
 }
 
@@ -124,6 +127,7 @@ export async function closeSessionAction(session: string): Promise<void> {
     dlog("[pyre-session] close_session command ok:", session);
   } catch (err) {
     console.error("[pyre-session] close_session command FAILED:", session, err);
+    toast("Couldn't close the session.", "error");
     return;
   }
 
@@ -206,6 +210,7 @@ async function doSplit(pane: string, orient: "h" | "v"): Promise<void> {
     refitAll();
   } catch (err) {
     console.error("[pyre-split] open_split failed:", err);
+    toast("Couldn't split the pane.", "error");
   }
 }
 
@@ -244,6 +249,7 @@ export async function closePaneAction(pane: string | null): Promise<void> {
     await closePane(target);
   } catch (err) {
     console.error("close_pane failed:", err);
+    toast("Couldn't close the pane.", "error");
   }
   disposePaneTerminal(target);
   if (getState().zoomedPane === target) setState({ zoomedPane: null });
@@ -306,6 +312,7 @@ export async function renamePaneAction(
     }
   } catch (err) {
     dlog("[pyre-rename] rpc FAILED pane=", pane, err);
+    toast("Rename failed.", "error");
   }
 }
 
@@ -352,9 +359,9 @@ export async function newPaneAction(): Promise<void> {
     await reloadSession(session);
     switchWindow(windowId);
   } catch (err) {
-    // new_window / open_pane not implemented yet (parallel bridge agent) —
-    // degrade gracefully.
-    dlog("[pyre-window] new-window: unavailable, no-op:", err);
+    // new_window / open_pane rejected (or the bridge predates the Window level).
+    dlog("[pyre-window] new-window: failed:", err);
+    toast("Couldn't open a new window.", "error");
   }
 }
 
@@ -380,6 +387,7 @@ export async function renameWindowAction(
     }
   } catch (err) {
     dlog("[pyre-rename] window rpc FAILED window=", windowId, err);
+    toast("Rename failed.", "error");
   }
 }
 
@@ -397,6 +405,7 @@ export async function closeWindowAction(windowId: string): Promise<void> {
     await closeWindow(windowId);
   } catch (err) {
     console.error("close_window failed:", windowId, err);
+    toast("Couldn't close the window.", "error");
   }
   for (const pane of leaves) {
     detachPaneStream(pane).catch(() => {
