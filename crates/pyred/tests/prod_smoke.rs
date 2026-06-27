@@ -324,6 +324,159 @@ async fn run_close_pane_eviction() -> anyhow::Result<()> {
     Ok(())
 }
 
+// ── close_session regression: windows cleared + idempotent on evicted session ─
+
+/// After `close_session`, `list_sessions` AND `list_windows` must both be empty.
+/// Regression for the window-model migration where close_session did not remove
+/// window rows from SQLite or from the in-memory window_store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires built pyred binary; run with --ignored"]
+async fn close_session_clears_windows() {
+    let result =
+        tokio::time::timeout(Duration::from_secs(30), run_close_session_clears_windows()).await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => panic!("close_session_clears_windows failed: {e:#}"),
+        Err(_) => panic!("close_session_clears_windows timed out after 30s"),
+    }
+}
+
+async fn run_close_session_clears_windows() -> anyhow::Result<()> {
+    let tmpdir = tempfile::TempDir::new()?;
+    let (child, _sock, rpc) = spawn_daemon(&tmpdir).await?;
+
+    let SpawnResp { session, .. } = rpc
+        .spawn(
+            tarpc::context::current(),
+            SpawnReq {
+                shell: Some("/bin/sh".into()),
+                cwd: None,
+                cols: 80,
+                rows: 24,
+                env: vec![],
+                name: None,
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("tarpc: {e}"))?
+        .map_err(|e| anyhow::anyhow!("spawn: {e:?}"))?;
+
+    // Confirm 1 window exists before close.
+    let windows_before = rpc
+        .list_windows(tarpc::context::current(), session)
+        .await
+        .map_err(|e| anyhow::anyhow!("tarpc: {e}"))?
+        .map_err(|e| anyhow::anyhow!("list_windows before: {e:?}"))?;
+    assert_eq!(
+        windows_before.len(),
+        1,
+        "expected 1 window before close_session, got: {windows_before:?}"
+    );
+
+    // Close the session.
+    rpc.close_session(tarpc::context::current(), session)
+        .await
+        .map_err(|e| anyhow::anyhow!("tarpc: {e}"))?
+        .map_err(|e| anyhow::anyhow!("close_session: {e:?}"))?;
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Session must be gone.
+    let sessions = rpc
+        .list_sessions(tarpc::context::current())
+        .await
+        .map_err(|e| anyhow::anyhow!("tarpc: {e}"))?
+        .map_err(|e| anyhow::anyhow!("list_sessions: {e:?}"))?;
+    assert!(
+        sessions.is_empty(),
+        "expected empty session list after close_session, got: {sessions:?}"
+    );
+
+    // Windows must be gone too.
+    let windows_after = rpc
+        .list_windows(tarpc::context::current(), session)
+        .await
+        .map_err(|e| anyhow::anyhow!("tarpc: {e}"))?
+        .map_err(|e| anyhow::anyhow!("list_windows after: {e:?}"))?;
+    assert!(
+        windows_after.is_empty(),
+        "BUG: windows still present after close_session; got: {windows_after:?}"
+    );
+
+    drop(rpc);
+    shutdown_daemon(child);
+    Ok(())
+}
+
+/// `close_session` on a session whose pane already exited (triggering
+/// `evict_session_if_empty`) must return `Ok(())`, not `NoSuchSession`.
+/// Regression for the single-mode path where kill_session failed with an error
+/// when the session was already gone, causing the GUI to show a toast and
+/// skip the UI reload.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires built pyred binary; run with --ignored"]
+async fn close_session_idempotent_after_pane_exit() {
+    let result = tokio::time::timeout(
+        Duration::from_secs(30),
+        run_close_session_idempotent(),
+    )
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => panic!("close_session_idempotent_after_pane_exit failed: {e:#}"),
+        Err(_) => panic!("close_session_idempotent_after_pane_exit timed out after 30s"),
+    }
+}
+
+async fn run_close_session_idempotent() -> anyhow::Result<()> {
+    let tmpdir = tempfile::TempDir::new()?;
+    let (child, _sock, rpc) = spawn_daemon(&tmpdir).await?;
+
+    let SpawnResp { session, pane, .. } = rpc
+        .spawn(
+            tarpc::context::current(),
+            SpawnReq {
+                shell: Some("/bin/sh".into()),
+                cwd: None,
+                cols: 80,
+                rows: 24,
+                env: vec![],
+                name: None,
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("tarpc: {e}"))?
+        .map_err(|e| anyhow::anyhow!("spawn: {e:?}"))?;
+
+    // Close the pane first — triggers evict_session_if_empty in single mode,
+    // removing the session from the in-memory registry before close_session arrives.
+    rpc.close_pane(tarpc::context::current(), pane)
+        .await
+        .map_err(|e| anyhow::anyhow!("tarpc: {e}"))?
+        .map_err(|e| anyhow::anyhow!("close_pane: {e:?}"))?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Session already evicted — close_session must return Ok (idempotent), not error.
+    rpc.close_session(tarpc::context::current(), session)
+        .await
+        .map_err(|e| anyhow::anyhow!("tarpc: {e}"))?
+        .map_err(|e| anyhow::anyhow!("close_session on evicted session returned error: {e:?}"))?;
+
+    let sessions = rpc
+        .list_sessions(tarpc::context::current())
+        .await
+        .map_err(|e| anyhow::anyhow!("tarpc: {e}"))?
+        .map_err(|e| anyhow::anyhow!("list_sessions: {e:?}"))?;
+    assert!(
+        sessions.is_empty(),
+        "expected empty session list; got: {sessions:?}"
+    );
+
+    drop(rpc);
+    shutdown_daemon(child);
+    Ok(())
+}
+
 // ── M7 regression: close_pane with layout persistence doesn't deadlock ────────
 //
 // Regression for: 7a8e7b8 extended close_pane with layout persistence (Store

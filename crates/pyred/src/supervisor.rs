@@ -1078,14 +1078,55 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
         session: SessionId,
     ) -> Result<(), PyreError> {
         let id = session.0.to_string();
-        if let Some(handle) = self.registry.remove(&id).await {
-            let res = handle
-                .ctrl_client
-                .shutdown(context::current(), 5)
-                .await
-                .map_err(|e| PyreError::Io(e.to_string()))?;
-            res.map_err(|e| PyreError::Io(e.to_string()))?;
+
+        // Snapshot window IDs before removing the session from the registry.
+        let window_ids: Vec<WindowId> = {
+            let sw = self.session_windows.lock().await;
+            sw.get(&id).cloned().unwrap_or_default()
+        };
+
+        // Remove the session from the worker registry (no-op if already gone).
+        let handle_opt = self.registry.remove(&id).await;
+
+        // Best-effort worker shutdown — if the worker is already dead the
+        // transport call fails, which is fine: we still clean local state below.
+        if let Some(handle) = handle_opt {
+            if let Err(e) = handle.ctrl_client.shutdown(context::current(), 5).await {
+                tracing::warn!("close_session {id}: worker shutdown transport error: {e}");
+            }
         }
+
+        // Tear down in-memory window + pane state for every window of this session.
+        for window in &window_ids {
+            // Remove pane → window mappings for all panes in this window.
+            let pane_ids = self
+                .store
+                .list_panes_for_window(*window)
+                .await
+                .unwrap_or_default();
+            {
+                let mut pwm = self.pane_window_map.lock().await;
+                for pane in &pane_ids {
+                    pwm.remove(pane);
+                }
+            }
+            // Remove window from in-memory store.
+            {
+                let mut ws = self.window_store.lock().await;
+                ws.remove(window);
+            }
+            // Delete from SQLite (best-effort).
+            if let Err(e) = self.store.delete_window(*window).await {
+                tracing::warn!("close_session: delete_window {window}: {e:#}");
+            }
+        }
+
+        // Remove session → windows mapping.
+        {
+            let mut sw = self.session_windows.lock().await;
+            sw.remove(&id);
+        }
+
         Ok(())
     }
 

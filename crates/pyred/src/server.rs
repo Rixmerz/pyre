@@ -265,10 +265,35 @@ impl pyre_proto::service::PyreDaemon for DaemonImpl {
         _ctx: context::Context,
         session: SessionId,
     ) -> Result<(), PyreError> {
-        self.registry
-            .kill_session(session)
-            .await
-            .map_err(|_| PyreError::NoSuchSession(session))
+        // Collect window IDs before kill_session removes the session from memory.
+        // Fall back to the store if the session is already evicted.
+        let window_ids: Vec<pyre_proto::WindowId> =
+            if let Some(state) = self.registry.get_session(session).await {
+                state.windows.lock().await.iter().map(|w| w.id).collect()
+            } else {
+                self.store
+                    .list_windows(session)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(id, _, _)| id)
+                    .collect()
+            };
+
+        // Remove from in-memory registry; treat "already gone" as success (idempotent).
+        if let Err(e) = self.registry.kill_session(session).await {
+            tracing::info!(
+                "close_session {session}: {e:#} (already evicted — continuing cleanup)"
+            );
+        }
+
+        // Delete persisted window rows (best-effort).
+        for wid in window_ids {
+            if let Err(e) = self.store.delete_window(wid).await {
+                tracing::warn!("close_session: delete_window {wid}: {e:#}");
+            }
+        }
+        Ok(())
     }
 
     async fn set_pane_state(
