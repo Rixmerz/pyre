@@ -73,15 +73,50 @@ function buildRows(): AgentRow[] {
   return rows;
 }
 
+/**
+ * Canonical string of everything the overlay rows RENDER from — per row:
+ * sessionId, pane id, state, the displayed title, the agent chip label, and the
+ * resolved session name (rows render `session?.name ?? sessionId`, so a rename
+ * must move the string). Row count and waiting-count shown in the header are both
+ * derived from this set, so they need no separate term. Mirrors railFingerprint:
+ * a no-op poll tick keeps the same string and skips the replaceChildren tear-down
+ * (which re-runs the overlay-fade/overlay-rise entrance keyframes -> flicker); a
+ * genuine change (new/closed pane, state shift, rename) changes the string and
+ * forces exactly one rebuild. Separator `\x01` can't collide with rendered text.
+ */
+function agentsFingerprint(rows: readonly AgentRow[]): string {
+  return rows
+    .map((r) => {
+      const sessName = r.session?.name ?? r.sessionId;
+      return `${r.sessionId}\x01${r.pane}\x01${r.state}\x01${r.title}\x01${r.agent}\x01${sessName}`;
+    })
+    .join("\x02");
+}
+
+/** Last fingerprint that triggered a full overlay rebuild. */
+let lastAgentsFingerprint = "";
+
 export function renderAgents(root: HTMLElement): void {
   const s = getState();
   root.classList.toggle("open", s.agentsOpen);
   if (!s.agentsOpen) {
     replaceChildren(root);
+    // Reset so a fresh open rebuilds and plays the entrance animation once.
+    lastAgentsFingerprint = "";
     return;
   }
 
   const rows = buildRows();
+  const fp = agentsFingerprint(rows);
+  if (fp === lastAgentsFingerprint && root.childElementCount > 0) {
+    // Agent set, states, titles and names are unchanged. Skip the rebuild so the
+    // overlay-fade/overlay-rise entrance keyframes don't re-run every poll tick
+    // (the flicker). childElementCount > 0 forces a build if the overlay is open
+    // but empty (first open against a stale fingerprint).
+    return;
+  }
+  lastAgentsFingerprint = fp;
+
   const waitingCount = rows.filter((r) => needsInput(r.state)).length;
 
   const backdrop = h("div", {
