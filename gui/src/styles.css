@@ -1931,6 +1931,21 @@ body.resizing-row * {
 .toast--success {
   border-left-color: var(--ok);
 }
+/* coalesce: ×N repeat badge shown when an identical toast recurs instead of
+   stacking a duplicate card. Muted pill at the trailing edge; numbers only. */
+.toast__count {
+  flex: none;
+  align-self: center;
+  margin-inline-start: auto;
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--fg-muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.5;
+}
 .toast--out {
   animation: toast-out var(--dur-fast) var(--ease-standard) forwards;
 }
