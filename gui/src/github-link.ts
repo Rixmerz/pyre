@@ -171,11 +171,11 @@ async function pollOnce(): Promise<void> {
     res = await githubDevicePoll();
   } catch (err) {
     const msg = String(err);
-    if (msg.includes("KEYRING_FAILED") || msg.includes("no device flow")) {
+    if (msg.includes("TOKEN_STORE_FAILED") || msg.includes("no device flow")) {
       // Terminal: GitHub authorized but we couldn't store the token locally, or the flow was lost.
       finishWithError(
-        msg.includes("KEYRING_FAILED")
-          ? "Couldn't save the GitHub token to your system keychain. Is a Secret Service (e.g. gnome-keyring) running and unlocked?"
+        msg.includes("TOKEN_STORE_FAILED")
+          ? "Couldn't save the GitHub token to ~/.config/pyre. Check the folder's permissions."
           : "GitHub link failed. Please try connecting again.",
       );
       return;

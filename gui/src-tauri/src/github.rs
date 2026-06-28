@@ -1,13 +1,15 @@
 //! GitHub OAuth Device Flow — Tauri command module.
 //!
 //! Architecture:
-//!   - All GitHub tokens go ONLY into the OS keychain (keyring crate).
-//!     They never touch state.db, logs, stdout, or any plaintext file.
+//!   - All GitHub tokens are stored in a 0600 plaintext file at
+//!     ~/.config/pyre/github-token (XDG_CONFIG_HOME respected).
+//!     They never touch state.db, logs, stdout, or the OS keychain.
 //!   - client_id is a compile-time default, overridable via PYRE_GITHUB_CLIENT_ID env.
 //!     Device flow requires no client_secret — none is shipped.
 //!   - In-flight device_code is held in GithubState (Tauri managed, per-app-instance Mutex).
-//!   - Pure parser functions are factored out so tests never touch the network or keychain.
+//!   - Pure parser functions are factored out so tests never touch the network or the file.
 
+use std::path::PathBuf;
 use serde::Serialize;
 use tauri::State;
 use tokio::sync::Mutex;
@@ -18,11 +20,84 @@ use tokio::sync::Mutex;
 
 const DEFAULT_CLIENT_ID: &str = "Ov23li1g0XoYJex02nIG";
 const GITHUB_SCOPE: &str = "read:user";
-const KEYRING_SERVICE: &str = "pyre";
-const KEYRING_ACCOUNT: &str = "github-token";
 
 fn client_id() -> String {
     std::env::var("PYRE_GITHUB_CLIENT_ID").unwrap_or_else(|_| DEFAULT_CLIENT_ID.to_string())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Token file helpers — the ONLY place the token is read from / written to disk
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Returns the absolute path to the token file.
+///
+/// Respects `XDG_CONFIG_HOME`; falls back to `$HOME/.config/pyre/github-token`.
+fn token_path() -> PathBuf {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let mut h = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+            h.push(".config");
+            h
+        });
+    base.join("pyre").join("github-token")
+}
+
+/// Write `token` to the token file with 0600 permissions (atomically on unix).
+///
+/// The parent directory is created with 0700 permissions if absent.
+/// On unix the file open uses `OpenOptionsExt::mode(0o600)` so the file is
+/// NEVER briefly world- or group-readable — no write-then-chmod race.
+/// On non-unix a plain create/truncate is used (Linux-first per project rules).
+fn store_token(token: &str) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let path = token_path();
+    let parent = path.parent().expect("token path always has a parent dir");
+    std::fs::create_dir_all(parent)?;
+
+    // Best-effort: restrict parent dir to owner-only access.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(
+            parent,
+            std::fs::Permissions::from_mode(0o700),
+        );
+    }
+
+    // Build OpenOptions; on unix add mode 0600 before open() so the inode is
+    // created with the correct permissions — never a world-readable moment.
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+
+    let mut file = opts.open(&path)?;
+    file.write_all(token.as_bytes())?;
+    Ok(())
+}
+
+/// Read the stored token, trimming trailing whitespace.
+///
+/// Returns `None` when the file is absent or empty.
+fn load_token() -> Option<String> {
+    let content = std::fs::read_to_string(token_path()).ok()?;
+    let trimmed = content.trim().to_string();
+    if trimmed.is_empty() { None } else { Some(trimmed) }
+}
+
+/// Delete the token file. Idempotent — ignores `NotFound`.
+fn clear_token() {
+    match std::fs::remove_file(token_path()) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {}
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -70,12 +145,12 @@ pub struct GithubState {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Internal poll result (carries the token so the command can write keychain)
+// Internal poll result (carries the token so the command can write it to disk)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Internal parse result for `github_device_poll`. Carries the raw token
 /// in the `Authorized` variant so the command (not the pure parser) writes
-/// it to the keychain. Tests inspect this type without touching the keychain.
+/// it to the token file. Tests inspect this type without touching the file.
 #[derive(Debug)]
 pub(crate) enum PollResult {
     Pending,
@@ -86,7 +161,7 @@ pub(crate) enum PollResult {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Pure parser functions — NO network, NO keychain, safe to unit-test
+// Pure parser functions — NO network, NO file I/O, safe to unit-test
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Parse GitHub's `POST /login/device/code` JSON response.
@@ -241,8 +316,8 @@ pub async fn github_device_start(
 /// Poll the GitHub Device Flow for authorization status.
 ///
 /// Reads the in-flight `device_code` from managed state. On success, writes
-/// the token to the OS keychain and clears the in-flight code. Returns a
-/// `PollState` discriminant — the token NEVER surfaces to the GUI.
+/// the token to ~/.config/pyre/github-token (0600) and clears the in-flight
+/// code. Returns a `PollState` discriminant — the token NEVER surfaces to the GUI.
 ///
 /// The GUI should call this on the `interval` returned by `github_device_start`.
 #[tauri::command]
@@ -283,12 +358,11 @@ pub async fn github_device_poll(
         PollResult::Authorized(token) => {
             // GitHub granted the token — always evict the device_code so we never re-poll a spent code.
             *state.device_code.lock().await = None;
-            // Token goes ONLY into the OS keychain — never logged, never plaintext.
-            // Tag keychain failures with KEYRING_FAILED: so the GUI treats them as terminal.
-            keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
-                .map_err(|e| format!("KEYRING_FAILED: couldn't open the OS keychain: {e}"))?
-                .set_password(&token)
-                .map_err(|e| format!("KEYRING_FAILED: couldn't save the token to the OS keychain: {e}"))?;
+            // Token goes ONLY into ~/.config/pyre/github-token (0600) — never logged, never serialized.
+            // Tag store failures with TOKEN_STORE_FAILED: so the GUI treats them as terminal.
+            store_token(&token).map_err(|e| {
+                format!("TOKEN_STORE_FAILED: couldn't write ~/.config/pyre/github-token: {e}")
+            })?;
             Ok(PollState::Authorized)
         }
         PollResult::Pending => Ok(PollState::Pending),
@@ -299,20 +373,14 @@ pub async fn github_device_poll(
 
 /// Fetch the linked GitHub account identity from the API.
 ///
-/// Returns `None` when no token is stored or when the stored token is stale
-/// (401 from the API → token deleted from keychain automatically).
+/// Returns `None` when no token file exists or when the stored token is stale
+/// (401 from the API → token file deleted automatically).
 /// Returns `Some(Account)` on success.
 #[tauri::command]
 pub async fn github_account() -> Result<Option<Account>, String> {
-    // Retrieve token from keychain (released before the await below).
-    let token = {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
-            .map_err(|e| format!("keyring init failed: {e}"))?;
-        match entry.get_password() {
-            Ok(t) => t,
-            Err(keyring::Error::NoEntry) => return Ok(None),
-            Err(e) => return Err(format!("keyring get failed: {e}")),
-        }
+    let token = match load_token() {
+        Some(t) => t,
+        None => return Ok(None),
     };
 
     let client = http_client()?;
@@ -327,17 +395,13 @@ pub async fn github_account() -> Result<Option<Account>, String> {
     let status = resp.status();
 
     if status == reqwest::StatusCode::UNAUTHORIZED {
-        // Stale or revoked token — purge it from the keychain.
-        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT) {
-            let _ = entry.delete_credential();
-        }
+        // Stale or revoked token — purge it from the file.
+        clear_token();
         return Ok(None);
     }
 
     if !status.is_success() {
-        return Err(format!(
-            "user request failed with HTTP {status}"
-        ));
+        return Err(format!("user request failed with HTTP {status}"));
     }
 
     let body = resp
@@ -348,7 +412,7 @@ pub async fn github_account() -> Result<Option<Account>, String> {
     Ok(Some(parse_account(&body)?))
 }
 
-/// Remove the stored GitHub token from the OS keychain.
+/// Remove the stored GitHub token file.
 ///
 /// Idempotent — treats "token not found" as success. Does NOT revoke the
 /// grant on GitHub; the GUI should link to
@@ -356,17 +420,12 @@ pub async fn github_account() -> Result<Option<Account>, String> {
 /// revocation.
 #[tauri::command]
 pub async fn github_disconnect() -> Result<(), String> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
-        .map_err(|e| format!("keyring init failed: {e}"))?;
-    match entry.delete_credential() {
-        Ok(()) => Ok(()),
-        Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(format!("keyring delete failed: {e}")),
-    }
+    clear_token();
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Unit tests — pure parser coverage, no network, no keychain
+// Unit tests — pure parser coverage + token file round-trip; no network
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -490,5 +549,56 @@ mod tests {
     fn parse_account_missing_login_errors() {
         let json = r#"{"name":"x","avatar_url":"y","html_url":"z"}"#;
         assert!(parse_account(json).is_err());
+    }
+
+    // ── token file round-trip + 0600 mode ────────────────────────────────────
+
+    #[test]
+    fn token_roundtrip_and_mode_0600() {
+        // Redirect the token path to a temp directory so the test is isolated
+        // from the real ~/.config/pyre. XDG_CONFIG_HOME is set here; the other
+        // tests in this module do not read home paths, so the conflict risk is low.
+        let tmp = std::env::temp_dir()
+            .join(format!("pyre-test-github-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        // SAFETY: test-only env mutation; the other tests in this file don't
+        // call token_path() so the race window is isolated to this test.
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+
+        let secret = "gho_roundtrip_test_ABCDEF123456";
+
+        // Write the token.
+        store_token(secret).expect("store_token should succeed");
+
+        // Read it back — must round-trip exactly.
+        let loaded = load_token().expect("load_token must return Some after store_token");
+        assert_eq!(loaded, secret, "round-trip mismatch: stored != loaded");
+
+        // On unix: assert the file was created with mode 0600.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::metadata(token_path())
+                .expect("token file must exist after store_token");
+            assert_eq!(
+                meta.permissions().mode() & 0o777,
+                0o600,
+                "token file must be mode 0600 (owner read/write only)"
+            );
+        }
+
+        // Clear — the file must disappear.
+        clear_token();
+        assert!(
+            load_token().is_none(),
+            "load_token must return None after clear_token"
+        );
+
+        // clear_token must be idempotent (NotFound must not panic).
+        clear_token();
+
+        // Restore env and clean up.
+        std::env::remove_var("XDG_CONFIG_HOME");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
