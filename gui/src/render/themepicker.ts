@@ -2,17 +2,43 @@
 // list_themes. Selecting calls selectTheme → get_theme → writes CSS vars.
 
 import { h, replaceChildren } from "./dom";
-import { getState } from "../state";
+import { getState, type AppState } from "../state";
 import { closeThemePicker } from "../actions";
 import { selectTheme } from "../themes";
 
 /** True while the layer is playing its exit animation (guards re-entry). */
 let closing = false;
 
+/**
+ * Canonical string of everything the swatch grid RENDERS — the active theme id
+ * (drives which swatch gets `.active`) plus, per theme in order, the five fields
+ * the swatch paints from: name (id + onclick key), display_name (title + label),
+ * kind (title), bg and accent (inline swatch colors). Mirrors railFingerprint /
+ * agentsFingerprint: a no-op poll tick keeps the same string and skips the
+ * replaceChildren tear-down (which re-runs the overlay-fade/overlay-rise entrance
+ * keyframes -> flicker); a genuine change (theme list edit, or applying a theme
+ * which moves activeTheme) changes the string and forces exactly one rebuild.
+ * Separators `\x01` (field) / `\x02` (row) can't collide with rendered text.
+ */
+function themePickerFingerprint(s: AppState): string {
+  const list = s.themes
+    .map(
+      (t) =>
+        `${t.name}\x01${t.display_name}\x01${t.kind}\x01${t.bg}\x01${t.accent}`,
+    )
+    .join("\x02");
+  return `${s.activeTheme}\x02${list}`;
+}
+
+/** Last fingerprint that triggered a full theme-picker rebuild. */
+let lastThemePickerFp = "";
+
 export function renderThemePicker(root: HTMLElement): void {
   const s = getState();
   if (!s.themePickerOpen) {
     closeThemeOverlay(root);
+    // Reset so a fresh reopen rebuilds and plays the entrance animation once.
+    lastThemePickerFp = "";
     return;
   }
 
@@ -21,6 +47,16 @@ export function renderThemePicker(root: HTMLElement): void {
   root.classList.remove("is-closing");
   root.style.removeProperty("display");
   root.classList.add("is-open");
+
+  const fp = themePickerFingerprint(s);
+  if (fp === lastThemePickerFp && root.childElementCount > 0) {
+    // Theme list and active selection unchanged. Skip the rebuild so the
+    // overlay-fade/overlay-rise entrance keyframes don't re-run every poll tick
+    // (the flicker). childElementCount > 0 forces a build on first open even if
+    // the fingerprint coincidentally matches a stale value.
+    return;
+  }
+  lastThemePickerFp = fp;
 
   const grid = h("div", { class: "theme-grid" });
   for (const t of s.themes) {
