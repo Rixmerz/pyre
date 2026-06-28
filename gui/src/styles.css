@@ -1250,7 +1250,32 @@ button {
 .gh-actions {
   display: flex;
   justify-content: flex-end;
+  gap: 8px;
   margin-top: 16px;
+}
+
+/* Dev-only DEMO affordances (mock build only — absent from real builds). */
+.gh-demo-badge {
+  margin-left: auto;
+  align-self: center;
+  padding: 2px 7px;
+  border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--warn) 12%, transparent);
+  color: var(--warn);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+.gh-demo-simulate {
+  color: var(--warn);
+  border-color: color-mix(in srgb, var(--warn) 40%, transparent);
+  background: color-mix(in srgb, var(--warn) 12%, transparent);
+}
+.gh-demo-simulate:hover {
+  border-color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 18%, transparent);
 }
 
 /* ── GitHub linking: topbar chip ───────────────────────────────────────── */

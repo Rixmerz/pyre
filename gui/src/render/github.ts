@@ -35,6 +35,28 @@ import { toast } from "../toast";
 /** Fallback when `animationend` never fires (matches --dur-fast). */
 const OVERLAY_FALLBACK_MS = 120;
 
+/** Build-time mock flag. Gates the dev-only DEMO badge + "Simulate" button. In
+ *  real builds Vite replaces `import.meta.env.VITE_MOCK` with `undefined`, so
+ *  `IS_MOCK` folds to `false`, the affordances vanish, and the modal renders
+ *  exactly as it does today. Because it's a build-time constant (not poll state)
+ *  it lives in the STATIC modal body and never re-renders per countdown tick. */
+const IS_MOCK = Boolean(import.meta.env.VITE_MOCK);
+
+/**
+ * Dev-only: explicitly authorize the in-memory GitHub flow from the modal's
+ * "Simulate authorization" button. The mock helper is DYNAMICALLY imported so
+ * the real production bundle never pulls in `mock-invoke` — the `import.meta.env`
+ * guard is statically false in real builds, making the `import()` below
+ * unreachable and tree-shaken away. After it flips the mock flag, the existing
+ * github-link poll loop's next tick sees `authorized`, loads @mockuser, and the
+ * modal closes via the normal success path — no special-casing in the real flow.
+ */
+async function simulateMockAuthorize(): Promise<void> {
+  if (!import.meta.env.VITE_MOCK) return;
+  const { mockAuthorizeGitHub } = await import("../mock-invoke");
+  mockAuthorizeGitHub();
+}
+
 // ── Device-code modal (Pattern B + in-place countdown) ───────────────────────
 
 /** True while the modal is playing its exit animation (guards re-entry). */
@@ -100,6 +122,16 @@ function buildModal(root: HTMLElement, code: string, uri: string): void {
       { class: "gh-modal-head" },
       h("span", { class: "gh-mark", html: icon("github") }),
       h("span", { class: "gh-modal-title" }, "Connect GitHub"),
+      // Dev-only honesty badge — absent from real builds (IS_MOCK folds false).
+      IS_MOCK &&
+        h(
+          "span",
+          {
+            class: "gh-demo-badge",
+            title: "This is the in-memory mock — not a real GitHub login.",
+          },
+          "DEMO (mock) — not real GitHub",
+        ),
     ),
     h(
       "p",
@@ -135,6 +167,18 @@ function buildModal(root: HTMLElement, code: string, uri: string): void {
         { class: "gh-btn", onclick: () => cancelGitHubLink() },
         "Cancel",
       ),
+      // Dev-only: explicitly complete the mock flow. Absent from real builds —
+      // IS_MOCK folds false, so neither the button nor its dynamic import ship.
+      IS_MOCK &&
+        h(
+          "button",
+          {
+            class: "gh-btn gh-btn-primary gh-demo-simulate",
+            title: "Mock only: simulate the user authorizing on GitHub.",
+            onclick: () => void simulateMockAuthorize(),
+          },
+          "Simulate authorization →",
+        ),
     ),
   );
 

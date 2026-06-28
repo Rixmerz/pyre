@@ -80,9 +80,12 @@ interface MockState {
   seq: number;
   /** Monotonic fake-pid counter. */
   pidSeq: number;
-  /** GitHub link state: the connected account (null until a mock authorization)
-   *  and a per-attempt poll counter (reset on each device_start). */
-  github: { account: GhAccount | null; pollCount: number };
+  /** GitHub link state. `authorized` is false until the demo's explicit
+   *  "Simulate authorization" button calls `mockAuthorizeGitHub()` — only then
+   *  does poll report `authorized` and `github_account` return the account.
+   *  Reset to false on each `github_device_start` (and on disconnect). The mock
+   *  NEVER auto-authorizes, so the device-code modal stays an honest demo. */
+  github: { authorized: boolean };
 }
 
 /** The account the mock device flow "authorizes" into after a couple of polls. */
@@ -314,7 +317,7 @@ function seed(): MockState {
     panes: new Map(),
     seq: 0,
     pidSeq: 1000,
-    github: { account: null, pollCount: 0 },
+    github: { authorized: false },
   };
 
   // Sessions ──────────────────────────────────────────────────────────────
@@ -798,14 +801,18 @@ function handle(s: MockState, cmd: string, a: Args): unknown {
 
     // ── GitHub account linking ──
     // The whole modal → connected → disconnect UX is iterable in the browser
-    // mock loop with no real GitHub: device_start hands back a fixed code +
-    // interval 1 (fast), poll returns pending twice then authorized (flipping the
-    // account on), account reflects the authorized state, disconnect clears it.
+    // mock loop with no real GitHub — but the mock is an HONEST demo: it NEVER
+    // auto-authorizes. device_start hands back a fixed code + interval 1 (fast)
+    // and resets to not-authorized; poll returns `pending` FOREVER until the
+    // demo's "Simulate authorization" button calls `mockAuthorizeGitHub()`; only
+    // then does poll report `authorized` and `github_account` return @mockuser.
+    // disconnect clears the flag. This keeps the device-code modal on screen so a
+    // tester can read it and can't mistake the mock for the real GitHub flow.
     case "github_account":
-      return s.github.account ? clone(s.github.account) : null;
+      return s.github.authorized ? clone(MOCK_GH_ACCOUNT) : null;
 
     case "github_device_start":
-      s.github.pollCount = 0; // reset the per-attempt counter
+      s.github.authorized = false; // honest demo: never pre-authorized
       return {
         user_code: "WDJB-MJHT",
         verification_uri: "https://github.com/login/device",
@@ -813,18 +820,14 @@ function handle(s: MockState, cmd: string, a: Args): unknown {
         interval: 1,
       } satisfies GhDeviceStart;
 
-    case "github_device_poll": {
-      s.github.pollCount += 1;
-      if (s.github.pollCount <= 2) {
-        return { status: "pending" } satisfies GhPoll;
-      }
-      // Authorized: flip the account on so a follow-up github_account returns it.
-      s.github.account = MOCK_GH_ACCOUNT;
-      return { status: "authorized" } satisfies GhPoll;
-    }
+    case "github_device_poll":
+      // Pending until the demo button explicitly authorizes — no auto-complete.
+      return s.github.authorized
+        ? ({ status: "authorized" } satisfies GhPoll)
+        : ({ status: "pending" } satisfies GhPoll);
 
     case "github_disconnect":
-      s.github.account = null;
+      s.github.authorized = false;
       return undefined;
 
     // ── Lifecycle long-poll ──
@@ -931,4 +934,18 @@ export function mockListen(): Promise<() => void> {
   return Promise.resolve(() => {
     /* nothing to unsubscribe */
   });
+}
+
+/**
+ * Mock-ONLY demo affordance: explicitly authorize the in-memory GitHub flow.
+ * The device-code modal's "Simulate authorization" button calls this (dynamically
+ * imported, so the real bundle never pulls in this module). After this, the next
+ * `github_device_poll` tick reports `authorized` and `github_account` returns the
+ * mock account, driving the normal success path (modal closes, chip shows
+ * @mockuser). Idempotent and side-effect-free beyond flipping the flag; safe to
+ * call more than once. Has no effect in production — the whole module is dev-only
+ * and tree-shaken when VITE_MOCK is unset.
+ */
+export function mockAuthorizeGitHub(): void {
+  model().github.authorized = true;
 }
