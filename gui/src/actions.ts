@@ -39,6 +39,7 @@ import {
 } from "./session-ops";
 import { dlog } from "./debug";
 import { toast } from "./toast";
+import { startGitHubLink, disconnectGitHub } from "./github-link";
 
 // ── Session actions ─────────────────────────────────────────────────────────
 
@@ -627,6 +628,20 @@ export function buildCommands(): Command[] {
       hint: "Ctrl+Shift+A",
       run: openAgents,
     },
+    // GitHub: Connect when disconnected, Disconnect when linked.
+    s.github.account
+      ? {
+          id: "github-disconnect",
+          title: "Disconnect GitHub",
+          hint: `@${s.github.account.login}`,
+          run: () => void disconnectGitHub(),
+        }
+      : {
+          id: "github-connect",
+          title: "Connect GitHub",
+          hint: "account",
+          run: () => void startGitHubLink(),
+        },
   ];
 
   // Switch session… submenu

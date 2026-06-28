@@ -14,6 +14,7 @@ import {
   toggleAgents,
 } from "../actions";
 import { fleetWaitingCount } from "./agents";
+import { startGitHubLink, toggleGhMenu } from "../github-link";
 import { toggleLightDark } from "../themes";
 
 export function renderTopbar(root: HTMLElement): void {
@@ -64,6 +65,42 @@ export function renderTopbar(root: HTMLElement): void {
     waiting > 0 && h("span", { class: "agents-btn-badge" }, String(waiting)),
   );
 
+  // GitHub chip: connected → avatar + @login (click opens the account menu
+  // popover, which lives in its own poll-survivable layer); disconnected → a
+  // "Connect GitHub" button that starts the device flow. The topbar rebuilds
+  // every poll, so the chip carries NO entrance keyframe (render-discipline LOW
+  // region) and the popover deliberately lives outside the topbar.
+  const gh = s.github;
+  const ghChip = gh.account
+    ? h(
+        "button",
+        {
+          class: "gh-chip gh-chip-connected",
+          title: `GitHub — @${gh.account.login}`,
+          "aria-label": `GitHub account @${gh.account.login}`,
+          onclick: () => toggleGhMenu(),
+        },
+        h("img", {
+          class: "gh-avatar",
+          src: gh.account.avatar_url,
+          alt: "",
+          width: 18,
+          height: 18,
+        }),
+        h("span", { class: "gh-chip-login" }, `@${gh.account.login}`),
+      )
+    : h(
+        "button",
+        {
+          class: "gh-chip",
+          title: "Connect a GitHub account",
+          "aria-label": "Connect GitHub",
+          onclick: () => void startGitHubLink(),
+        },
+        h("span", { class: "gh-chip-icon", html: icon("github") }),
+        h("span", { class: "gh-chip-login" }, "Connect GitHub"),
+      );
+
   const right = h(
     "div",
     { class: "topbar-right" },
@@ -83,6 +120,7 @@ export function renderTopbar(root: HTMLElement): void {
         "K",
       ),
     ),
+    ghChip,
     h(
       "button",
       {

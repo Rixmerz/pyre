@@ -214,3 +214,33 @@ export interface PollEventsResult {
   events: LifecycleEvent[];
   last_seq: number;
 }
+
+// ── GitHub account linking (OAuth App + Device Flow) ──────────────────────────
+// The device flow + keychain + GitHub REST calls live in the Tauri Rust layer
+// (gui/src-tauri/src/github.rs, owned by a parallel agent); the GUI codes against
+// these four shapes. pyre NEVER sees the user's password — the user authorizes in
+// their own browser and the Tauri layer stores only the access token in the OS
+// keychain. See `.claude/notions/feature-github-oauth.md`.
+
+/** The linked GitHub account from `github_account()` — `null` when disconnected. */
+export interface GhAccount {
+  login: string;
+  name: string | null;
+  avatar_url: string;
+  html_url: string;
+}
+
+/** Result of `github_device_start()` — the device/user code pair to authorize. */
+export interface GhDeviceStart {
+  /** The short code the user types at `verification_uri` (e.g. "WDJB-MJHT"). */
+  user_code: string;
+  /** Where the user enters the code (e.g. github.com/login/device). */
+  verification_uri: string;
+  /** Seconds until the device code expires (drives the modal countdown). */
+  expires_in: number;
+  /** Minimum seconds between `github_device_poll()` calls. */
+  interval: number;
+}
+
+/** Result of `github_device_poll()` — the authorization status of the link. */
+export type GhPoll = { status: "pending" | "authorized" | "denied" | "expired" };

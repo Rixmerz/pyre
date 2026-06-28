@@ -10,6 +10,9 @@ import { invoke, listen, type UnlistenFn } from "./invoke";
 import type {
   Block,
   DaemonStatus,
+  GhAccount,
+  GhDeviceStart,
+  GhPoll,
   LayoutNode,
   PaneClosedPayload,
   PaneStateInfo,
@@ -179,6 +182,28 @@ export const listThemes = (): Promise<ThemeMeta[]> => invoke("list_themes");
 
 export const getTheme = (name: string): Promise<ThemePalette> =>
   invoke("get_theme", { name });
+
+// ── GitHub account linking (OAuth App + Device Flow) ──────────────────────────
+// The Tauri Rust layer owns the device flow, the OS keychain, and the GitHub REST
+// calls (parallel agent); these wrappers are the GUI's only seam into it. All four
+// are wired DEFENSIVELY at the call site — a bridge that predates them rejects, and
+// the link flow surfaces a toast rather than crashing the UI.
+
+/** Begin the device flow: returns the user code + verification URI to authorize. */
+export const githubDeviceStart = (): Promise<GhDeviceStart> =>
+  invoke("github_device_start");
+
+/** Poll the pending authorization. Call on the `interval` from `githubDeviceStart`. */
+export const githubDevicePoll = (): Promise<GhPoll> =>
+  invoke("github_device_poll");
+
+/** The linked account (from the keychain token), or `null` when disconnected. */
+export const githubAccount = (): Promise<GhAccount | null> =>
+  invoke("github_account");
+
+/** Forget the LOCAL token (does NOT revoke the grant server-side — see the
+ *  "Manage on GitHub" link the account menu surfaces). */
+export const githubDisconnect = (): Promise<void> => invoke("github_disconnect");
 
 // ── Lifecycle events (long-poll) ─────────────────────────────────────────────
 /**

@@ -21,6 +21,9 @@
 import type {
   Block,
   DaemonStatus,
+  GhAccount,
+  GhDeviceStart,
+  GhPoll,
   GitInfo,
   LayoutNode,
   PaneState,
@@ -77,7 +80,18 @@ interface MockState {
   seq: number;
   /** Monotonic fake-pid counter. */
   pidSeq: number;
+  /** GitHub link state: the connected account (null until a mock authorization)
+   *  and a per-attempt poll counter (reset on each device_start). */
+  github: { account: GhAccount | null; pollCount: number };
 }
+
+/** The account the mock device flow "authorizes" into after a couple of polls. */
+const MOCK_GH_ACCOUNT: GhAccount = {
+  login: "mockuser",
+  name: "Mock User",
+  avatar_url: "https://avatars.githubusercontent.com/u/9919?s=80",
+  html_url: "https://github.com/mockuser",
+};
 
 /** Fixed seed timestamp (no Date.now at module top). */
 const SEED_TS = "2026-06-20T09:00:00.000Z";
@@ -300,6 +314,7 @@ function seed(): MockState {
     panes: new Map(),
     seq: 0,
     pidSeq: 1000,
+    github: { account: null, pollCount: 0 },
   };
 
   // Sessions ──────────────────────────────────────────────────────────────
@@ -780,6 +795,37 @@ function handle(s: MockState, cmd: string, a: Args): unknown {
       const name = reqStr(a, "name");
       return clone(THEME_PALETTES[name] ?? THEME_PALETTES.ember);
     }
+
+    // ── GitHub account linking ──
+    // The whole modal → connected → disconnect UX is iterable in the browser
+    // mock loop with no real GitHub: device_start hands back a fixed code +
+    // interval 1 (fast), poll returns pending twice then authorized (flipping the
+    // account on), account reflects the authorized state, disconnect clears it.
+    case "github_account":
+      return s.github.account ? clone(s.github.account) : null;
+
+    case "github_device_start":
+      s.github.pollCount = 0; // reset the per-attempt counter
+      return {
+        user_code: "WDJB-MJHT",
+        verification_uri: "https://github.com/login/device",
+        expires_in: 900,
+        interval: 1,
+      } satisfies GhDeviceStart;
+
+    case "github_device_poll": {
+      s.github.pollCount += 1;
+      if (s.github.pollCount <= 2) {
+        return { status: "pending" } satisfies GhPoll;
+      }
+      // Authorized: flip the account on so a follow-up github_account returns it.
+      s.github.account = MOCK_GH_ACCOUNT;
+      return { status: "authorized" } satisfies GhPoll;
+    }
+
+    case "github_disconnect":
+      s.github.account = null;
+      return undefined;
 
     // ── Lifecycle long-poll ──
     case "poll_events": {

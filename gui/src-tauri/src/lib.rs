@@ -1,5 +1,7 @@
 //! Tauri v2 backend — full pyred daemon bridge for the pyre GUI.
 //!
+//! GitHub OAuth commands live in `github.rs` and are registered below.
+//!
 //! Architecture:
 //!   - ONE shared tarpc control client held in Tauri managed state (AppState).
 //!     Connected on first use via `ensure_client()`, reused for all subsequent
@@ -11,6 +13,8 @@
 //!
 //! Connection pattern (0x01 control + 0x02 stream) is the same as
 //! crates/pyre-tui/src/app/pane_ops.rs and the original spike lib.rs.
+
+mod github;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1242,6 +1246,7 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             app.manage(AppState::default());
+            app.manage(github::GithubState::default());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1289,6 +1294,11 @@ pub fn run() {
             // splash + notifications
             close_splash,
             notify,
+            // github oauth device flow
+            github::github_device_start,
+            github::github_device_poll,
+            github::github_account,
+            github::github_disconnect,
         ])
         .run(tauri::generate_context!())
         .expect("error while running pyre-gui");

@@ -4,6 +4,8 @@
 
 import type {
   Block,
+  GhAccount,
+  GhDeviceStart,
   GitInfo,
   LayoutNode,
   PaneStateInfo,
@@ -11,6 +13,18 @@ import type {
   ThemeMeta,
   WindowInfo,
 } from "./types";
+
+/**
+ * GitHub account-linking slice. `account` is the linked identity (null when
+ * disconnected); `linking` holds the in-flight device-code response while a link
+ * attempt is open (drives the modal — non-null ⇒ modal visible); `status` is the
+ * coarse phase the chip + palette read. Mutated only via `setGithub`.
+ */
+export interface GithubState {
+  account: GhAccount | null;
+  linking: GhDeviceStart | null;
+  status: "idle" | "linking" | "authorized" | "error";
+}
 
 export interface AppState {
   // Connectivity
@@ -66,6 +80,13 @@ export interface AppState {
   themes: ThemeMeta[];
   activeTheme: string;
 
+  // GitHub account linking
+  github: GithubState;
+  /** The account menu popover (anchored to the topbar chip) is open. Kept as a
+   *  chrome flag alongside the other overlay flags so the menu can live in its
+   *  own poll-survivable layer instead of inside the poll-rebuilt topbar. */
+  ghMenuOpen: boolean;
+
   // UI chrome
   railCollapsed: boolean;
   rightCollapsed: boolean;
@@ -94,6 +115,8 @@ const state: AppState = {
   agentsOpen: false,
   themes: [],
   activeTheme: "ember",
+  github: { account: null, linking: null, status: "idle" },
+  ghMenuOpen: false,
   railCollapsed: false,
   rightCollapsed: false,
   paletteOpen: false,
@@ -122,6 +145,17 @@ export function notify(): void {
 /** Shallow-merge a patch into the store and notify subscribers. */
 export function setState(patch: Partial<AppState>): void {
   Object.assign(state, patch);
+  notify();
+}
+
+/**
+ * Merge a patch into the nested `github` slice and notify. A dedicated setter (vs
+ * `setState({ github: {...} })`) keeps callers from having to spread the previous
+ * sub-fields by hand — `setGithub({ status: "linking" })` leaves `account` and
+ * `linking` untouched. Follows the store's mutate-then-notify convention.
+ */
+export function setGithub(patch: Partial<GithubState>): void {
+  Object.assign(state.github, patch);
   notify();
 }
 

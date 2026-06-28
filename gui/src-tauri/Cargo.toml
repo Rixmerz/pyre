@@ -37,6 +37,10 @@ pyre-proto = { path = "../../crates/pyre-proto" }
 pyre-themes = { path = "../../crates/pyre-themes" }
 # UUID parsing for newtype IDs.
 uuid = { version = "1", features = ["v4"] }
+# GitHub OAuth Device Flow — keychain storage (Linux: Secret Service/libsecret)
+keyring = "3"
+# HTTP client for GitHub API calls (rustls-tls avoids OpenSSL dependency)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [features]
 # default tauri custom-protocol feature for production builds

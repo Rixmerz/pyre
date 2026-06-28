@@ -11,8 +11,10 @@ import { renderStatusbar } from "./statusbar";
 import { renderPalette, resetPalette, handlePaletteKey } from "./palette";
 import { renderThemePicker } from "./themepicker";
 import { renderAgents } from "./agents";
+import { renderGhModal, renderGhMenu } from "./github";
 import { isInlineEditing } from "./inline-edit";
 import { openPalette, closePalette, unzoom, closeAgents } from "../actions";
+import { cancelGitHubLink, closeGhMenu } from "../github-link";
 
 interface Regions {
   topbar: HTMLElement;
@@ -25,6 +27,8 @@ interface Regions {
   palette: HTMLElement;
   themepicker: HTMLElement;
   agents: HTMLElement;
+  ghModal: HTMLElement;
+  ghMenu: HTMLElement;
   shell: HTMLElement;
 }
 
@@ -52,13 +56,15 @@ export function mountShell(app: HTMLElement): void {
   const palette = el("div", "palette-layer");
   const themepicker = el("div", "themepicker-layer");
   const agents = el("div", "agents-layer");
+  const ghModal = el("div", "gh-modal-layer");
+  const ghMenu = el("div", "gh-menu-layer");
 
   const shell = el("div", "shell");
   shell.append(rail, center, right);
 
-  app.append(topbar, shell, statusbar, palette, themepicker, agents);
+  app.append(topbar, shell, statusbar, palette, themepicker, agents, ghModal, ghMenu);
 
-  regions = { topbar, rail, center, tabs, paneArea, right, statusbar, palette, themepicker, agents, shell };
+  regions = { topbar, rail, center, tabs, paneArea, right, statusbar, palette, themepicker, agents, ghModal, ghMenu, shell };
 
   wireGlobalKeys();
   subscribe(renderAll);
@@ -104,6 +110,11 @@ export function renderAll(): void {
   renderPalette(regions.palette);
   renderThemePicker(regions.themepicker);
   renderAgents(regions.agents);
+  // GitHub device-code modal + account-menu popover. The modal owns its own 1s
+  // countdown tick (see render/github.ts); both are render-discipline compliant
+  // so the ~750ms poll never rebuilds them.
+  renderGhModal(regions.ghModal);
+  renderGhMenu(regions.ghMenu);
 
   // Reflect chrome collapse on the shell grid.
   regions.shell.classList.toggle("rail-collapsed", s.railCollapsed);
@@ -125,7 +136,14 @@ function wireGlobalKeys(): void {
       return;
     }
     if (e.key === "Escape") {
-      if (s.agentsOpen) {
+      if (s.github.linking) {
+        // An open device-code modal: Esc cancels the link attempt.
+        e.preventDefault();
+        cancelGitHubLink();
+      } else if (s.ghMenuOpen) {
+        e.preventDefault();
+        closeGhMenu();
+      } else if (s.agentsOpen) {
         e.preventDefault();
         closeAgents();
       } else if (s.themePickerOpen) {

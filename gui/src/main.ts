@@ -33,6 +33,7 @@ import {
   focusFirstLeaf,
 } from "./session-ops";
 import { newSession } from "./actions";
+import { loadGitHubAccount } from "./github-link";
 import { startGitPolling } from "./git-poll";
 import {
   disposePaneTerminal,
@@ -180,6 +181,10 @@ async function boot(): Promise<void> {
   await wireEvents();
   installKeybinds();
   initNotifications();
+  // Load any previously-linked GitHub account so the chip shows it immediately.
+  // Owned by the Tauri layer (not pyred), so it runs regardless of daemon
+  // connectivity — fire-and-forget, never blocking boot.
+  void loadGitHubAccount();
 
   // Connectivity → initial load. Retry a few times before surfacing the dead
   // state: the daemon may still be binding its socket when the webview loads.

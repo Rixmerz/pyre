@@ -970,7 +970,9 @@ button {
 
 /* ── Command palette ──────────────────────────────────────────────────── */
 .palette-layer,
-.themepicker-layer {
+.themepicker-layer,
+.gh-modal-layer,
+.gh-menu-layer {
   display: none;
 }
 /* Shown while open (legacy `.open`) OR animating in/out (`.is-open` /
@@ -980,7 +982,10 @@ button {
 .palette-layer.is-closing,
 .themepicker-layer.open,
 .themepicker-layer.is-open,
-.themepicker-layer.is-closing {
+.themepicker-layer.is-closing,
+.gh-modal-layer.is-open,
+.gh-modal-layer.is-closing,
+.gh-menu-layer.open {
   display: block;
 }
 .palette-backdrop,
@@ -1109,6 +1114,260 @@ button {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* ── GitHub linking: device-code modal ─────────────────────────────────── */
+.gh-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding-top: 16vh;
+  z-index: 105;
+  backdrop-filter: blur(2px);
+}
+.gh-modal {
+  width: min(440px, 92vw);
+  background: var(--surface-1);
+  border: 1px solid var(--hairline);
+  border-radius: 10px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.55);
+  padding: 18px 18px 16px;
+}
+.gh-modal-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  color: var(--fg);
+}
+.gh-mark {
+  display: inline-flex;
+  color: var(--fg);
+}
+.gh-modal-title {
+  font-weight: 700;
+  font-size: 14px;
+  letter-spacing: 0.01em;
+}
+.gh-modal-sub {
+  margin: 10px 0 12px;
+  font-size: 12.5px;
+  color: var(--fg-muted);
+}
+/* The big copyable code — mono, generous tracking, ember on hover/focus. */
+.gh-code {
+  display: block;
+  width: 100%;
+  font-family: var(--font-mono);
+  font-size: 30px;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  text-align: center;
+  color: var(--fg);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 10px;
+  cursor: pointer;
+  transition: border-color var(--dur-fast) var(--ease-standard),
+    color var(--dur-fast) var(--ease-standard);
+}
+.gh-code:hover,
+.gh-code:focus-visible {
+  border-color: var(--ember);
+  color: var(--ember);
+  outline: none;
+}
+.gh-uri-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+}
+.gh-uri {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--fg-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.gh-btn {
+  flex: 0 0 auto;
+  min-height: 26px;
+  padding: 5px 12px;
+  font-size: 12px;
+  color: var(--fg);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease-standard),
+    border-color var(--dur-fast) var(--ease-standard),
+    color var(--dur-fast) var(--ease-standard);
+}
+.gh-btn:hover {
+  border-color: var(--hairline);
+  background: color-mix(in srgb, var(--surface-2), var(--fg) 6%);
+}
+.gh-btn-primary {
+  color: var(--ember);
+  border-color: color-mix(in srgb, var(--ember) 40%, transparent);
+  background: color-mix(in srgb, var(--ember) 14%, transparent);
+}
+.gh-btn-primary:hover {
+  border-color: var(--ember);
+  background: color-mix(in srgb, var(--ember) 20%, transparent);
+}
+.gh-waiting {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 14px;
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+.gh-spinner {
+  display: inline-flex;
+  color: var(--ember);
+}
+.gh-waiting-text {
+  flex: 1 1 auto;
+}
+.gh-countdown-wrap {
+  flex: 0 0 auto;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--fg-faint);
+}
+.gh-countdown {
+  color: var(--fg-muted);
+}
+.gh-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 16px;
+}
+
+/* ── GitHub linking: topbar chip ───────────────────────────────────────── */
+.gh-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 26px;
+  padding: 3px 9px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--fg-muted);
+  font-size: 12px;
+  cursor: pointer;
+  transition: border-color var(--dur-fast) var(--ease-standard),
+    color var(--dur-fast) var(--ease-standard),
+    background var(--dur-fast) var(--ease-standard);
+}
+.gh-chip:hover {
+  border-color: var(--hairline);
+  color: var(--fg);
+}
+.gh-chip-icon {
+  display: inline-flex;
+}
+.gh-chip-connected {
+  padding-left: 3px;
+}
+.gh-chip-login {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  max-width: 16ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.gh-avatar {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 1px solid var(--hairline);
+  flex: 0 0 auto;
+  object-fit: cover;
+}
+
+/* ── GitHub linking: account menu popover (Pattern A layer) ─────────────── */
+.gh-menu-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 104;
+}
+.gh-menu {
+  position: fixed;
+  top: 46px;
+  right: 12px;
+  width: min(240px, 90vw);
+  background: var(--surface-1);
+  border: 1px solid var(--hairline);
+  border-radius: 10px;
+  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.5);
+  padding: 6px;
+  animation: overlay-rise var(--dur-fast) var(--ease-standard);
+}
+.gh-menu-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 9px 10px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 4px;
+}
+.gh-menu-head .gh-avatar {
+  width: 28px;
+  height: 28px;
+}
+.gh-menu-id {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.gh-menu-login {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.gh-menu-name {
+  font-size: 11px;
+  color: var(--fg-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.gh-menu-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  min-height: 26px;
+  padding: 7px 9px;
+  font-size: 12.5px;
+  color: var(--fg);
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease-standard),
+    color var(--dur-fast) var(--ease-standard);
+}
+.gh-menu-item:hover {
+  background: var(--surface-2);
+}
+.gh-menu-danger {
+  color: var(--error);
+}
+.gh-menu-danger:hover {
+  background: color-mix(in srgb, var(--error) 16%, transparent);
 }
 
 /* ── Keyboard cheatsheet overlay (? / F1) ─────────────────────────────── */
@@ -1764,24 +2023,28 @@ body.resizing-row * {
 .is-open .palette-backdrop,
 .is-open .theme-backdrop,
 .is-open .cheatsheet-backdrop,
+.is-open .gh-backdrop,
 .cheatsheet-backdrop.is-open {
   animation: overlay-fade var(--dur-base) var(--ease-standard);
 }
 .is-open .palette-modal,
 .is-open .theme-modal,
 .is-open .cheatsheet-modal,
+.is-open .gh-modal,
 .cheatsheet-backdrop.is-open .cheatsheet-modal {
   animation: overlay-rise var(--dur-base) var(--ease-standard);
 }
 .is-closing .palette-backdrop,
 .is-closing .theme-backdrop,
 .is-closing .cheatsheet-backdrop,
+.is-closing .gh-backdrop,
 .cheatsheet-backdrop.is-closing {
   animation: overlay-fade var(--dur-fast) var(--ease-standard) reverse forwards;
 }
 .is-closing .palette-modal,
 .is-closing .theme-modal,
 .is-closing .cheatsheet-modal,
+.is-closing .gh-modal,
 .cheatsheet-backdrop.is-closing .cheatsheet-modal {
   animation: overlay-rise var(--dur-fast) var(--ease-standard) reverse forwards;
 }
@@ -1874,7 +2137,12 @@ body.resizing-row * {
   .cheatsheet-backdrop.is-closing,
   .is-closing .palette-modal,
   .is-closing .theme-modal,
-  .is-closing .cheatsheet-modal {
+  .is-closing .cheatsheet-modal,
+  .is-open .gh-backdrop,
+  .is-open .gh-modal,
+  .is-closing .gh-backdrop,
+  .is-closing .gh-modal,
+  .gh-menu {
     animation: none !important;
   }
   /* Toast keeps feedback but as opacity-only (no translate). */
