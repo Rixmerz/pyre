@@ -281,13 +281,14 @@ pub async fn github_device_poll(
 
     match parse_poll(&body)? {
         PollResult::Authorized(token) => {
-            // Token goes ONLY into the OS keychain — never logged, never plaintext.
-            keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
-                .map_err(|e| format!("keyring init failed: {e}"))?
-                .set_password(&token)
-                .map_err(|e| format!("keyring set failed: {e}"))?;
-            // Clear the in-flight device_code so subsequent polls fail cleanly.
+            // GitHub granted the token — always evict the device_code so we never re-poll a spent code.
             *state.device_code.lock().await = None;
+            // Token goes ONLY into the OS keychain — never logged, never plaintext.
+            // Tag keychain failures with KEYRING_FAILED: so the GUI treats them as terminal.
+            keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
+                .map_err(|e| format!("KEYRING_FAILED: couldn't open the OS keychain: {e}"))?
+                .set_password(&token)
+                .map_err(|e| format!("KEYRING_FAILED: couldn't save the token to the OS keychain: {e}"))?;
             Ok(PollState::Authorized)
         }
         PollResult::Pending => Ok(PollState::Pending),

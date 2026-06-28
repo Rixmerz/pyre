@@ -29,6 +29,10 @@ let pollTimer: number | null = null;
 let deadline: number | null = null;
 /** Guards `startGitHubLink` against a double-start while the start RPC is inflight. */
 let starting = false;
+/** Count of consecutive untagged poll errors; resets on any successful response. */
+let consecutivePollErrors = 0;
+/** Max consecutive untagged errors before treating the flow as terminally broken. */
+const POLL_ERROR_LIMIT = 5;
 
 /** Epoch-ms the current device code expires, or null when no link is open.
  *  render/github.ts reads this to paint the countdown in place. */
@@ -144,6 +148,7 @@ export function closeGhMenu(): void {
 
 function startPolling(intervalSec: number): void {
   stopPolling();
+  consecutivePollErrors = 0;
   pollTimer = window.setInterval(() => void pollOnce(), intervalSec * 1000);
 }
 
@@ -165,10 +170,27 @@ async function pollOnce(): Promise<void> {
   try {
     res = await githubDevicePoll();
   } catch (err) {
-    // Transient poll failure — keep trying until the deadline.
+    const msg = String(err);
+    if (msg.includes("KEYRING_FAILED") || msg.includes("no device flow")) {
+      // Terminal: GitHub authorized but we couldn't store the token locally, or the flow was lost.
+      finishWithError(
+        msg.includes("KEYRING_FAILED")
+          ? "Couldn't save the GitHub token to your system keychain. Is a Secret Service (e.g. gnome-keyring) running and unlocked?"
+          : "GitHub link failed. Please try connecting again.",
+      );
+      return;
+    }
+    // Untagged transient error — keep retrying until the deadline or the backstop fires.
+    consecutivePollErrors += 1;
+    if (consecutivePollErrors >= POLL_ERROR_LIMIT) {
+      finishWithError("GitHub link failed after repeated errors. Please try connecting again.");
+      return;
+    }
     console.warn("[pyre-github] device poll failed (will retry):", err);
     return;
   }
+  // A response arrived — reset the transient-error backstop.
+  consecutivePollErrors = 0;
   switch (res.status) {
     case "pending":
       return;
