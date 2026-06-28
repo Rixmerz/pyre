@@ -4,7 +4,7 @@
 
 :root {
   /* Surfaces */
-  --surface-0: #0b0c0e;
+  --surface-0: #0a0b0e;
   --surface-1: #131419;
   --surface-2: #1a1c22;
   --term-bg: #0a0b0e;
@@ -15,7 +15,7 @@
   --focus: #e8743b;
 
   /* Text */
-  --fg: #ecedee;
+  --fg: #eceef4;
   --fg-muted: #969ca6;
   --fg-faint: #5d626c;
 

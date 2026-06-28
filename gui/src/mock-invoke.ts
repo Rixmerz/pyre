@@ -502,25 +502,25 @@ const ANSI_LIGHT: string[] = [
 ];
 
 const THEME_META: ThemeMeta[] = [
-  { name: "ember", display_name: "Ember Dark", kind: "dark", accent: "#e8743b", bg: "#0a0b0e" },
+  { name: "ember", display_name: "Ember Black", kind: "dark", accent: "#e8743b", bg: "#0a0b0e" },
   { name: "paper", display_name: "Paper Light", kind: "light", accent: "#2563eb", bg: "#f7f7f5" },
 ];
 
 const THEME_PALETTES: Record<string, ThemePalette> = {
   ember: {
     name: "ember",
-    display_name: "Ember Dark",
+    display_name: "Ember Black",
     bg: "#0a0b0e",
-    bg_dim: "#07080a",
+    bg_dim: "#070809",
     fg: "#eceef4",
-    fg_dim: "#9aa0ab",
-    border: "#2c2f39",
+    fg_dim: "#969ca6",
+    border: "#23252d",
     border_focus: "#e8743b",
     cursor: "#e8743b",
     accent: "#e8743b",
-    ok: "#8fd99a",
-    warn: "#ffcf5a",
-    error: "#ff6b7a",
+    ok: "#3fb950",
+    warn: "#f5b042",
+    error: "#ff5630",
     ansi: ANSI_DARK,
   },
   paper: {
