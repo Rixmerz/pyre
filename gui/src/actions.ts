@@ -36,6 +36,7 @@ import {
   reloadWindows,
   reloadPaneStates,
   focusFirstLeaf,
+  reloadFocusedBlocks,
 } from "./session-ops";
 import { dlog } from "./debug";
 import { toast } from "./toast";
@@ -61,9 +62,14 @@ export async function newSession(): Promise<void> {
 }
 
 export async function switchSession(session: string): Promise<void> {
-  setState({ activeSession: session, zoomedPane: null });
+  // Clear stale blocks synchronously so the inspector never flashes the OLD
+  // session's blocks before the new pane's load.
+  setState({ activeSession: session, zoomedPane: null, blocks: [] });
   await reloadSession(session);
   focusFirstLeaf(session);
+  // Load the new pane's blocks at once (the same fn the ~750ms poll uses) so the
+  // sequence is stale → empty → new, with no empty gap lingering until the poll.
+  await reloadFocusedBlocks();
 }
 
 export async function promptRenameSession(session: string): Promise<void> {

@@ -6,7 +6,7 @@ import { icon } from "./icons";
 // wordmark and inherits no external request (offline-first). It carries its own
 // ember gradient, so it does NOT use currentColor like the stroke icons.
 import logoSvg from "../assets/logo.svg?raw";
-import { activeSessionInfo, getState } from "../state";
+import { activeSessionInfo, getState, type AppState } from "../state";
 import {
   openPalette,
   openThemePicker,
@@ -17,8 +17,53 @@ import { fleetWaitingCount } from "./agents";
 import { startGitHubLink, toggleGhMenu } from "../github-link";
 import { toggleLightDark } from "../themes";
 
+/**
+ * Canonical string of every DYNAMIC value the topbar RENDERS — so an idle poll
+ * tick keeps the same string and skips the replaceChildren rebuild (which would
+ * re-create the session switcher pill, the agents/palette/github/theme buttons
+ * mid-:hover → the flicker). A genuine change rebuilds it exactly once. Inputs,
+ * each grepped from the render below:
+ *   - active session id   (switcher onclick captures `active.id`; the rename
+ *     would target the WRONG session if a same-name/same-count swap skipped the
+ *     rebuild, so id is load-bearing, not decorative)
+ *   - active session name  (the `.session-name` span; "no session" when null)
+ *   - active session pane_count  (the `.chip` pane count; absent when null)
+ *   - github account login  ("disconnected" when no account → the chip flips
+ *     between connected avatar+@login and the "Connect GitHub" button)
+ *   - fleet "waiting" count  (the agents button's has-waiting class, title and
+ *     `.agents-btn-badge`)
+ * Nothing else in the topbar is dynamic: the wordmark, palette, theme-toggle and
+ * settings buttons are static, and the github account-menu popover lives in its
+ * own poll-survivable layer (not this DOM). Separator `\x01` can't collide with
+ * rendered text. Mirrors railFingerprint / agentsFingerprint.
+ */
+function topbarFingerprint(s: Readonly<AppState>): string {
+  const active = activeSessionInfo();
+  const ghLogin = s.github.account?.login ?? "disconnected";
+  const waiting = fleetWaitingCount();
+  return [
+    active?.id ?? "",
+    active?.name ?? "",
+    active?.pane_count ?? "",
+    ghLogin,
+    waiting,
+  ].join("\x01");
+}
+
+/** Last fingerprint that triggered a full topbar rebuild. */
+let lastTopbarFp = "";
+
 export function renderTopbar(root: HTMLElement): void {
   const s = getState();
+  const fp = topbarFingerprint(s);
+  if (fp === lastTopbarFp && root.childElementCount > 0) {
+    // Active session (id/name/count), github login and waiting count are all
+    // unchanged — skip the rebuild so the topbar buttons and the switcher pill
+    // survive :hover (childElementCount > 0 forces a build on first paint).
+    return;
+  }
+  lastTopbarFp = fp;
+
   const active = activeSessionInfo();
   const paneChip = active
     ? h(

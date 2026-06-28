@@ -284,7 +284,11 @@ export function focusFirstLeaf(session: string): void {
   const win = activeWindowOf(session);
   const layout = win ? getState().layouts.get(win) : undefined;
   const first = leafPanes(layout)[0] ?? null;
-  setState({ focusedPane: first });
+  // Clear stale blocks on ANY focus change to a new pane (not just switchSession)
+  // so the inspector never shows the previous pane's blocks while the new pane's
+  // blocks load. The poll's reloadFocusedBlocks (or switchSession's immediate
+  // call) then fills in the new pane's blocks.
+  setState({ focusedPane: first, blocks: [] });
 }
 
 // ── Event-driven lifecycle ───────────────────────────────────────────────────
