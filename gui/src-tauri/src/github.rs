@@ -122,6 +122,7 @@ pub enum PollState {
     Authorized,
     Denied,
     Expired,
+    SlowDown,
 }
 
 /// GitHub user identity returned by `github_account`.
@@ -158,6 +159,7 @@ pub(crate) enum PollResult {
     Authorized(String),
     Denied,
     Expired,
+    SlowDown,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -225,7 +227,7 @@ pub(crate) fn parse_poll(json: &str) -> Result<PollResult, String> {
     let error = v["error"].as_str().unwrap_or("");
     match error {
         "authorization_pending" => Ok(PollResult::Pending),
-        "slow_down" => Ok(PollResult::Pending),
+        "slow_down" => Ok(PollResult::SlowDown),
         "expired_token" => Ok(PollResult::Expired),
         "access_denied" => Ok(PollResult::Denied),
         "" => Err("access_token response has neither access_token nor error field".to_string()),
@@ -349,10 +351,17 @@ pub async fn github_device_poll(
         .await
         .map_err(|e| format!("access_token request failed: {e}"))?;
 
+    let status = resp.status();
     let body = resp
         .text()
         .await
         .map_err(|e| format!("access_token read body failed: {e}"))?;
+
+    // Diagnostic log — safe: logs error field + has_token bool, NEVER the token value.
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+        eprintln!("[pyre-github] poll http={} error={:?} has_token={}",
+            status.as_u16(), v["error"].as_str().unwrap_or("none"), v.get("access_token").is_some());
+    }
 
     match parse_poll(&body)? {
         PollResult::Authorized(token) => {
@@ -366,6 +375,7 @@ pub async fn github_device_poll(
             Ok(PollState::Authorized)
         }
         PollResult::Pending => Ok(PollState::Pending),
+        PollResult::SlowDown => Ok(PollState::SlowDown),
         PollResult::Denied => Ok(PollState::Denied),
         PollResult::Expired => Ok(PollState::Expired),
     }
@@ -468,10 +478,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_poll_slow_down_maps_to_pending() {
+    fn parse_poll_slow_down_maps_to_slow_down() {
         let json = r#"{"error":"slow_down","error_description":"Too many polling requests."}"#;
         let result = parse_poll(json).expect("should parse");
-        assert!(matches!(result, PollResult::Pending));
+        assert!(matches!(result, PollResult::SlowDown));
     }
 
     #[test]

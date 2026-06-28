@@ -27,6 +27,8 @@ const REVOKE_URL =
 /** Live poll timer + expiry deadline for the open link attempt (null when idle). */
 let pollTimer: number | null = null;
 let deadline: number | null = null;
+/** Current polling interval in seconds; increases by 5 on each slow_down per RFC 8628 §3.5. */
+let currentIntervalSec = 5;
 /** Guards `startGitHubLink` against a double-start while the start RPC is inflight. */
 let starting = false;
 /** Count of consecutive untagged poll errors; resets on any successful response. */
@@ -149,14 +151,20 @@ export function closeGhMenu(): void {
 function startPolling(intervalSec: number): void {
   stopPolling();
   consecutivePollErrors = 0;
-  pollTimer = window.setInterval(() => void pollOnce(), intervalSec * 1000);
+  currentIntervalSec = Math.max(1, intervalSec);
+  scheduleNext(currentIntervalSec);
 }
 
 function stopPolling(): void {
   if (pollTimer != null) {
-    window.clearInterval(pollTimer);
+    window.clearTimeout(pollTimer);
     pollTimer = null;
   }
+}
+
+/** Schedule the next poll `sec` seconds from now. */
+function scheduleNext(sec: number): void {
+  pollTimer = window.setTimeout(() => void pollOnce(), sec * 1000);
 }
 
 async function pollOnce(): Promise<void> {
@@ -187,12 +195,14 @@ async function pollOnce(): Promise<void> {
       return;
     }
     console.warn("[pyre-github] device poll failed (will retry):", err);
+    scheduleNext(currentIntervalSec);
     return;
   }
   // A response arrived — reset the transient-error backstop.
   consecutivePollErrors = 0;
   switch (res.status) {
     case "pending":
+      scheduleNext(currentIntervalSec);
       return;
     case "authorized":
       await finishAuthorized();
@@ -202,6 +212,11 @@ async function pollOnce(): Promise<void> {
       return;
     case "expired":
       finishWithError("GitHub link expired.");
+      return;
+    case "slow_down":
+      // RFC 8628 §3.5: increase the polling interval by 5 seconds and retry.
+      currentIntervalSec += 5;
+      scheduleNext(currentIntervalSec);
       return;
   }
 }

@@ -243,4 +243,4 @@ export interface GhDeviceStart {
 }
 
 /** Result of `github_device_poll()` — the authorization status of the link. */
-export type GhPoll = { status: "pending" | "authorized" | "denied" | "expired" };
+export type GhPoll = { status: "pending" | "authorized" | "denied" | "expired" | "slow_down" };
