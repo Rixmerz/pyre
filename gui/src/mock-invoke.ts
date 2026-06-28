@@ -949,3 +949,12 @@ export function mockListen(): Promise<() => void> {
 export function mockAuthorizeGitHub(): void {
   model().github.authorized = true;
 }
+
+// Reset the in-memory mock state on Vite hot-reload so demo state (e.g. a
+// simulated GitHub auth) doesn't linger across edits. Prod builds have no
+// import.meta.hot, so this compiles out.
+if (import.meta.hot) {
+  import.meta.hot.dispose(() => {
+    state = null;
+  });
+}
