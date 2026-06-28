@@ -800,6 +800,13 @@ mod tests {
         ) -> Result<LayoutNode, PyreError> {
             Err(PyreError::NoSuchSession(SessionId::new()))
         }
+        async fn git_status(
+            self,
+            _ctx: tarpc::context::Context,
+            _session: SessionId,
+        ) -> Result<Option<pyre_proto::GitInfo>, PyreError> {
+            Ok(None)
+        }
     }
 
     // ── Test helpers ─────────────────────────────────────────────────────────

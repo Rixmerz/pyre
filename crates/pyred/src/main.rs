@@ -26,6 +26,7 @@
 mod agent_detect;
 mod ansi;
 mod config;
+mod git;
 mod hooks;
 mod index;
 mod inspect;

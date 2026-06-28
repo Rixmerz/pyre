@@ -262,6 +262,14 @@ pub trait PyreDaemon {
     /// Returns `PyreError::NoSuchSession` if the window (or its session) is
     /// not found.
     async fn get_window_layout(window: WindowId) -> Result<layout::LayoutNode, PyreError>;
+
+    /// Return git repository status for the working directory of `session`'s
+    /// first pane.
+    ///
+    /// Returns `Ok(None)` when the cwd is not inside a git repo, git is not
+    /// installed, or the session has no live panes. Callers should hide the
+    /// git chip rather than showing an error in those cases.
+    async fn git_status(session: SessionId) -> Result<Option<crate::GitInfo>, PyreError>;
 }
 
 /// Process metadata returned by `inspect_pid`.

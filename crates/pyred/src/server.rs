@@ -4,10 +4,10 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use pyre_proto::{
-    layout, AttachAck, Block, BlockHit, BlockId, ListBlocksReq, OpenPaneReq, OpenPaneSplitReq,
-    PaneEvent, PaneId, PaneInfo, PaneStateKind, PyreError, ReplayBlocks, ResizePaneReq,
-    ResizePaneRes, SearchBlocksReq, SessionId, SessionInfo, SpawnReq, SpawnResp, WindowId,
-    WindowInfo,
+    layout, AttachAck, Block, BlockHit, BlockId, GitInfo, ListBlocksReq, OpenPaneReq,
+    OpenPaneSplitReq, PaneEvent, PaneId, PaneInfo, PaneStateKind, PyreError, ReplayBlocks,
+    ResizePaneReq, ResizePaneRes, SearchBlocksReq, SessionId, SessionInfo, SpawnReq, SpawnResp,
+    WindowId, WindowInfo,
 };
 use tarpc::context;
 
@@ -676,5 +676,45 @@ impl pyre_proto::service::PyreDaemon for DaemonImpl {
             .get_window_layout(window)
             .await
             .ok_or(PyreError::NoSuchSession(SessionId::new()))
+    }
+
+    async fn git_status(
+        self,
+        _ctx: context::Context,
+        session: SessionId,
+    ) -> Result<Option<GitInfo>, PyreError> {
+        let sess = match self.registry.get_session(session).await {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        // Pick the first live pane to resolve a cwd via its shell child PID.
+        let child_pid = {
+            let panes = sess.panes.lock().await;
+            panes.values().next().map(|p| p.child_pid)
+        };
+        let Some(child_pid) = child_pid else {
+            return Ok(None);
+        };
+
+        // Read the shell's cwd from /proc/<pid>/cwd (Linux/macOS).
+        // On non-unix platforms we cannot resolve the cwd this way, so return
+        // None — same pattern as pty.rs:401-408.
+        let cwd = {
+            #[cfg(unix)]
+            {
+                match std::fs::read_link(format!("/proc/{child_pid}/cwd")) {
+                    Ok(p) => p,
+                    Err(_) => return Ok(None),
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = child_pid;
+                return Ok(None);
+            }
+        };
+
+        Ok(crate::git::git_info(&cwd).await)
     }
 }

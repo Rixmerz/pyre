@@ -317,6 +317,35 @@ button {
   font-size: 10.5px;
   color: var(--fg-faint);
 }
+/* Per-session git chip — display-only, sits inside .rail-name so it hides with
+   the rail when collapsed. Color transition only (no transform), so it survives
+   the reduced-motion block unchanged. */
+.git-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 140px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--fg-muted);
+  transition: color var(--dur-fast) var(--ease-standard);
+}
+.git-branch {
+  color: var(--ember);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 84px;
+}
+.git-dirty {
+  color: var(--warn);
+}
+.git-ahead,
+.git-behind {
+  color: var(--fg-muted);
+}
 .rail-close {
   position: relative;
   display: inline-flex;

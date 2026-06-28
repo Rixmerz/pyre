@@ -4,7 +4,7 @@
 import { h, replaceChildren } from "./dom";
 import { icon } from "./icons";
 import { attachRenameAffordance } from "./inline-edit";
-import { getState, panesOfSession, type AppState } from "../state";
+import { getSessionGit, getState, panesOfSession, type AppState } from "../state";
 import { heatVar, hottest } from "../heat";
 import {
   closeSessionAction,
@@ -13,7 +13,7 @@ import {
   switchSession,
   toggleRail,
 } from "../actions";
-import type { PaneState } from "../types";
+import type { GitInfo, PaneState } from "../types";
 
 /**
  * Canonical string of everything the rail rows RENDER from — per session: id,
@@ -28,7 +28,13 @@ import type { PaneState } from "../types";
 function railFingerprint(s: Readonly<AppState>): string {
   const rows = s.sessions.map((sess) => {
     const states = panesOfSession(sess.id).map((p) => p.state as PaneState);
-    return `${sess.id}${sess.name}${sess.pane_count}${hottest(states)}`;
+    // Git is folded into the fingerprint so a real change (branch switch,
+    // dirty count, ahead/behind shift) rebuilds the row exactly once. Paired
+    // with setSessionGit's change-gate, a steady repo keeps the same string ->
+    // zero rebuilds; only an actual git delta moves it.
+    const g = getSessionGit(sess.id);
+    const git = `${g?.branch ?? ""}:${g?.dirty ?? 0}:${g?.ahead ?? 0}:${g?.behind ?? 0}`;
+    return `${sess.id}${sess.name}${sess.pane_count}${hottest(states)}${git}`;
   });
   return `c:${s.railCollapsed ? 1 : 0}|[${rows.join("")}]`;
 }
@@ -124,6 +130,7 @@ export function renderRail(root: HTMLElement): void {
           "span",
           { class: "rail-name" },
           nameSpan,
+          gitChip(getSessionGit(sess.id)),
           h("span", { class: "rail-pane-count" }, `${sess.pane_count}`),
         ),
       closeBtn,
@@ -174,4 +181,28 @@ function heatDot(state: PaneState): HTMLElement {
   const dot = h("span", { class: "heat-dot", "data-state": state });
   dot.style.setProperty("--dot-heat", heatVar(state));
   return dot;
+}
+
+/**
+ * Compact per-session git chip: `⎇ <branch>` always, then `●<dirty>` / `↑<ahead>`
+ * / `↓<behind>` only when each is non-zero. Returns null when git is unknown (not
+ * a repo, or not polled yet) so the row carries no chip — lives inside `.rail-name`
+ * so it hides with the rail when collapsed. Long branch names truncate via CSS
+ * (`.git-branch` max-width + ellipsis), never JS. Display-only — no handlers. The
+ * `title` carries the full detail for hover.
+ */
+function gitChip(git: GitInfo | undefined): HTMLElement | null {
+  if (!git) return null;
+  const detail =
+    git.branch +
+    (git.upstream ? ` (${git.upstream})` : "") +
+    ` · ${git.dirty} dirty · ↑${git.ahead} ↓${git.behind}`;
+  return h(
+    "span",
+    { class: "git-chip", title: detail },
+    h("span", { class: "git-branch" }, `⎇ ${git.branch}`),
+    git.dirty > 0 && h("span", { class: "git-dirty" }, `●${git.dirty}`),
+    git.ahead > 0 && h("span", { class: "git-ahead" }, `↑${git.ahead}`),
+    git.behind > 0 && h("span", { class: "git-behind" }, `↓${git.behind}`),
+  );
 }

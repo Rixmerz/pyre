@@ -4,6 +4,7 @@
 
 import type {
   Block,
+  GitInfo,
   LayoutNode,
   PaneStateInfo,
   SessionInfo,
@@ -43,6 +44,15 @@ export interface AppState {
   blocks: Block[]; // blocks for the focused pane, newest-first
   blocksLoading: boolean;
 
+  /**
+   * Per-session git status, keyed by session id. Kept SEPARATE from `sessions`
+   * so a `list_sessions` refresh (which replaces the whole array) never clobbers
+   * git that the slower 3 s git-poll owns. Absent key ⇒ unknown/not-a-repo ⇒ no
+   * chip. Mutated only via `setSessionGit`, whose change-gate stops the poll from
+   * notifying on no-op ticks (flicker fix, commit 27888ba).
+   */
+  gitBySession: Map<string, GitInfo>;
+
   // Block panel search
   blockQuery: string;
   searchResults: Block[] | null; // null = not searching, show live blocks
@@ -76,6 +86,7 @@ const state: AppState = {
   activeWindow: new Map(),
   blocks: [],
   blocksLoading: false,
+  gitBySession: new Map(),
   blockQuery: "",
   searchResults: null,
   blocksFailuresOnly: false,
@@ -131,6 +142,39 @@ export function paneStateOf(pane: string): PaneStateInfo | undefined {
 export function paneDisplayName(pane: string, fallback: string): string {
   const name = (paneStateOf(pane)?.name ?? "").trim();
   return name || fallback;
+}
+
+/** Git status for one session, if known (not a repo / not yet polled ⇒ undefined). */
+export function getSessionGit(session: string): GitInfo | undefined {
+  return state.gitBySession.get(session);
+}
+
+/** True when two git snapshots differ on any of the 5 fields (null vs present counts). */
+function gitChanged(a: GitInfo | undefined, b: GitInfo | null): boolean {
+  if (a == null && b == null) return false;
+  if (a == null || b == null) return true;
+  return (
+    a.branch !== b.branch ||
+    a.dirty !== b.dirty ||
+    a.ahead !== b.ahead ||
+    a.behind !== b.behind ||
+    a.upstream !== b.upstream
+  );
+}
+
+/**
+ * Set (or clear, on `null`) a session's git status. CHANGE-GATED: shallow-compares
+ * the 5 fields against the stored value and returns WITHOUT notifying when nothing
+ * moved — this is the discipline that stops the 3 s git poll from rebuilding the
+ * rail every tick (chronic-flicker fix, commit 27888ba). Only a genuine change
+ * mutates the map and calls notify(), so steady state = zero rebuilds and a real
+ * git change = exactly one. `null` deletes the key (no chip).
+ */
+export function setSessionGit(session: string, git: GitInfo | null): void {
+  if (!gitChanged(state.gitBySession.get(session), git)) return;
+  if (git === null) state.gitBySession.delete(session);
+  else state.gitBySession.set(session, git);
+  notify();
 }
 
 /** All pane states belonging to a given session. */

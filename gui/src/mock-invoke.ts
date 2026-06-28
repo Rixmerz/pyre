@@ -21,6 +21,7 @@
 import type {
   Block,
   DaemonStatus,
+  GitInfo,
   LayoutNode,
   PaneState,
   PaneStateInfo,
@@ -569,6 +570,23 @@ function handle(s: MockState, cmd: string, a: Args): unknown {
     // ── Sessions ──
     case "list_sessions":
       return [...s.sessions.values()].map((m) => sessionDto(s, m));
+
+    // Fake per-session git status so the chip is visible + varied in the browser
+    // mock loop. Seeded sessions get distinct shapes (dirty / ahead vs behind);
+    // any other session falls back to a clean `main`. Returning a value (never
+    // null) keeps the chip on screen — null ("not a repo") is reserved for a
+    // manual one-off test. Reads `args.session`, matching the real `{ session }`.
+    case "git_status": {
+      const session = reqStr(a, "session");
+      const seeded: Record<string, GitInfo> = {
+        "sess-dev": { branch: "main", dirty: 3, ahead: 1, behind: 0, upstream: "origin/main" },
+        "sess-infra": { branch: "feat/windows", dirty: 0, ahead: 0, behind: 2, upstream: "origin/feat/windows" },
+      };
+      return (
+        seeded[session] ??
+        ({ branch: "main", dirty: 0, ahead: 0, behind: 0, upstream: "origin/main" } satisfies GitInfo)
+      );
+    }
 
     case "spawn_session": {
       const sess = makeSession(s);

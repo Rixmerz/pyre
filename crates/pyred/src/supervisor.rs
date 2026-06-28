@@ -27,7 +27,7 @@ use pyre_proto::supervisor::{
     BlockEvent, RegisterAck, RpcError, SupervisorWorker, WorkerControlClient,
 };
 use pyre_proto::{
-    layout, AttachAck, Block, BlockHit, BlockId, InputFrame, LayoutNode, ListBlocksReq,
+    layout, AttachAck, Block, BlockHit, BlockId, GitInfo, InputFrame, LayoutNode, ListBlocksReq,
     OpenPaneReq, OpenPaneSplitReq, OutputFrame, PaneEvent, PaneEventKind, PaneId, PaneInfo,
     PaneStateKind, PyreError, ReplayBlocks, ResizePaneReq, ResizePaneRes, SearchBlocksReq,
     SessionId, SessionInfo, SpawnReq, SpawnResp, WindowId, WindowInfo,
@@ -1972,6 +1972,18 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
         }
         // No windows at all — fall back to the single-leaf builder.
         self.window_single_leaf_fallback(session_id, &id_str).await
+    }
+
+    /// In hybrid mode the pane child PIDs live inside worker processes and are
+    /// not forwarded to the supervisor over the WorkerControl protocol. We
+    /// therefore cannot resolve `/proc/<pid>/cwd` here. Return `None` so the
+    /// caller hides the git chip rather than showing an error.
+    async fn git_status(
+        self,
+        _ctx: context::Context,
+        _session: SessionId,
+    ) -> Result<Option<GitInfo>, PyreError> {
+        Ok(None)
     }
 }
 

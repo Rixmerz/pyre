@@ -152,6 +152,15 @@ pub struct SessionDto {
 }
 
 #[derive(Serialize)]
+pub struct GitInfoDto {
+    pub branch: String,
+    pub dirty: u32,
+    pub ahead: u32,
+    pub behind: u32,
+    pub upstream: Option<String>,
+}
+
+#[derive(Serialize)]
 pub struct SpawnDto {
     pub session: String,
     pub pane: String,
@@ -447,6 +456,30 @@ async fn close_session(state: State<'_, AppState>, session: String) -> Result<()
         .map_err(|e| format!("gc_stale_sessions transport error: {e}"))?
         .map_err(|e| format!("gc_stale_sessions daemon error: {e}"))?;
     Ok(())
+}
+
+#[tauri::command]
+async fn git_status(
+    session: String,
+    state: State<'_, AppState>,
+) -> Result<Option<GitInfoDto>, String> {
+    let session_id = parse_session(&session)?;
+    let client = {
+        let mut guard = state.inner.lock().await;
+        ensure_client(&mut guard).await?
+    };
+    let info = client
+        .git_status(tarpc::context::current(), session_id)
+        .await
+        .map_err(|e| format!("git_status transport error: {e}"))?
+        .map_err(|e| format!("git_status daemon error: {e}"))?;
+    Ok(info.map(|g| GitInfoDto {
+        branch: g.branch,
+        dirty: g.dirty,
+        ahead: g.ahead,
+        behind: g.behind,
+        upstream: g.upstream,
+    }))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1220,6 +1253,7 @@ pub fn run() {
             spawn_session,
             rename_session,
             close_session,
+            git_status,
             // windows
             list_windows,
             new_window,

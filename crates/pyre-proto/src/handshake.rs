@@ -15,7 +15,8 @@ use crate::MODE_CONTROL;
 /// v5: window model — `WindowId`, `WindowInfo`; `list_windows`, `new_window`,
 ///     `rename_window`, `close_window`, `get_window_layout` RPCs; `PaneInfo`,
 ///     `OpenPaneReq`, `SpawnResp` gain `window: WindowId` field.
-pub const PROTO_VERSION: u32 = 5;
+/// v6: `git_status` RPC + `GitInfo` type — read-only git status for a session's cwd.
+pub const PROTO_VERSION: u32 = 6;
 
 /// Client: write `MODE_CONTROL` + little-endian `PROTO_VERSION`.
 pub async fn write_control_client<W: AsyncWrite + Unpin>(w: &mut W) -> io::Result<()> {

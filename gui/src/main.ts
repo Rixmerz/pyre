@@ -33,6 +33,7 @@ import {
   focusFirstLeaf,
 } from "./session-ops";
 import { newSession } from "./actions";
+import { startGitPolling } from "./git-poll";
 import {
   disposePaneTerminal,
   refitAll,
@@ -203,6 +204,10 @@ async function boot(): Promise<void> {
 
   startPolling();
   startPidPoll();
+  // Per-session git chip poll. Idempotent + self-healing: it reads whatever
+  // sessions are in state each 3 s tick, so it works whether we booted connected
+  // or pick sessions up after a later reconnect — same pattern as startPidPoll.
+  startGitPolling();
   window.addEventListener("resize", () => refitAll());
 }
 

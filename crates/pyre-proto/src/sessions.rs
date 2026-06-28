@@ -146,6 +146,27 @@ pub struct SpawnResp {
     pub window: WindowId,
 }
 
+/// Git repository state for the working directory of a session's first pane.
+///
+/// Returned by the `git_status` RPC. The caller receives `None` when the
+/// session's cwd is not inside a git repository, git is unavailable, or the
+/// session has no live panes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitInfo {
+    /// Current branch name, or `"HEAD"` for detached-HEAD state.
+    pub branch: String,
+    /// Number of modified / untracked files (lines in porcelain output after
+    /// the `##` header line).
+    pub dirty: u32,
+    /// Commits ahead of the upstream branch (0 when no upstream).
+    pub ahead: u32,
+    /// Commits behind the upstream branch (0 when no upstream).
+    pub behind: u32,
+    /// Upstream tracking ref, e.g. `"origin/main"`. `None` when no upstream
+    /// is configured.
+    pub upstream: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResizePaneReq {
     pub pane_id: PaneId,

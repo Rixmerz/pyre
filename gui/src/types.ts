@@ -92,6 +92,20 @@ export interface WindowInfo {
   created_at?: string;
 }
 
+/**
+ * Per-session git status from `git_status(session)`. The daemon resolves the
+ * session's cwd to a repo; `null` (not modeled here — the command returns
+ * `GitInfo | null`) means "not a git repo" ⇒ the rail renders NO chip. Counts are
+ * non-negative; `upstream` is null when the branch has no tracking remote.
+ */
+export interface GitInfo {
+  branch: string;
+  dirty: number;
+  ahead: number;
+  behind: number;
+  upstream: string | null;
+}
+
 /** A command block from `list_blocks(pane)` / `search_blocks(...)`. */
 export interface Block {
   id: string;

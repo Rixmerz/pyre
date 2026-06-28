@@ -20,8 +20,8 @@ pub use service::{
     PyreDaemon, PyreDaemonClient, PyreError, SpawnReq, MODE_CONTROL, MODE_STREAM,
 };
 pub use sessions::{
-    AgentKind, OpenPaneReq, PaneInfo, PaneStateKind, ReplayBlocks, ResizePaneReq, ResizePaneRes,
-    SessionInfo, SpawnResp, WindowInfo,
+    AgentKind, GitInfo, OpenPaneReq, PaneInfo, PaneStateKind, ReplayBlocks, ResizePaneReq,
+    ResizePaneRes, SessionInfo, SpawnResp, WindowInfo,
 };
 pub use socket::{attach_stream, connect_control, default_socket};
 pub use supervisor::{
