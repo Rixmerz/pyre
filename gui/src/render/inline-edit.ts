@@ -16,6 +16,7 @@
 // whose refresh skips a name-only repaint (the center's fingerprint guard).
 
 import { dlog } from "../debug";
+import { toast } from "../toast";
 
 // How many inline editors are currently mounted in the DOM. The render loop
 // reads this (via `isInlineEditing`) to SKIP rebuilding a surface while the user
@@ -181,9 +182,10 @@ export function beginInlineEdit(opts: InlineEditOpts): HTMLInputElement | null {
     // (markSettled, above) → restore label with new text → fire onCommit.
     label.textContent = next;
     restoreLabel();
-    void Promise.resolve(onCommit(next)).catch((err) =>
-      dlog("[pyre-rename] onCommit rejected — kept fallback label:", err),
-    );
+    void Promise.resolve(onCommit(next)).catch((err) => {
+      dlog("[pyre-rename] onCommit rejected — kept fallback label:", err);
+      toast("Rename failed.", "error");
+    });
   };
 
   input.addEventListener("keydown", (e: KeyboardEvent) => {

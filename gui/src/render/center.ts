@@ -46,6 +46,7 @@ import { mountPaneTerminal, refitAll } from "../terminals";
 import { setWeight } from "../api";
 import { chipKind } from "./agents";
 import { dlog } from "../debug";
+import { toast } from "../toast";
 import type { LayoutNode, PaneState, WindowInfo } from "../types";
 
 /** First leaf pane id under a node — the representative weight target. */
@@ -315,9 +316,10 @@ function divider(
       }
       const leftPane = firstLeaf(node.children[leftIdx]!);
       const rightPane = firstLeaf(node.children[rightIdx]!);
-      void setWeight(leftPane, Math.round(lastLeftW)).catch((err) =>
-        console.error("set_weight failed:", leftPane, err),
-      );
+      void setWeight(leftPane, Math.round(lastLeftW)).catch((err) => {
+        console.error("set_weight failed:", leftPane, err);
+        toast("Couldn't resize the panes.", "error");
+      });
       void setWeight(rightPane, Math.round(lastRightW)).catch((err) =>
         console.error("set_weight failed:", rightPane, err),
       );

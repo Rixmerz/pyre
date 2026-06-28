@@ -460,6 +460,7 @@ export async function runBlockSearch(query: string): Promise<void> {
   } catch (err) {
     console.error("search_blocks failed:", err);
     setState({ searchResults: [] });
+    toast("Search failed.", "error");
   }
 }
 
@@ -482,9 +483,10 @@ export function toggleBlockExpanded(blockId: string): void {
  */
 export function rerunBlock(pane: string, command: string): void {
   const bytes = Array.from(new TextEncoder().encode(command + "\n"));
-  void sendKeys(pane, bytes).catch((e) =>
-    console.error("rerun send_keys failed:", e),
-  );
+  void sendKeys(pane, bytes).catch((e) => {
+    console.error("rerun send_keys failed:", e);
+    toast("Couldn't rerun the command.", "error");
+  });
   if (getState().focusedPane === pane) focusPaneTerminal(pane);
 }
 

@@ -9,6 +9,7 @@ import { icon } from "./icons";
 import { getState, setState, type AppState } from "../state";
 import { runBlockSearch, toggleBlockExpanded, toggleFailuresOnly, rerunBlock } from "../actions";
 import { blockStdout } from "../api";
+import { toast } from "../toast";
 import type { Block } from "../types";
 
 /**
@@ -253,6 +254,7 @@ function blockCard(b: Block, cool: number, expanded: boolean): HTMLElement {
         void navigator.clipboard?.writeText(text);
       } catch (err) {
         console.error("block_stdout failed:", err);
+        toast("Couldn't copy the output.", "error");
       }
     }),
     iconAction("Rerun in pane", icon("rerun"), () => rerunBlock(b.pane, b.command)),
@@ -308,6 +310,7 @@ function outputBlock(b: Block): HTMLElement {
       .catch((err) => {
         console.error("block_stdout failed:", err);
         if (pre.isConnected) pre.textContent = "(failed to load output)";
+        toast("Couldn't load the output.", "error");
       });
   }
   return pre;
