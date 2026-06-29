@@ -34,6 +34,7 @@ fn parse_porcelain(out: &str) -> GitInfo {
                 ahead: 0,
                 behind: 0,
                 upstream: None,
+                cwd: None,
             }
         }
     };
@@ -82,6 +83,7 @@ fn parse_porcelain(out: &str) -> GitInfo {
         ahead,
         behind,
         upstream,
+        cwd: None,
     }
 }
 
@@ -126,7 +128,9 @@ pub async fn git_info(cwd: &Path) -> Option<GitInfo> {
     }
 
     let stdout = std::str::from_utf8(&output.stdout).ok()?;
-    Some(parse_porcelain(stdout))
+    let mut info = parse_porcelain(stdout);
+    info.cwd = Some(cwd.to_string_lossy().into_owned());
+    Some(info)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -165,6 +165,14 @@ pub struct GitInfo {
     /// Upstream tracking ref, e.g. `"origin/main"`. `None` when no upstream
     /// is configured.
     pub upstream: Option<String>,
+    /// Absolute path to the working directory used to run `git status`.
+    ///
+    /// In single mode this is the live cwd read from `/proc/<pid>/cwd`.
+    /// In hybrid mode this is the spawn-time cwd (does not track `cd` within
+    /// the pane until live-cwd forwarding from the worker is implemented).
+    /// `None` on non-unix platforms or when the cwd could not be determined.
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

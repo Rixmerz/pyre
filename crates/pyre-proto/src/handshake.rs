@@ -16,7 +16,10 @@ use crate::MODE_CONTROL;
 ///     `rename_window`, `close_window`, `get_window_layout` RPCs; `PaneInfo`,
 ///     `OpenPaneReq`, `SpawnResp` gain `window: WindowId` field.
 /// v6: `git_status` RPC + `GitInfo` type — read-only git status for a session's cwd.
-pub const PROTO_VERSION: u32 = 6;
+/// v7: `GitInfo` gains `cwd: Option<String>` — the resolved working directory
+///     used to run `git status`, so the GUI's PR/CI chip does not need to
+///     derive it from `inspect_pid → env → PWD`.
+pub const PROTO_VERSION: u32 = 7;
 
 /// Client: write `MODE_CONTROL` + little-endian `PROTO_VERSION`.
 pub async fn write_control_client<W: AsyncWrite + Unpin>(w: &mut W) -> io::Result<()> {
