@@ -72,6 +72,20 @@ impl Store {
 
         backfill_windows(&pool).await.context("backfill windows")?;
 
+        // ── Boot reconcile: stamp ghost "running" blocks left by a SIGKILL ──────
+        // When the daemon is killed -9, the shutdown drain never runs and blocks
+        // remain `ended_at IS NULL` until the next start.  Stamp them now so the
+        // TUI never shows stale "running" blocks from a previous daemon instance.
+        // Idempotent: blocks already finalized are not matched by the WHERE clause.
+        let reconcile_ts = Utc::now().timestamp_millis();
+        sqlx::query(
+            "UPDATE blocks SET ended_at = ?1, exit_code = NULL WHERE ended_at IS NULL",
+        )
+        .bind(reconcile_ts)
+        .execute(&pool)
+        .await
+        .context("boot reconcile: stamp unfinalized blocks")?;
+
         Ok(Self { pool, data_dir })
     }
 
@@ -1267,6 +1281,63 @@ mod tests {
 
     /// `assign_pane_window` is idempotent: calling it twice with the same
     /// (pane, window) pair must not create a duplicate row.
+    /// Boot-reconcile invariant: `Store::open` stamps every block that has
+    /// `ended_at IS NULL` (left by a SIGKILL of a previous daemon instance).
+    /// After the second open the row must have `ended_at IS NOT NULL` and
+    /// `exit_code` must remain NULL (we don't know the real exit code).
+    #[tokio::test]
+    async fn boot_reconcile_closes_ghost_blocks() -> Result<()> {
+        let _g = ENV_LOCK.lock().await;
+        let tmp = TempDir::new()?;
+        // SAFETY: test-only env mutation, serialized by ENV_LOCK.
+        unsafe {
+            std::env::set_var("PYRE_DATA_DIR", tmp.path());
+        }
+
+        let (sid, pid, bid) = {
+            let store = Store::open().await?;
+            let sid = SessionId(Uuid::new_v4());
+            let pid = PaneId(Uuid::new_v4());
+            let bid = BlockId(Uuid::new_v4());
+            store.upsert_session(sid, "test").await?;
+            store.upsert_pane(pid, sid, "/bin/sh", None, 80, 24).await?;
+            let block = Block {
+                id: bid,
+                pane: pid,
+                session: sid,
+                command: "long-running".into(),
+                cwd: None,
+                started_at: Utc::now(),
+                ended_at: None,
+                exit_code: None,
+                stdout_len: 0,
+            };
+            store.create_block(&block).await?;
+            // Precondition: block is in-progress (ended_at IS NULL).
+            let before = store.list_blocks(Some(sid), 10).await?;
+            assert!(
+                before[0].ended_at.is_none(),
+                "precondition: ghost block must be in-progress before reconcile"
+            );
+            (sid, pid, bid)
+        };
+        // Store dropped here — pool closes.  Re-open simulates a daemon restart.
+        let _ = (pid, bid); // suppress unused warnings
+
+        let store2 = Store::open().await?;
+        let after = store2.list_blocks(Some(sid), 10).await?;
+        assert_eq!(after.len(), 1);
+        assert!(
+            after[0].ended_at.is_some(),
+            "boot reconcile must set ended_at on ghost block after re-open"
+        );
+        assert!(
+            after[0].exit_code.is_none(),
+            "exit_code must remain NULL — daemon was killed, no exit code known"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn assign_pane_window_calling_twice_keeps_single_assignment() -> Result<()> {
         let _g = ENV_LOCK.lock().await;
