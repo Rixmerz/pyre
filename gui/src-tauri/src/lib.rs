@@ -1299,6 +1299,8 @@ pub fn run() {
             github::github_device_poll,
             github::github_account,
             github::github_disconnect,
+            // github pr/ci (read-only)
+            github::github_pr_ci,
         ])
         .run(tauri::generate_context!())
         .expect("error while running pyre-gui");

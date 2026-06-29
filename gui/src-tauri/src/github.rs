@@ -428,6 +428,271 @@ pub async fn github_disconnect() -> Result<(), String> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// PR/CI public types
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Folded CI state for the open PR's head commit check-runs.
+///
+/// Serialized as lowercase strings (e.g. `"success"`, `"failure"`, `"none"`).
+///
+/// # Variant note
+/// `CiState::None` is a valid Rust enum variant name — it is not the
+/// `Option::None` keyword.  It means "PR found but no check-runs recorded
+/// yet", distinct from the outer `Option<PrCiInfo>::None` which hides the
+/// chip entirely.
+#[derive(Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CiState {
+    Success,
+    Failure,
+    Pending,
+    Running,
+    None,
+}
+
+/// PR number, URL, and folded CI state for the current branch.
+///
+/// Returned as `Option<PrCiInfo>` by `github_pr_ci`.  The outer `None` hides
+/// the chip (no token / no remote / 401 / any error).  The inner
+/// `ci_state = CiState::None` means "PR exists but no check-runs yet".
+#[derive(Serialize)]
+pub struct PrCiInfo {
+    pub pr_number: Option<u32>,
+    pub pr_url: Option<String>,
+    pub ci_state: CiState,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PR/CI pure parser helpers — no network, no I/O, safe to unit-test
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Parse the first open PR from a GitHub `GET /pulls` JSON array.
+///
+/// Returns `(pr_number, html_url, head_sha)` for the first entry, or `None`
+/// when the array is empty or required fields are absent.
+pub(crate) fn parse_pulls(json: &str) -> Option<(u32, String, String)> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let pr = v.as_array()?.first()?;
+    let number = pr["number"].as_u64()? as u32;
+    let url = pr["html_url"].as_str()?.to_string();
+    let sha = pr["head"]["sha"].as_str()?.to_string();
+    Some((number, url, sha))
+}
+
+/// Fold a GitHub `GET /check-runs` JSON response into a single `CiState`.
+///
+/// Priority (highest wins): Failure > Running > Pending > Success > None.
+///
+/// - Failure conclusions: `failure`, `timed_out`, `action_required`, `cancelled`.
+/// - Running: any run with `status = "in_progress"`.
+/// - Pending: any run with `status = "queued"`.
+/// - Success: all completed runs with `success`, `neutral`, `skipped`, or `stale`.
+/// - None: empty `check_runs` array or unparseable response.
+pub(crate) fn parse_check_runs(json: &str) -> CiState {
+    let v = match serde_json::from_str::<serde_json::Value>(json) {
+        Ok(v) => v,
+        Err(_) => return CiState::None,
+    };
+    let runs = match v["check_runs"].as_array() {
+        Some(r) => r,
+        None => return CiState::None,
+    };
+    if runs.is_empty() {
+        return CiState::None;
+    }
+
+    let mut has_failure = false;
+    let mut has_running = false;
+    let mut has_pending = false;
+    let mut has_success = false;
+
+    for run in runs {
+        let status = run["status"].as_str().unwrap_or("");
+        let conclusion = run["conclusion"].as_str().unwrap_or("");
+
+        match status {
+            "in_progress" => has_running = true,
+            "queued" => has_pending = true,
+            "completed" => match conclusion {
+                "failure" | "timed_out" | "action_required" | "cancelled" => has_failure = true,
+                "success" | "neutral" | "skipped" | "stale" => has_success = true,
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    if has_failure {
+        CiState::Failure
+    } else if has_running {
+        CiState::Running
+    } else if has_pending {
+        CiState::Pending
+    } else if has_success {
+        CiState::Success
+    } else {
+        CiState::None
+    }
+}
+
+/// Parse a GitHub remote URL into `(owner, repo)`.
+///
+/// Handles SSH (`git@github.com:owner/repo[.git]`) and HTTPS/HTTP
+/// (`https://github.com/owner/repo[.git]`).  Returns `None` for non-GitHub
+/// remotes or unrecognized formats.
+pub(crate) fn parse_owner_repo(url: &str) -> Option<(String, String)> {
+    let url = url.trim();
+    // Strip optional .git suffix before splitting.
+    let url = url.strip_suffix(".git").unwrap_or(url);
+
+    // SSH: git@github.com:owner/repo
+    if let Some(rest) = url.strip_prefix("git@github.com:") {
+        let (owner, repo) = rest.split_once('/')?;
+        return Some((owner.to_string(), repo.to_string()));
+    }
+
+    // HTTPS or HTTP.
+    for prefix in ["https://github.com/", "http://github.com/"] {
+        if let Some(rest) = url.strip_prefix(prefix) {
+            let (owner, repo) = rest.split_once('/')?;
+            return Some((owner.to_string(), repo.to_string()));
+        }
+    }
+
+    None
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PR/CI private helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Invoke `git -C {cwd} remote get-url origin` and return the trimmed URL,
+/// or `None` on any error (git not found, not a git repo, no origin, etc.).
+async fn get_remote_origin_url(cwd: &str) -> Option<String> {
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .arg("remote")
+        .arg("get-url")
+        .arg("origin")
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let url = String::from_utf8(output.stdout).ok()?;
+    let trimmed = url.trim().to_string();
+    if trimmed.is_empty() { None } else { Some(trimmed) }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PR/CI Tauri command
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Fetch the open PR and folded CI state for `branch` in the repo rooted at
+/// `cwd`.
+///
+/// Returns `None` (chip hidden) on: no stored token / `cwd` is not a git repo
+/// / no `origin` remote / non-GitHub remote / no open PR for this branch /
+/// HTTP 401 / any network failure.  Never panics.
+///
+/// # How to get `cwd` and `branch`
+/// - `branch` comes from `git_status(session_id)` → `GitInfoDto.branch`.
+/// - `cwd` is NOT yet exposed by `SessionDto`.  Until a lightweight
+///   `get_session_cwd` command is added (would require daemon changes), the
+///   GUI can obtain it via `inspect_pid(pane_id)` → `env` → the `PWD` entry.
+///   No daemon/proto changes are required for this command itself; the
+///   architectural fork is flagged here for awareness.
+///
+/// # Security
+/// The stored token is used only in `Authorization: Bearer` request headers
+/// and is NEVER serialized, logged, or included in the returned value.
+#[tauri::command]
+pub async fn github_pr_ci(cwd: String, branch: String) -> Result<Option<PrCiInfo>, String> {
+    // Guard: no token → chip hidden.
+    let token = match load_token() {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+
+    // Resolve owner/repo from the git remote origin URL.
+    let remote_url = match get_remote_origin_url(&cwd).await {
+        Some(u) => u,
+        None => return Ok(None),
+    };
+    let (owner, repo) = match parse_owner_repo(&remote_url) {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+
+    let client = match http_client() {
+        Ok(c) => c,
+        Err(_) => return Ok(None),
+    };
+
+    // Fetch open PRs for this branch.
+    let pulls_url = format!(
+        "https://api.github.com/repos/{owner}/{repo}/pulls?head={owner}:{branch}&state=open"
+    );
+    let pulls_resp = match client
+        .get(&pulls_url)
+        .header("Accept", "application/vnd.github+json")
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => return Ok(None),
+    };
+
+    if pulls_resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Ok(None);
+    }
+    if !pulls_resp.status().is_success() {
+        return Ok(None);
+    }
+
+    let pulls_body = match pulls_resp.text().await {
+        Ok(b) => b,
+        Err(_) => return Ok(None),
+    };
+
+    // No open PR for this branch → chip hidden.
+    let (pr_number, pr_url, head_sha) = match parse_pulls(&pulls_body) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+
+    // Fetch CI check-runs for the PR head SHA.
+    let checks_url = format!(
+        "https://api.github.com/repos/{owner}/{repo}/commits/{head_sha}/check-runs"
+    );
+    let ci_state = match client
+        .get(&checks_url)
+        .header("Accept", "application/vnd.github+json")
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => match resp.text().await {
+            Ok(body) => parse_check_runs(&body),
+            Err(_) => CiState::None,
+        },
+        _ => CiState::None,
+    };
+
+    // Token was used only in Authorization headers above — never logged or returned.
+    Ok(Some(PrCiInfo {
+        pr_number: Some(pr_number),
+        pr_url: Some(pr_url),
+        ci_state,
+    }))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Unit tests — pure parser coverage + token file round-trip; no network
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -552,6 +817,131 @@ mod tests {
     fn parse_account_missing_login_errors() {
         let json = r#"{"name":"x","avatar_url":"y","html_url":"z"}"#;
         assert!(parse_account(json).is_err());
+    }
+
+    // ── PR/CI: parse_pulls ───────────────────────────────────────────────────
+
+    #[test]
+    fn parse_pulls_first_pr_number_url_and_sha() {
+        let json = r#"[{
+            "number": 42,
+            "html_url": "https://github.com/owner/repo/pull/42",
+            "head": {
+                "sha": "abc123def456789",
+                "label": "owner:feature-branch"
+            }
+        }]"#;
+        let (num, url, sha) = parse_pulls(json).expect("should parse first PR");
+        assert_eq!(num, 42);
+        assert_eq!(url, "https://github.com/owner/repo/pull/42");
+        assert_eq!(sha, "abc123def456789");
+    }
+
+    #[test]
+    fn parse_pulls_empty_array_returns_none() {
+        assert!(parse_pulls("[]").is_none(), "empty array must return None");
+    }
+
+    #[test]
+    fn parse_pulls_missing_head_sha_returns_none() {
+        // head object is present but sha is absent — must return None.
+        let json = r#"[{"number": 1, "html_url": "https://github.com/o/r/pull/1", "head": {}}]"#;
+        assert!(parse_pulls(json).is_none());
+    }
+
+    // ── PR/CI: parse_check_runs ──────────────────────────────────────────────
+
+    #[test]
+    fn parse_check_runs_all_success_maps_to_success() {
+        let json = r#"{
+            "total_count": 2,
+            "check_runs": [
+                {"status": "completed", "conclusion": "success"},
+                {"status": "completed", "conclusion": "neutral"}
+            ]
+        }"#;
+        assert!(matches!(parse_check_runs(json), CiState::Success));
+    }
+
+    #[test]
+    fn parse_check_runs_any_failure_maps_to_failure() {
+        let json = r#"{
+            "check_runs": [
+                {"status": "completed", "conclusion": "success"},
+                {"status": "completed", "conclusion": "failure"}
+            ]
+        }"#;
+        assert!(matches!(parse_check_runs(json), CiState::Failure));
+    }
+
+    #[test]
+    fn parse_check_runs_in_progress_maps_to_running() {
+        let json = r#"{
+            "check_runs": [
+                {"status": "completed", "conclusion": "success"},
+                {"status": "in_progress", "conclusion": null}
+            ]
+        }"#;
+        assert!(matches!(parse_check_runs(json), CiState::Running));
+    }
+
+    #[test]
+    fn parse_check_runs_queued_only_maps_to_pending() {
+        let json = r#"{"check_runs": [{"status": "queued", "conclusion": null}]}"#;
+        assert!(matches!(parse_check_runs(json), CiState::Pending));
+    }
+
+    #[test]
+    fn parse_check_runs_empty_array_maps_to_none() {
+        let json = r#"{"total_count": 0, "check_runs": []}"#;
+        assert!(matches!(parse_check_runs(json), CiState::None));
+    }
+
+    #[test]
+    fn parse_check_runs_failure_beats_running() {
+        // Failure has higher priority than Running.
+        let json = r#"{
+            "check_runs": [
+                {"status": "in_progress", "conclusion": null},
+                {"status": "completed", "conclusion": "timed_out"}
+            ]
+        }"#;
+        assert!(matches!(parse_check_runs(json), CiState::Failure));
+    }
+
+    // ── PR/CI: parse_owner_repo ──────────────────────────────────────────────
+
+    #[test]
+    fn parse_owner_repo_ssh_with_dot_git() {
+        let (owner, repo) = parse_owner_repo("git@github.com:acme/myproject.git").unwrap();
+        assert_eq!(owner, "acme");
+        assert_eq!(repo, "myproject");
+    }
+
+    #[test]
+    fn parse_owner_repo_ssh_without_dot_git() {
+        let (owner, repo) = parse_owner_repo("git@github.com:acme/myproject").unwrap();
+        assert_eq!(owner, "acme");
+        assert_eq!(repo, "myproject");
+    }
+
+    #[test]
+    fn parse_owner_repo_https_with_dot_git() {
+        let (owner, repo) = parse_owner_repo("https://github.com/acme/myproject.git").unwrap();
+        assert_eq!(owner, "acme");
+        assert_eq!(repo, "myproject");
+    }
+
+    #[test]
+    fn parse_owner_repo_https_without_dot_git() {
+        let (owner, repo) = parse_owner_repo("https://github.com/acme/myproject").unwrap();
+        assert_eq!(owner, "acme");
+        assert_eq!(repo, "myproject");
+    }
+
+    #[test]
+    fn parse_owner_repo_non_github_returns_none() {
+        assert!(parse_owner_repo("https://gitlab.com/acme/repo.git").is_none());
     }
 
     // ── token file round-trip + 0600 mode ────────────────────────────────────
