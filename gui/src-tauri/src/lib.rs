@@ -18,6 +18,8 @@ mod github;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as _;
 
 use futures::StreamExt;
 use pyre_proto::{
@@ -45,6 +47,9 @@ struct Inner {
     stream_tasks: HashMap<PaneId, JoinHandle<()>>,
     /// Pane forwarded by legacy `start_pane` / `send_keys` (kept for compat).
     legacy_pane: Option<PaneId>,
+    /// Guards auto-spawn: set to `true` after the first spawn attempt so the
+    /// existing reconnect loop never re-spawns pyred on every poll tick.
+    spawn_attempted: bool,
 }
 
 pub struct AppState {
@@ -74,6 +79,89 @@ fn resolve_socket() -> std::path::PathBuf {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Helper: locate the pyred binary
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Return the first `pyred` binary found, trying in order:
+///
+/// 1. Any directory on `$PATH`.
+/// 2. The directory that contains the running pyre-gui executable.
+/// 3. `~/.local/bin/pyred`.
+fn find_pyred() -> Option<std::path::PathBuf> {
+    // 1. PATH lookup.
+    if let Ok(paths) = std::env::var("PATH") {
+        for dir in paths.split(':') {
+            let candidate = std::path::Path::new(dir).join("pyred");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    // 2. Sibling of the current executable (e.g. both installed in the same
+    //    app bundle directory).
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let candidate = parent.join("pyred");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    // 3. XDG local bin.
+    if let Ok(home) = std::env::var("HOME") {
+        let candidate = std::path::PathBuf::from(home).join(".local/bin/pyred");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helper: spawn pyred detached (outlives the GUI process)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Spawn `pyred` in a new process group so it continues running after the GUI
+/// exits.  stdout/stderr are redirected to `/dev/null`.
+///
+/// Returns `Ok(())` when the child process has been forked successfully.
+/// It does NOT wait for the daemon to become ready — callers must poll the
+/// socket separately.
+#[cfg(unix)]
+fn spawn_pyred_detached(bin: &std::path::Path) -> Result<(), String> {
+    let dev_null_out = std::fs::File::open("/dev/null")
+        .map_err(|e| format!("open /dev/null for stdout: {e}"))?;
+    let dev_null_err = std::fs::File::open("/dev/null")
+        .map_err(|e| format!("open /dev/null for stderr: {e}"))?;
+
+    std::process::Command::new(bin)
+        .stdin(std::process::Stdio::null())
+        .stdout(dev_null_out)
+        .stderr(dev_null_err)
+        // `process_group(0)` calls `setpgid(0, 0)`, placing the child in its
+        // own process group so SIGHUP from the parent session does not reach it.
+        .process_group(0)
+        .spawn()
+        .map(|_child| ())
+        .map_err(|e| format!("failed to spawn {:?}: {e}", bin))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helper: poll until the socket file is present (or timeout)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Poll `socket` every 100 ms for up to 5 s waiting for it to exist on the
+/// filesystem.  Returns when the socket appears or the timeout expires.
+async fn poll_socket_ready(socket: &std::path::Path) {
+    for _ in 0..50u32 {
+        if socket.exists() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Helper: connect-or-reuse control client
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -82,16 +170,53 @@ async fn ensure_client(inner: &mut Inner) -> Result<PyreDaemonClient, String> {
         return Ok(c.clone());
     }
     let socket = resolve_socket();
-    let client = pyre_proto::socket::connect_control(&socket)
-        .await
-        .map_err(|e| {
-            format!(
-                "could not connect to pyred at {} — is the daemon running? ({e})",
-                socket.display()
-            )
-        })?;
-    inner.client = Some(client.clone());
-    Ok(client)
+
+    // First connection attempt.
+    match pyre_proto::socket::connect_control(&socket).await {
+        Ok(client) => {
+            inner.client = Some(client.clone());
+            Ok(client)
+        }
+        // Connect failed.  If we have not yet tried to spawn pyred, do it
+        // exactly once here.  Subsequent failures (reconnect loop ticks) fall
+        // straight through to the Err return below so we never spam-spawn.
+        Err(_) if !inner.spawn_attempted => {
+            inner.spawn_attempted = true;
+
+            #[cfg(unix)]
+            {
+                let bin = find_pyred().ok_or_else(|| {
+                    "pyred not found — checked PATH, the GUI's own directory, \
+                     and ~/.local/bin/pyred"
+                        .to_string()
+                })?;
+
+                spawn_pyred_detached(&bin).map_err(|e| {
+                    format!("auto-spawn of pyred failed: {e}")
+                })?;
+
+                // Wait up to 5 s for the socket file to appear, then retry.
+                poll_socket_ready(&socket).await;
+            }
+
+            // Retry the connection (on non-unix this is still a plain retry
+            // without a spawn, giving the daemon a moment to become ready).
+            let client = pyre_proto::socket::connect_control(&socket)
+                .await
+                .map_err(|e| {
+                    format!(
+                        "pyred was spawned but {} is still unreachable: {e}",
+                        socket.display()
+                    )
+                })?;
+            inner.client = Some(client.clone());
+            Ok(client)
+        }
+        Err(e) => Err(format!(
+            "could not connect to pyred at {} — is the daemon running? ({e})",
+            socket.display()
+        )),
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
