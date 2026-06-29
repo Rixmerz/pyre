@@ -952,13 +952,15 @@ function handle(s: MockState, cmd: string, a: Args): unknown {
     // manual one-off test. Reads `args.session`, matching the real `{ session }`.
     case "git_status": {
       const session = reqStr(a, "session");
+      // `cwd` (proto v7) is what the PR/CI poller now feeds to github_pr_ci —
+      // it MUST be present here or the mock chip would never fire.
       const seeded: Record<string, GitInfo> = {
-        "sess-dev": { branch: "main", dirty: 3, ahead: 1, behind: 0, upstream: "origin/main" },
-        "sess-infra": { branch: "feat/windows", dirty: 0, ahead: 0, behind: 2, upstream: "origin/feat/windows" },
+        "sess-dev": { branch: "main", dirty: 3, ahead: 1, behind: 0, upstream: "origin/main", cwd: "/home/dev/pyre" },
+        "sess-infra": { branch: "feat/windows", dirty: 0, ahead: 0, behind: 2, upstream: "origin/feat/windows", cwd: "/home/dev/pyre" },
       };
       return (
         seeded[session] ??
-        ({ branch: "main", dirty: 0, ahead: 0, behind: 0, upstream: "origin/main" } satisfies GitInfo)
+        ({ branch: "main", dirty: 0, ahead: 0, behind: 0, upstream: "origin/main", cwd: "/home/dev/pyre" } satisfies GitInfo)
       );
     }
 
