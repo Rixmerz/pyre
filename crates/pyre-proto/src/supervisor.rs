@@ -188,4 +188,15 @@ pub trait WorkerControl {
 
     /// Mark pane as seen by the user.
     async fn mark_pane_seen(slot_idx: u32) -> Result<(), RpcError>;
+
+    /// Return the live working directory of the shell child for pane `slot_idx`.
+    ///
+    /// Resolves via `/proc/<child_pid>/cwd`, which follows `cd` in real time.
+    /// Returns `None` when the pane is absent or the procfs symlink cannot be
+    /// read (e.g. the child has already exited).
+    ///
+    /// This is intentionally an internal supervisor↔worker RPC and does NOT
+    /// affect the user-facing `PROTO_VERSION` (which guards the GUI↔daemon
+    /// `PyreDaemon` handshake in `handshake.rs`).
+    async fn pane_cwd(slot_idx: u32) -> Result<Option<String>, RpcError>;
 }
