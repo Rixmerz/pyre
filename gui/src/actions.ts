@@ -18,6 +18,7 @@ import {
   spawnSession,
 } from "./api";
 import {
+  getSessionPrCi,
   getState,
   setState,
   windowTabs,
@@ -40,7 +41,7 @@ import {
 } from "./session-ops";
 import { dlog } from "./debug";
 import { toast } from "./toast";
-import { startGitHubLink, disconnectGitHub } from "./github-link";
+import { openExternalUrl, startGitHubLink, disconnectGitHub } from "./github-link";
 
 // ── Session actions ─────────────────────────────────────────────────────────
 
@@ -649,6 +650,22 @@ export function buildCommands(): Command[] {
           run: () => void startGitHubLink(),
         },
   ];
+
+  // "Open PR for this branch" — only when the active session has a PR url.
+  // Uses openExternalUrl (the same helper the OAuth flow uses) so it works in
+  // both the Tauri shell (shell plugin) and the browser mock (window.open).
+  const activePrCi = s.activeSession
+    ? getSessionPrCi(s.activeSession)
+    : undefined;
+  if (activePrCi?.pr_url) {
+    const prUrl = activePrCi.pr_url;
+    cmds.push({
+      id: "open-pr",
+      title: `Open PR #${activePrCi.pr_number ?? ""} for this branch`,
+      hint: "GitHub",
+      run: () => void openExternalUrl(prUrl),
+    });
+  }
 
   // Switch session… submenu
   if (s.sessions.length > 0) {
