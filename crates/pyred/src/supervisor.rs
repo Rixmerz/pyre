@@ -2525,18 +2525,26 @@ async fn finalize_open_blocks(
     block_index: &Arc<BlockIndex>,
 ) {
     for state in pane_parsers.values_mut() {
-        let open_blocks: Vec<pyre_proto::BlockId> = state.writers.keys().cloned().collect();
+        // `block_meta` is the authoritative set of in-progress blocks: every
+        // CommandStart inserts here. `writers` is a SUBSET — a block whose
+        // `BlobWriter::open` failed has meta but no writer. Drain from
+        // `block_meta` so those writer-less blocks are still finalized;
+        // otherwise they stay `ended_at IS NULL` forever (ghost "running"
+        // block). See `finalize_open_blocks_finalizes_writerless_block`.
+        let open_blocks: Vec<pyre_proto::BlockId> = state.block_meta.keys().cloned().collect();
         for block in open_blocks {
-            if let Some(bw) = state.writers.remove(&block) {
-                let stdout_len = tokio::task::spawn_blocking(move || bw.close().unwrap_or(0))
+            let stdout_len = if let Some(bw) = state.writers.remove(&block) {
+                tokio::task::spawn_blocking(move || bw.close().unwrap_or(0))
                     .await
-                    .unwrap_or(0);
-                // IGNORED: finalize_block error on shutdown drain is best-effort;
-                // acceptable data loss during process teardown.
-                let _ = store
-                    .finalize_block(block, Utc::now(), None, stdout_len)
-                    .await;
-            }
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            // IGNORED: finalize_block error on shutdown drain is best-effort;
+            // acceptable data loss during process teardown.
+            let _ = store
+                .finalize_block(block, Utc::now(), None, stdout_len)
+                .await;
             let stdout_text = state
                 .stdout_bufs
                 .remove(&block)
