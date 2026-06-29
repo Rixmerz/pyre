@@ -247,14 +247,29 @@ fn is_shell(name: &str) -> bool {
     SHELL_SET.contains(&name)
 }
 
-/// Walk /proc/{pid}/task/{pid}/children recursively to find the deepest leaf PID,
-/// then return its comm. Falls back to root_pid's own comm.
+/// Return the comm of the foreground process for this PTY.
+///
+/// **Approach:** read the DIRECT child of the PTY shell (one level down), not
+/// the deepest descendant.  When the user types `claude`, the tree is:
+///
+/// ```text
+/// bash (root_pid)            ← PTY shell
+///   └── claude               ← direct child — what we want to classify
+///         ├── node-worker-1  ← deepest_child used to return this
+///         └── node-worker-N
+/// ```
+///
+/// Walking to the deepest leaf gives `node-worker-N`, whose comm is `"node"`,
+/// which classifies as `Unknown`.  Taking the direct child gives `"claude"` →
+/// `ClaudeCode`.  Falls back to the shell's own comm when it has no children
+/// (e.g. idle shell with no foreground program).
+///
 /// On non-Linux the process tree cannot be walked; returns root comm directly.
 pub fn foreground_of(root_pid: u32) -> Option<String> {
     #[cfg(target_os = "linux")]
     {
-        let deepest = deepest_child(root_pid);
-        read_comm(deepest)
+        let child = direct_child(root_pid);
+        read_comm(child)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -262,16 +277,20 @@ pub fn foreground_of(root_pid: u32) -> Option<String> {
     }
 }
 
+/// Return the last direct child PID of `pid`, or `pid` itself if it has none.
+///
+/// Uses `/proc/{pid}/task/{pid}/children` which lists only immediate children
+/// (not the full subtree), so this is O(1) in process-tree depth.
 #[cfg(target_os = "linux")]
-fn deepest_child(pid: u32) -> u32 {
+fn direct_child(pid: u32) -> u32 {
     let children_path = format!("/proc/{pid}/task/{pid}/children");
     if let Ok(content) = std::fs::read_to_string(&children_path) {
-        let children: Vec<u32> = content
+        if let Some(last) = content
             .split_whitespace()
-            .filter_map(|s| s.parse().ok())
-            .collect();
-        if let Some(&last) = children.last() {
-            return deepest_child(last);
+            .filter_map(|s| s.parse::<u32>().ok())
+            .next_back()
+        {
+            return last;
         }
     }
     pid
@@ -406,6 +425,34 @@ mod tests {
         t.last_output_at = Instant::now() - std::time::Duration::from_secs(5);
         t.evaluate();
         assert_eq!(t.state, PaneStateKind::WaitingInput);
+    }
+
+    // ── Fix (a): foreground classification ────────────────────────────────
+    //
+    // The actual /proc walking cannot be unit-tested without spawning real child
+    // processes (done indirectly by integration tests in tests/smoke.rs).  What
+    // we can verify here is that classify_foreground produces the right result
+    // for the comm strings that direct_child returns at runtime:
+    //
+    //   - "claude"  → ClaudeCode  (the comm of the direct child we now read)
+    //   - "node"    → Unknown     (the comm deepest_child used to return — WRONG)
+    //
+    // This documents the before/after contract.
+
+    #[test]
+    fn classify_claude_direct_child_is_claude_code() {
+        // direct_child(bash_pid) → claude_pid  →  read_comm → "claude"
+        // classify_foreground("claude") must be ClaudeCode, not Unknown.
+        let kind = crate::agent_detect::classify_foreground("claude");
+        assert_eq!(kind, pyre_proto::AgentKind::ClaudeCode);
+    }
+
+    #[test]
+    fn classify_node_worker_is_unknown() {
+        // The old deepest_child path returned a node worker comm.
+        // That classified as Unknown — the bug we fixed by switching to direct_child.
+        let kind = crate::agent_detect::classify_foreground("node");
+        assert_eq!(kind, pyre_proto::AgentKind::Unknown);
     }
 
     /// A `Mutex<PaneStateTracker>` whose guard was held by a panicking thread
