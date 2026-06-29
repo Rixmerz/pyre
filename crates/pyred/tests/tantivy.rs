@@ -5,6 +5,10 @@
 //! writes OSC 133 markers directly to its stdout (PTY master read side),
 //! bypassing the line-discipline echo path that would strip raw escape bytes.
 
+#[allow(dead_code)]
+#[path = "common.rs"]
+mod common;
+
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -71,12 +75,14 @@ async fn run_tantivy_test() -> anyhow::Result<()> {
     }
 
     // --- 3. Spawn pyred ---
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_pyred"))
-        .env("XDG_RUNTIME_DIR", xdg_dir.path())
-        .env("PYRE_DATA_DIR", data_dir.path())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
+    let mut child = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_pyred"))
+            .env("XDG_RUNTIME_DIR", xdg_dir.path())
+            .env("PYRE_DATA_DIR", data_dir.path())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?,
+    );
 
     // --- 4. Poll up to 3 s for socket ---
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
@@ -298,11 +304,12 @@ async fn run_tantivy_test() -> anyhow::Result<()> {
             Err(_) => break,
         }
         if tokio::time::Instant::now() >= wait_deadline {
-            child.kill().ok();
+            child.kill();
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     Ok(())
+    // `child` guard drops here; process already reaped above on the happy path.
 }

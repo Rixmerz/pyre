@@ -11,6 +11,10 @@
 //! never processed by the echo path, so the OSC 133 sequences arrive intact at
 //! pyred's parser.
 
+#[allow(dead_code)]
+#[path = "common.rs"]
+mod common;
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -77,13 +81,15 @@ async fn run_blocks_test() -> anyhow::Result<()> {
     // --- 2. Spawn pyred with both env vars set ---
     // XDG_CONFIG_HOME is pointed at the temp dir so pyred uses default (single)
     // process model regardless of the user's ~/.config/pyre/config.toml setting.
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_pyred"))
-        .env("XDG_RUNTIME_DIR", xdg_dir.path())
-        .env("PYRE_DATA_DIR", data_dir.path())
-        .env("XDG_CONFIG_HOME", xdg_dir.path())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
+    let mut child = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_pyred"))
+            .env("XDG_RUNTIME_DIR", xdg_dir.path())
+            .env("PYRE_DATA_DIR", data_dir.path())
+            .env("XDG_CONFIG_HOME", xdg_dir.path())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?,
+    );
 
     // --- 3. Poll up to 3s for socket ---
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
@@ -259,7 +265,7 @@ async fn run_blocks_test() -> anyhow::Result<()> {
             Err(_) => break,
         }
         if tokio::time::Instant::now() >= wait_deadline {
-            child.kill().ok();
+            child.kill();
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -271,4 +277,5 @@ async fn run_blocks_test() -> anyhow::Result<()> {
     );
 
     Ok(())
+    // `child` guard drops here; process already reaped above on the happy path.
 }

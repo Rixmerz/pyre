@@ -14,6 +14,10 @@
 //! a writable XDG_RUNTIME_DIR-like temp directory.  Run with:
 //!   cargo test --test prod_smoke -- --ignored --nocapture
 
+#[allow(dead_code)]
+#[path = "common.rs"]
+mod common;
+
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -33,19 +37,21 @@ use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 
 async fn spawn_daemon(
     tmpdir: &tempfile::TempDir,
-) -> anyhow::Result<(std::process::Child, std::path::PathBuf, PyreDaemonClient)> {
+) -> anyhow::Result<(common::ChildGuard, std::path::PathBuf, PyreDaemonClient)> {
     let sock_path = tmpdir.path().join("pyre.sock");
-    let child = std::process::Command::new(env!("CARGO_BIN_EXE_pyred"))
-        .env("XDG_RUNTIME_DIR", tmpdir.path())
-        .env("PYRE_DATA_DIR", tmpdir.path())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
+    let child = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_pyred"))
+            .env("XDG_RUNTIME_DIR", tmpdir.path())
+            .env("PYRE_DATA_DIR", tmpdir.path())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?,
+    );
     wait_for_socket(&sock_path, Duration::from_secs(5)).await?;
     let rpc = connect_control(&sock_path).await?;
     Ok((child, sock_path, rpc))
 }
 
-fn shutdown_daemon(mut child: std::process::Child) {
+fn shutdown_daemon(mut child: common::ChildGuard) {
     let pid = Pid::from_raw(child.id() as i32);
     kill(pid, Signal::SIGTERM).ok();
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
@@ -54,11 +60,12 @@ fn shutdown_daemon(mut child: std::process::Child) {
             break;
         }
         if std::time::Instant::now() >= deadline {
-            child.kill().ok();
+            child.kill();
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+    // child guard drops here; already reaped above.
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────

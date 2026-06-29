@@ -7,6 +7,10 @@
 //!
 //! Test 6 (`migration_idempotency`) is fully in-process.
 
+#[allow(dead_code)]
+#[path = "common.rs"]
+mod common;
+
 use std::time::Duration;
 use tokio::sync::Mutex;
 
@@ -105,15 +109,17 @@ async fn run_cross_session_search() -> anyhow::Result<()> {
 
     let sock_path = rt_dir.join("pyre.sock");
 
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_pyred"))
-        .arg("--mode")
-        .arg("supervisor")
-        .env("XDG_RUNTIME_DIR", &rt_dir)
-        .env("XDG_STATE_HOME", &state_dir)
-        .env("XDG_CONFIG_HOME", tmpdir.path().join("config"))
-        .env("PYRE_DATA_DIR", &state_dir)
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
+    let mut child = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_pyred"))
+            .arg("--mode")
+            .arg("supervisor")
+            .env("XDG_RUNTIME_DIR", &rt_dir)
+            .env("XDG_STATE_HOME", &state_dir)
+            .env("XDG_CONFIG_HOME", tmpdir.path().join("config"))
+            .env("PYRE_DATA_DIR", &state_dir)
+            .stderr(std::process::Stdio::piped())
+            .spawn()?,
+    );
 
     wait_for_socket(&sock_path, Duration::from_secs(8)).await?;
     let rpc = connect_control(&sock_path).await?;
@@ -201,7 +207,7 @@ async fn run_cross_session_search() -> anyhow::Result<()> {
             break;
         }
         if tokio::time::Instant::now() >= deadline {
-            child.kill().ok();
+            child.kill();
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -239,15 +245,17 @@ async fn run_worker_respawn() -> anyhow::Result<()> {
     )?;
 
     let sock_path = rt_dir.join("pyre.sock");
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_pyred"))
-        .arg("--mode")
-        .arg("supervisor")
-        .env("XDG_RUNTIME_DIR", &rt_dir)
-        .env("XDG_STATE_HOME", &state_dir)
-        .env("XDG_CONFIG_HOME", tmpdir.path().join("config"))
-        .env("PYRE_DATA_DIR", &state_dir)
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
+    let mut child = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_pyred"))
+            .arg("--mode")
+            .arg("supervisor")
+            .env("XDG_RUNTIME_DIR", &rt_dir)
+            .env("XDG_STATE_HOME", &state_dir)
+            .env("XDG_CONFIG_HOME", tmpdir.path().join("config"))
+            .env("PYRE_DATA_DIR", &state_dir)
+            .stderr(std::process::Stdio::piped())
+            .spawn()?,
+    );
 
     wait_for_socket(&sock_path, Duration::from_secs(8)).await?;
     let rpc = connect_control(&sock_path).await?;
@@ -344,7 +352,7 @@ async fn run_worker_respawn() -> anyhow::Result<()> {
             break;
         }
         if tokio::time::Instant::now() >= deadline {
-            child.kill().ok();
+            child.kill();
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -408,15 +416,17 @@ async fn run_close_pane_eviction() -> anyhow::Result<()> {
     )?;
 
     let sock_path = rt_dir.join("pyre.sock");
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_pyred"))
-        .arg("--mode")
-        .arg("supervisor")
-        .env("XDG_RUNTIME_DIR", &rt_dir)
-        .env("XDG_STATE_HOME", &state_dir)
-        .env("XDG_CONFIG_HOME", tmpdir.path().join("config"))
-        .env("PYRE_DATA_DIR", &state_dir)
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
+    let mut child = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_pyred"))
+            .arg("--mode")
+            .arg("supervisor")
+            .env("XDG_RUNTIME_DIR", &rt_dir)
+            .env("XDG_STATE_HOME", &state_dir)
+            .env("XDG_CONFIG_HOME", tmpdir.path().join("config"))
+            .env("PYRE_DATA_DIR", &state_dir)
+            .stderr(std::process::Stdio::piped())
+            .spawn()?,
+    );
 
     wait_for_socket(&sock_path, Duration::from_secs(8)).await?;
     let rpc = connect_control(&sock_path).await?;
@@ -499,7 +509,7 @@ async fn run_close_pane_eviction() -> anyhow::Result<()> {
             break;
         }
         if tokio::time::Instant::now() >= deadline {
-            child.kill().ok();
+            child.kill();
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -540,15 +550,17 @@ async fn run_hybrid_wait_pane() -> anyhow::Result<()> {
     )?;
     let sock_path = rt_dir.join("pyre.sock");
 
-    let child = std::process::Command::new(env!("CARGO_BIN_EXE_pyred"))
-        .arg("--mode")
-        .arg("supervisor")
-        .env("XDG_RUNTIME_DIR", &rt_dir)
-        .env("XDG_STATE_HOME", &state_dir)
-        .env("XDG_CONFIG_HOME", tmpdir.path().join("config"))
-        .env("PYRE_DATA_DIR", &state_dir)
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
+    let child = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_pyred"))
+            .arg("--mode")
+            .arg("supervisor")
+            .env("XDG_RUNTIME_DIR", &rt_dir)
+            .env("XDG_STATE_HOME", &state_dir)
+            .env("XDG_CONFIG_HOME", tmpdir.path().join("config"))
+            .env("PYRE_DATA_DIR", &state_dir)
+            .stderr(std::process::Stdio::piped())
+            .spawn()?,
+    );
 
     wait_for_socket(&sock_path, Duration::from_secs(8)).await?;
     let rpc = connect_control(&sock_path).await?;
@@ -631,15 +643,17 @@ async fn run_hybrid_replay() -> anyhow::Result<()> {
     )?;
     let sock_path = rt_dir.join("pyre.sock");
 
-    let child = std::process::Command::new(env!("CARGO_BIN_EXE_pyred"))
-        .arg("--mode")
-        .arg("supervisor")
-        .env("XDG_RUNTIME_DIR", &rt_dir)
-        .env("XDG_STATE_HOME", &state_dir)
-        .env("XDG_CONFIG_HOME", tmpdir.path().join("config"))
-        .env("PYRE_DATA_DIR", &state_dir)
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
+    let child = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_pyred"))
+            .arg("--mode")
+            .arg("supervisor")
+            .env("XDG_RUNTIME_DIR", &rt_dir)
+            .env("XDG_STATE_HOME", &state_dir)
+            .env("XDG_CONFIG_HOME", tmpdir.path().join("config"))
+            .env("PYRE_DATA_DIR", &state_dir)
+            .stderr(std::process::Stdio::piped())
+            .spawn()?,
+    );
 
     wait_for_socket(&sock_path, Duration::from_secs(8)).await?;
     let rpc = connect_control(&sock_path).await?;
@@ -672,6 +686,7 @@ async fn run_hybrid_replay() -> anyhow::Result<()> {
     let pid = Pid::from_raw(child.id() as i32);
     kill(pid, Signal::SIGTERM).ok();
     Ok(())
+    // `child` guard drops here and reaps the process.
 }
 
 // ---------------------------------------------------------------------------

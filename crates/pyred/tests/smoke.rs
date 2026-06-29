@@ -1,6 +1,10 @@
 //! Integration smoke test: spawn pyred, open control + stream connections,
 //! run `echo pyre-smoke` in a PTY session, assert the output arrives.
 
+#[allow(dead_code)]
+#[path = "common.rs"]
+mod common;
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -34,11 +38,13 @@ async fn run_smoke() -> anyhow::Result<()> {
     let tmpdir = tempfile::TempDir::new()?;
     let sock_path = tmpdir.path().join("pyre.sock");
 
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_pyred"))
-        .env("XDG_RUNTIME_DIR", tmpdir.path())
-        .env("PYRE_DATA_DIR", tmpdir.path())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
+    let mut child = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_pyred"))
+            .env("XDG_RUNTIME_DIR", tmpdir.path())
+            .env("PYRE_DATA_DIR", tmpdir.path())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?,
+    );
 
     // --- 2. Poll up to 3s for socket to appear ---
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
@@ -157,7 +163,7 @@ async fn run_smoke() -> anyhow::Result<()> {
             Err(_) => break,
         }
         if tokio::time::Instant::now() >= wait_deadline {
-            child.kill().ok();
+            child.kill();
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -169,4 +175,6 @@ async fn run_smoke() -> anyhow::Result<()> {
     );
 
     Ok(())
+    // `child` guard drops here; if we reached this point the process has
+    // already been waited above, so the guard's wait() is a harmless no-op.
 }

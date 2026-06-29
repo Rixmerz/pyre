@@ -4,6 +4,10 @@
 //! then calls `capture_pane` over the control connection and asserts the
 //! expected marker text appears in the returned ring-buffer snapshot.
 
+#[allow(dead_code)]
+#[path = "common.rs"]
+mod common;
+
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -36,11 +40,13 @@ async fn run_capture() -> anyhow::Result<()> {
     let tmpdir = tempfile::TempDir::new()?;
     let sock_path = tmpdir.path().join("pyre.sock");
 
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_pyred"))
-        .env("XDG_RUNTIME_DIR", tmpdir.path())
-        .env("PYRE_DATA_DIR", tmpdir.path())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
+    let mut child = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_pyred"))
+            .env("XDG_RUNTIME_DIR", tmpdir.path())
+            .env("PYRE_DATA_DIR", tmpdir.path())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?,
+    );
 
     // --- 2. Wait for socket to appear and accept connections ---
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -134,13 +140,14 @@ async fn run_capture() -> anyhow::Result<()> {
             Err(_) => break,
         }
         if tokio::time::Instant::now() >= wait_deadline {
-            child.kill().ok();
+            child.kill();
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     Ok(())
+    // `child` guard drops here; process already reaped above on the happy path.
 }
 
 async fn connect_control(sock_path: &std::path::Path) -> anyhow::Result<PyreDaemonClient> {
