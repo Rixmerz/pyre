@@ -4,7 +4,7 @@
 import { h, replaceChildren } from "./dom";
 import { icon } from "./icons";
 import { attachRenameAffordance } from "./inline-edit";
-import { getSessionGit, getState, panesOfSession, type AppState } from "../state";
+import { getSessionGit, getSessionPrCi, getState, panesOfSession, type AppState } from "../state";
 import { heatVar, hottest } from "../heat";
 import {
   closeSessionAction,
@@ -13,7 +13,7 @@ import {
   switchSession,
   toggleRail,
 } from "../actions";
-import type { GitInfo, PaneState } from "../types";
+import type { GitInfo, PaneState, PrCiInfo } from "../types";
 
 /**
  * Canonical string of everything the rail rows RENDER from — per session: id,
@@ -34,7 +34,12 @@ function railFingerprint(s: Readonly<AppState>): string {
     // zero rebuilds; only an actual git delta moves it.
     const g = getSessionGit(sess.id);
     const git = `${g?.branch ?? ""}:${g?.dirty ?? 0}:${g?.ahead ?? 0}:${g?.behind ?? 0}`;
-    return `${sess.id}${sess.name}${sess.pane_count}${hottest(states)}${git}`;
+    // PR/CI folded in so a PR open/close or CI state flip rebuilds the chip
+    // exactly once. Paired with setSessionPrCi's change-gate, a steady PR
+    // keeps the same string → zero rebuilds.
+    const pc = getSessionPrCi(sess.id);
+    const prCi = `:${pc?.pr_number ?? ""}:${pc?.ci_state ?? ""}`;
+    return `${sess.id}${sess.name}${sess.pane_count}${hottest(states)}${git}${prCi}`;
   });
   return `c:${s.railCollapsed ? 1 : 0}|[${rows.join("")}]`;
 }
@@ -130,7 +135,7 @@ export function renderRail(root: HTMLElement): void {
           "span",
           { class: "rail-name" },
           nameSpan,
-          gitChip(getSessionGit(sess.id)),
+          gitChip(getSessionGit(sess.id), getSessionPrCi(sess.id)),
           h("span", { class: "rail-pane-count" }, `${sess.pane_count}`),
         ),
       closeBtn,
@@ -185,13 +190,17 @@ function heatDot(state: PaneState): HTMLElement {
 
 /**
  * Compact per-session git chip: `⎇ <branch>` always, then `●<dirty>` / `↑<ahead>`
- * / `↓<behind>` only when each is non-zero. Returns null when git is unknown (not
- * a repo, or not polled yet) so the row carries no chip — lives inside `.rail-name`
- * so it hides with the rail when collapsed. Long branch names truncate via CSS
- * (`.git-branch` max-width + ellipsis), never JS. Display-only — no handlers. The
- * `title` carries the full detail for hover.
+ * / `↓<behind>` only when each is non-zero. When `prCi` is present and has a
+ * `pr_number`, appends `#<n>` + a colored CI-state dot (hidden when ci_state is
+ * "none"). Returns null when git is unknown (not a repo, or not polled yet) so
+ * the row carries no chip. Lives inside `.rail-name` so it hides when collapsed.
+ * Long branch names truncate via CSS (`.git-branch` max-width + ellipsis), never
+ * JS. Display-only — no handlers. The `title` carries the full detail for hover.
  */
-function gitChip(git: GitInfo | undefined): HTMLElement | null {
+function gitChip(
+  git: GitInfo | undefined,
+  prCi: PrCiInfo | undefined,
+): HTMLElement | null {
   if (!git) return null;
   const detail =
     git.branch +
@@ -204,5 +213,13 @@ function gitChip(git: GitInfo | undefined): HTMLElement | null {
     git.dirty > 0 && h("span", { class: "git-dirty" }, `●${git.dirty}`),
     git.ahead > 0 && h("span", { class: "git-ahead" }, `↑${git.ahead}`),
     git.behind > 0 && h("span", { class: "git-behind" }, `↓${git.behind}`),
+    // PR/CI extension — both hidden when prCi is absent (null/undefined)
+    prCi !== undefined && prCi.pr_number !== null &&
+      h("span", { class: "git-pr-number" }, `#${prCi.pr_number}`),
+    prCi !== undefined && prCi.ci_state !== "none" &&
+      h("span", {
+        class: `git-ci-dot git-ci-${prCi.ci_state}`,
+        title: prCi.ci_state,
+      }, "●"),
   );
 }

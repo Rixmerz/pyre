@@ -346,6 +346,20 @@ button {
 .git-behind {
   color: var(--fg-muted);
 }
+/* PR number and CI state dot — appended to the existing git chip when a PR is
+   open for this branch. ci_state "none" is never rendered (conditional in rail.ts). */
+.git-pr-number {
+  color: var(--fg-muted);
+  margin-left: 2px;
+}
+.git-ci-dot {
+  font-size: 8px;
+  line-height: 1;
+}
+.git-ci-success { color: var(--ok); }
+.git-ci-failure { color: var(--error); }
+.git-ci-pending,
+.git-ci-running  { color: var(--warn); }
 .rail-close {
   position: relative;
   display: inline-flex;

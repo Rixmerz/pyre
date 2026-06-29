@@ -35,6 +35,7 @@ import {
 import { newSession } from "./actions";
 import { loadGitHubAccount } from "./github-link";
 import { startGitPolling } from "./git-poll";
+import { startPrCiPolling } from "./pr-ci-poll";
 import {
   disposePaneTerminal,
   refitAll,
@@ -213,6 +214,9 @@ async function boot(): Promise<void> {
   // sessions are in state each 3 s tick, so it works whether we booted connected
   // or pick sessions up after a later reconnect — same pattern as startPidPoll.
   startGitPolling();
+  // PR / CI chip poll. Slow (30 s) to respect GitHub rate limits; also fires
+  // immediately on session/branch change via a state subscription.
+  startPrCiPolling();
   window.addEventListener("resize", () => refitAll());
 }
 

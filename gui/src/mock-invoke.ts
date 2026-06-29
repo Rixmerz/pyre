@@ -30,6 +30,7 @@ import type {
   PaneStateInfo,
   PidInfo,
   PollEventsResult,
+  PrCiInfo,
   SessionInfo,
   ThemeMeta,
   ThemePalette,
@@ -1184,6 +1185,33 @@ function handle(s: MockState, cmd: string, a: Args): unknown {
     case "github_disconnect":
       s.github.authorized = false;
       return undefined;
+
+    // ── PR / CI status ──
+    // Vary by branch so the demo shows different CI states across sessions.
+    // `null` is intentionally never returned — the chip is always visible in the
+    // mock so a developer opening http://127.0.0.1:1420/ can see it without a token.
+    case "github_pr_ci": {
+      const branch = optStr(a, "branch") ?? "";
+      if (branch === "feat/windows") {
+        return {
+          pr_number: 41,
+          pr_url: "https://github.com/rixmerz/pyre/pull/41",
+          ci_state: "running",
+        } satisfies PrCiInfo;
+      }
+      if (branch === "main") {
+        return {
+          pr_number: 42,
+          pr_url: "https://github.com/rixmerz/pyre/pull/42",
+          ci_state: "success",
+        } satisfies PrCiInfo;
+      }
+      return {
+        pr_number: 43,
+        pr_url: "https://github.com/rixmerz/pyre/pull/43",
+        ci_state: "pending",
+      } satisfies PrCiInfo;
+    }
 
     // ── Lifecycle long-poll ──
     case "poll_events": {

@@ -18,6 +18,7 @@ import type {
   PaneStateInfo,
   PidInfo,
   PollEventsResult,
+  PrCiInfo,
   PtyOutputPayload,
   SessionInfo,
   SplitOrient,
@@ -204,6 +205,17 @@ export const githubAccount = (): Promise<GhAccount | null> =>
 /** Forget the LOCAL token (does NOT revoke the grant server-side — see the
  *  "Manage on GitHub" link the account menu surfaces). */
 export const githubDisconnect = (): Promise<void> => invoke("github_disconnect");
+
+/**
+ * Fetch the open PR + latest CI run state for a branch.
+ * Returns `null` when no token, no remote, no PR found, 401, or any error —
+ * callers hide the chip entirely on null. The cwd is derived from
+ * `inspect_pid(pane) → env → PWD`; branch comes from `git_status`.
+ */
+export const githubPrCi = (
+  cwd: string,
+  branch: string,
+): Promise<PrCiInfo | null> => invoke("github_pr_ci", { cwd, branch });
 
 // ── Lifecycle events (long-poll) ─────────────────────────────────────────────
 /**

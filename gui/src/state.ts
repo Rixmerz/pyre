@@ -9,6 +9,7 @@ import type {
   GitInfo,
   LayoutNode,
   PaneStateInfo,
+  PrCiInfo,
   SessionInfo,
   ThemeMeta,
   WindowInfo,
@@ -94,6 +95,15 @@ export interface AppState {
    */
   gitBySession: Map<string, GitInfo>;
 
+  /**
+   * Per-session PR / CI status, keyed by session id. Absent key ⇒ not yet
+   * fetched ⇒ chip hidden. Mutated only via `setSessionPrCi`, which is
+   * change-gated (mirrors `setSessionGit`) so the 30 s poll never triggers a
+   * render rebuild when the PR state is unchanged. `null` from the Tauri command
+   * deletes the key (no-token / no-PR / error → chip hidden).
+   */
+  prCiBySession: Map<string, PrCiInfo>;
+
   // Block panel search
   blockQuery: string;
   searchResults: Block[] | null; // null = not searching, show live blocks
@@ -136,6 +146,7 @@ const state: AppState = {
   blocksLoading: false,
   pidReadout: null,
   gitBySession: new Map(),
+  prCiBySession: new Map(),
   blockQuery: "",
   searchResults: null,
   blocksFailuresOnly: false,
@@ -236,6 +247,36 @@ export function setSessionGit(session: string, git: GitInfo | null): void {
   if (!gitChanged(state.gitBySession.get(session), git)) return;
   if (git === null) state.gitBySession.delete(session);
   else state.gitBySession.set(session, git);
+  notify();
+}
+
+/** PR / CI info for one session, if known (not yet polled / no PR ⇒ undefined). */
+export function getSessionPrCi(session: string): PrCiInfo | undefined {
+  return state.prCiBySession.get(session);
+}
+
+/** True when two PrCiInfo snapshots differ on any rendered field (null vs present counts). */
+function prCiChanged(a: PrCiInfo | undefined, b: PrCiInfo | null): boolean {
+  if (a == null && b == null) return false;
+  if (a == null || b == null) return true;
+  return (
+    a.pr_number !== b.pr_number ||
+    a.ci_state !== b.ci_state ||
+    a.pr_url !== b.pr_url
+  );
+}
+
+/**
+ * Set (or clear, on `null`) a session's PR / CI status. CHANGE-GATED: compares
+ * the three rendered fields against the stored value and returns WITHOUT notifying
+ * when nothing moved — mirrors `setSessionGit` so the 30 s poll never rebuilds the
+ * rail on a no-op tick. A genuine change mutates the map and calls notify().
+ * `null` deletes the key (no chip).
+ */
+export function setSessionPrCi(session: string, prCi: PrCiInfo | null): void {
+  if (!prCiChanged(state.prCiBySession.get(session), prCi)) return;
+  if (prCi === null) state.prCiBySession.delete(session);
+  else state.prCiBySession.set(session, prCi);
   notify();
 }
 

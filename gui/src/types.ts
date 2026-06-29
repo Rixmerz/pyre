@@ -215,6 +215,22 @@ export interface PollEventsResult {
   last_seq: number;
 }
 
+// ── PR / CI status (GitHub) ───────────────────────────────────────────────────
+
+/** CI run state reported by `github_pr_ci`. */
+export type CiState = "success" | "failure" | "pending" | "running" | "none";
+
+/**
+ * PR and CI info for a branch from `github_pr_ci(cwd, branch)`.
+ * The Tauri command returns this or `null` when no token / no remote / no PR /
+ * 401 / any error — in all null cases the chip is hidden entirely.
+ */
+export interface PrCiInfo {
+  pr_number: number | null;
+  pr_url: string | null;
+  ci_state: CiState;
+}
+
 // ── GitHub account linking (OAuth App + Device Flow) ──────────────────────────
 // The device flow + keychain + GitHub REST calls live in the Tauri Rust layer
 // (gui/src-tauri/src/github.rs, owned by a parallel agent); the GUI codes against
