@@ -209,8 +209,8 @@ export const githubDisconnect = (): Promise<void> => invoke("github_disconnect")
 /**
  * Fetch the open PR + latest CI run state for a branch.
  * Returns `null` when no token, no remote, no PR found, 401, or any error —
- * callers hide the chip entirely on null. The cwd is derived from
- * `inspect_pid(pane) → env → PWD`; branch comes from `git_status`.
+ * callers hide the chip entirely on null. Both `cwd` and `branch` come from a
+ * single `git_status(session)` call (`GitInfo.cwd` / `GitInfo.branch`, proto v7).
  */
 export const githubPrCi = (
   cwd: string,

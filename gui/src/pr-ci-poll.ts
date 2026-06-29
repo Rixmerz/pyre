@@ -6,20 +6,14 @@
 //     once for the active session whenever the focused session id or its branch
 //     changes, so the chip is live the moment the user switches to a PR branch.
 //
-// CWD derivation: `inspect_pid(pane)` → env → PWD entry. The same inspect_pid
-// path already powers the statusbar process readout, so it is proven reliable in
-// both mock (always returns /home/dev/pyre) and against real pyred. A missing PWD
-// entry or a failed inspect_pid silently skips the session for this tick and
-// leaves the prior chip value intact — no flicker on transient errors.
+// CWD source: `git_status(session)` now carries the resolved working directory
+// (`GitInfo.cwd`, proto v7), so both the branch and the cwd come from the SAME
+// call the poller already makes — no separate `inspect_pid` → env → PWD step.
+// When `git_status` reports no cwd (null/absent) the session is skipped for the
+// tick and the prior chip value is left intact — no flicker on transient gaps.
 
-import { githubPrCi, inspectPid } from "./api";
-import {
-  getSessionGit,
-  getState,
-  panesOfSession,
-  setSessionPrCi,
-  subscribe,
-} from "./state";
+import { githubPrCi } from "./api";
+import { getSessionGit, getState, setSessionPrCi, subscribe } from "./state";
 
 /** 30 s minimum between full sweeps — GitHub rate-limit friendly. */
 const PR_CI_POLL_MS = 30_000;
@@ -39,28 +33,16 @@ let lastActiveKey = "";
 /**
  * Fetch PR/CI for one session and store it change-gated. Silently skips when:
  *  - no git info yet (branch unknown),
- *  - no pane available to inspect for PWD,
- *  - inspect_pid rejects or env lacks PWD,
+ *  - git_status reports no cwd (not a repo / cwd unresolved) — never calls
+ *    github_pr_ci with an empty cwd; the chip stays hidden,
  *  - github_pr_ci rejects (keeps prior chip value).
  */
 async function pollSession(sessId: string): Promise<void> {
   const git = getSessionGit(sessId);
   if (!git) return;
 
-  const panes = panesOfSession(sessId);
-  const paneId = panes[0]?.pane;
-  if (!paneId) return;
-
-  let cwd: string;
-  try {
-    const pidInfo = await inspectPid(paneId);
-    const entry = pidInfo.env.find(([k]) => k === "PWD");
-    if (!entry) return;
-    cwd = entry[1];
-  } catch {
-    // inspect_pid missing or pane gone — skip silently.
-    return;
-  }
+  const cwd = git.cwd;
+  if (!cwd) return; // no resolved cwd → skip, do not call github_pr_ci
 
   try {
     const prCi = await githubPrCi(cwd, git.branch);

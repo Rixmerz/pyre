@@ -104,6 +104,12 @@ export interface GitInfo {
   ahead: number;
   behind: number;
   upstream: string | null;
+  /**
+   * Absolute working directory `git status` ran in (proto v7). `null`/absent
+   * when the cwd could not be resolved. The PR/CI poller uses this as the cwd
+   * for `github_pr_ci` — no separate `inspect_pid` → PWD lookup.
+   */
+  cwd?: string | null;
 }
 
 /** A command block from `list_blocks(pane)` / `search_blocks(...)`. */
