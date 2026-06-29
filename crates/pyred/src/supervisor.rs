@@ -3222,3 +3222,79 @@ async fn handle_public_conn(
         other => anyhow::bail!("unknown mode tag {other:#04x}"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shard::ENV_TEST_LOCK as ENV_LOCK;
+    use tempfile::TempDir;
+    use uuid::Uuid;
+
+    /// Teardown invariant: on the shutdown drain, EVERY in-progress block is
+    /// finalized (ended_at set) — including a block whose `BlobWriter::open`
+    /// failed at `CommandStart`. Such a block lives in `block_meta`/`stdout_bufs`
+    /// but NOT in `writers`. If the drain only walks `writers`, that block stays
+    /// `ended_at IS NULL` forever — a ghost "running" block. The authoritative
+    /// set of open blocks is `block_meta`, not `writers`.
+    #[tokio::test]
+    async fn finalize_open_blocks_finalizes_writerless_block() -> Result<()> {
+        let _g = ENV_LOCK.lock().await;
+        let tmp = TempDir::new()?;
+        // SAFETY: test-only env mutation, serialized by ENV_LOCK (shared with
+        // the store/shard/migration tests that mutate process-global env).
+        unsafe {
+            std::env::set_var("PYRE_DATA_DIR", tmp.path());
+        }
+        let store = Arc::new(Store::open().await?);
+        let block_index = Arc::new(BlockIndex::open(&tmp.path().join("index"))?);
+
+        let sid = SessionId(Uuid::new_v4());
+        let pid = PaneId(Uuid::new_v4());
+        let bid = BlockId(Uuid::new_v4());
+        store.upsert_session(sid, "test").await?;
+        store.upsert_pane(pid, sid, "/bin/sh", None, 80, 24).await?;
+
+        // CommandStart succeeded in creating the block (ended_at = NULL) but the
+        // blob-open failed, so no writer was inserted for it.
+        let block = Block {
+            id: bid,
+            pane: pid,
+            session: sid,
+            command: "long-running".into(),
+            cwd: None,
+            started_at: Utc::now(),
+            ended_at: None,
+            exit_code: None,
+            stdout_len: 0,
+        };
+        store.create_block(&block).await?;
+
+        // Precondition: the block is a ghost (in-progress, ended_at NULL).
+        let before = store.list_blocks(Some(sid), 10).await?;
+        assert_eq!(before.len(), 1);
+        assert!(
+            before[0].ended_at.is_none(),
+            "precondition: block must start in-progress"
+        );
+
+        // Parser state shaped like a blob-open failure: present in block_meta +
+        // stdout_bufs, absent from writers.
+        let mut state = PaneParserState::new(sid);
+        state.block_meta.insert(bid, block.clone());
+        state.stdout_bufs.insert(bid, Vec::new());
+        let mut pane_parsers: HashMap<(String, u32), PaneParserState> = HashMap::new();
+        pane_parsers.insert((sid.0.to_string(), 0), state);
+
+        // Drain (the shutdown path that runs when the event channel closes).
+        finalize_open_blocks(&mut pane_parsers, &store, &block_index).await;
+
+        // Invariant: no ghost block survives the drain.
+        let after = store.list_blocks(Some(sid), 10).await?;
+        assert_eq!(after.len(), 1);
+        assert!(
+            after[0].ended_at.is_some(),
+            "block must be finalized on drain even without a BlobWriter — no ghost running block"
+        );
+        Ok(())
+    }
+}
