@@ -2139,6 +2139,9 @@ struct SupervisorWorkerImpl {
     /// remove the entry without holding `window_store` across an await.
     pane_window_map: Arc<Mutex<HashMap<PaneId, WindowId>>>,
     store: Arc<crate::store::Store>,
+    /// Signal channel to the block-event batcher: finalize open blocks for
+    /// (session_id, slot_idx) when a pane closes mid-command.
+    finalize_tx: mpsc::Sender<(String, u32)>,
 }
 
 impl SupervisorWorker for SupervisorWorkerImpl {
@@ -2264,6 +2267,15 @@ impl SupervisorWorker for SupervisorWorkerImpl {
             self.pane_event_bus
                 .emit(pane_id, PaneEventKind::Closed, None);
         }
+
+        // Ask the block-event batcher to finalize any open block for this pane
+        // (e.g. a command that was running when the pane closed with no OSC-133;D
+        // marker). Best-effort: if the channel is full or already closed the
+        // daemon-shutdown drain will still finalize it at process exit.
+        let _ = self
+            .finalize_tx
+            .try_send((session_id.clone(), slot_idx));
+
         Ok(())
     }
 
@@ -2330,6 +2342,7 @@ impl PaneParserState {
 
 async fn block_event_batcher(
     mut event_rx: mpsc::Receiver<BlockEvent>,
+    mut finalize_rx: mpsc::Receiver<(String, u32)>,
     block_index: Arc<BlockIndex>,
     store: Arc<Store>,
     registry: Arc<WorkerRegistry>,
@@ -2362,6 +2375,19 @@ async fn block_event_batcher(
                 if !evs.is_empty() {
                     for ev in evs {
                         process_raw_event(ev, &mut pane_parsers, &store, &block_index, &registry).await;
+                    }
+                }
+            }
+            maybe_fin = finalize_rx.recv() => {
+                if let Some(key) = maybe_fin {
+                    // Flush any buffered events first so the pane's blocks are
+                    // processed before we finalize its open state.
+                    let evs = std::mem::take(&mut pending);
+                    for ev in evs {
+                        process_raw_event(ev, &mut pane_parsers, &store, &block_index, &registry).await;
+                    }
+                    if let Some(state) = pane_parsers.get_mut(&key) {
+                        finalize_one_pane_state(state, &store, &block_index).await;
                     }
                 }
             }
@@ -2518,6 +2544,47 @@ async fn process_raw_event(
     }
 }
 
+/// Finalize all in-progress blocks for a single pane parser state (best-effort).
+///
+/// `block_meta` is the authoritative set of in-progress blocks: every
+/// CommandStart inserts here. `writers` is a SUBSET — a block whose
+/// `BlobWriter::open` failed has meta but no writer. Drain from `block_meta`
+/// so those writer-less blocks are still finalized; otherwise they stay
+/// `ended_at IS NULL` forever (ghost "running" block).
+/// No-op when the state has no open blocks (safe to call unconditionally).
+async fn finalize_one_pane_state(
+    state: &mut PaneParserState,
+    store: &Arc<Store>,
+    block_index: &Arc<BlockIndex>,
+) {
+    let open_blocks: Vec<pyre_proto::BlockId> = state.block_meta.keys().cloned().collect();
+    for block in open_blocks {
+        let stdout_len = if let Some(bw) = state.writers.remove(&block) {
+            tokio::task::spawn_blocking(move || bw.close().unwrap_or(0))
+                .await
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        // IGNORED: finalize_block error is best-effort; acceptable data loss.
+        let _ = store
+            .finalize_block(block, Utc::now(), None, stdout_len)
+            .await;
+        let stdout_text = state
+            .stdout_bufs
+            .remove(&block)
+            .and_then(|b| String::from_utf8(b).ok())
+            .unwrap_or_default();
+        if let Some(meta) = state.block_meta.remove(&block) {
+            let idx = block_index.clone();
+            tokio::task::spawn_blocking(move || {
+                // IGNORED: Tantivy index error is best-effort; block is in SQLite.
+                let _ = idx.add_block(&meta, &stdout_text);
+            });
+        }
+    }
+}
+
 /// Finalize any in-progress blocks (best-effort on shutdown).
 async fn finalize_open_blocks(
     pane_parsers: &mut HashMap<(String, u32), PaneParserState>,
@@ -2525,40 +2592,7 @@ async fn finalize_open_blocks(
     block_index: &Arc<BlockIndex>,
 ) {
     for state in pane_parsers.values_mut() {
-        // `block_meta` is the authoritative set of in-progress blocks: every
-        // CommandStart inserts here. `writers` is a SUBSET — a block whose
-        // `BlobWriter::open` failed has meta but no writer. Drain from
-        // `block_meta` so those writer-less blocks are still finalized;
-        // otherwise they stay `ended_at IS NULL` forever (ghost "running"
-        // block). See `finalize_open_blocks_finalizes_writerless_block`.
-        let open_blocks: Vec<pyre_proto::BlockId> = state.block_meta.keys().cloned().collect();
-        for block in open_blocks {
-            let stdout_len = if let Some(bw) = state.writers.remove(&block) {
-                tokio::task::spawn_blocking(move || bw.close().unwrap_or(0))
-                    .await
-                    .unwrap_or(0)
-            } else {
-                0
-            };
-            // IGNORED: finalize_block error on shutdown drain is best-effort;
-            // acceptable data loss during process teardown.
-            let _ = store
-                .finalize_block(block, Utc::now(), None, stdout_len)
-                .await;
-            let stdout_text = state
-                .stdout_bufs
-                .remove(&block)
-                .and_then(|b| String::from_utf8(b).ok())
-                .unwrap_or_default();
-            if let Some(meta) = state.block_meta.remove(&block) {
-                let idx = block_index.clone();
-                tokio::task::spawn_blocking(move || {
-                    // IGNORED: Tantivy index error on shutdown drain is best-effort;
-                    // the block is already persisted in SQLite.
-                    let _ = idx.add_block(&meta, &stdout_text);
-                });
-            }
-        }
+        finalize_one_pane_state(state, store, block_index).await;
     }
 }
 
@@ -2675,6 +2709,9 @@ pub async fn run(
     }
 
     let (event_tx, event_rx) = mpsc::channel::<BlockEvent>(4096);
+    // Finalize signals: (session_id, slot_idx) sent by pane_closed so the
+    // block-event batcher can finalize that pane's open blocks immediately.
+    let (finalize_tx, finalize_rx) = mpsc::channel::<(String, u32)>(256);
     let registry = Arc::new(WorkerRegistry::new());
     let mirror_registry = PaneMirrorRegistry::new();
 
@@ -2722,6 +2759,7 @@ pub async fn run(
 
     tokio::spawn(block_event_batcher(
         event_rx,
+        finalize_rx,
         block_index.clone(),
         store.clone(),
         registry.clone(),
@@ -2738,6 +2776,7 @@ pub async fn run(
         let sw_window_store = window_store.clone();
         let sw_pane_window_map = pane_window_map.clone();
         let sw_store = store.clone();
+        let sw_finalize_tx = finalize_tx.clone();
         tokio::spawn(async move {
             loop {
                 match sw_listener.accept().await {
@@ -2750,6 +2789,7 @@ pub async fn run(
                             window_store: sw_window_store.clone(),
                             pane_window_map: sw_pane_window_map.clone(),
                             store: sw_store.clone(),
+                            finalize_tx: sw_finalize_tx.clone(),
                         };
                         let transport = tarpc::serde_transport::new(
                             Framed::new(sock, LengthDelimitedCodec::new()),
@@ -3294,6 +3334,74 @@ mod tests {
         assert!(
             after[0].ended_at.is_some(),
             "block must be finalized on drain even without a BlobWriter — no ghost running block"
+        );
+        Ok(())
+    }
+
+    /// Pane-close invariant: when a pane closes mid-command (no OSC-133;D end
+    /// marker), `finalize_one_pane_state` must finalize that pane's open
+    /// block(s) with `ended_at` set, even if the BlobWriter was never opened
+    /// (blob-open failure path).  Ghost "running" blocks must not survive a
+    /// pane close.
+    #[tokio::test]
+    async fn finalize_pane_blocks_on_pane_close() -> Result<()> {
+        let _g = ENV_LOCK.lock().await;
+        let tmp = TempDir::new()?;
+        // SAFETY: test-only env mutation, serialized by ENV_LOCK.
+        unsafe {
+            std::env::set_var("PYRE_DATA_DIR", tmp.path());
+        }
+        let store = Arc::new(Store::open().await?);
+        let block_index = Arc::new(BlockIndex::open(&tmp.path().join("index"))?);
+
+        let sid = SessionId(Uuid::new_v4());
+        let pid = PaneId(Uuid::new_v4());
+        let bid = BlockId(Uuid::new_v4());
+        store.upsert_session(sid, "test").await?;
+        store.upsert_pane(pid, sid, "/bin/sh", None, 80, 24).await?;
+
+        // CommandStart created the block (ended_at = NULL); pane closes before
+        // OSC-133;D arrives so no BlockEnd event ever fires.
+        let block = Block {
+            id: bid,
+            pane: pid,
+            session: sid,
+            command: "long-running".into(),
+            cwd: None,
+            started_at: Utc::now(),
+            ended_at: None,
+            exit_code: None,
+            stdout_len: 0,
+        };
+        store.create_block(&block).await?;
+
+        // Precondition: block is in-progress.
+        let before = store.list_blocks(Some(sid), 10).await?;
+        assert!(
+            before[0].ended_at.is_none(),
+            "precondition: block must be in-progress before pane close"
+        );
+
+        // Build parser state as the batcher would have it at the moment of close:
+        // block_meta present, no writer (simulates blob-open failure — worst case).
+        let mut state = PaneParserState::new(sid);
+        state.block_meta.insert(bid, block.clone());
+        state.stdout_bufs.insert(bid, Vec::new());
+
+        // Simulate the batcher receiving a finalize signal for this pane.
+        finalize_one_pane_state(&mut state, &store, &block_index).await;
+
+        // Invariant: open block must be finalized (ended_at NOT NULL).
+        let after = store.list_blocks(Some(sid), 10).await?;
+        assert_eq!(after.len(), 1);
+        assert!(
+            after[0].ended_at.is_some(),
+            "block must be finalized on pane close — no ghost running block"
+        );
+        // block_meta must be drained (no double-finalize on the next shutdown drain).
+        assert!(
+            state.block_meta.is_empty(),
+            "block_meta must be empty after finalize — guard against double-finalize"
         );
         Ok(())
     }
