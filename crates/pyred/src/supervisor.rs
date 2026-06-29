@@ -1994,25 +1994,48 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
 
     /// Resolve git status for a session in hybrid mode.
     ///
-    /// Worker pane child PIDs are not forwarded to the supervisor over the
-    /// WorkerControl protocol, so `/proc/<pid>/cwd` is unavailable here.
-    /// Fall back to the session's spawn cwd recorded at `spawn()` time.
-    ///
-    /// ponytail: the spawn-cwd fallback does not track `cd` within the pane;
-    /// the chip reflects the session's starting directory until live-cwd
-    /// forwarding from the worker is implemented (future work).
+    /// Asks the session's worker for the live pane cwd via `pane_cwd` RPC,
+    /// which reads `/proc/<child_pid>/cwd` and therefore follows `cd` in real
+    /// time.  Falls back to the spawn cwd recorded at `spawn()` time so the
+    /// chip is always available even before the first `pane_cwd` round-trip
+    /// succeeds (e.g. worker still starting) or when the worker is unreachable.
     async fn git_status(
         self,
         _ctx: context::Context,
         session: SessionId,
     ) -> Result<Option<GitInfo>, PyreError> {
         let session_id_str = session.0.to_string();
-        let cwd = self
-            .spawn_cwds
-            .lock()
-            .await
-            .get(&session_id_str)
-            .cloned();
+
+        // Attempt to get the live cwd from the worker via pane_cwd RPC.
+        let live_cwd: Option<PathBuf> = 'live: {
+            let ctrl_client = self.registry.get_ctrl_client(&session_id_str).await;
+            let Some(ctrl_client) = ctrl_client else {
+                break 'live None;
+            };
+            // Pick the first live slot — mirrors server.rs:692-694 pattern.
+            let slots = match ctrl_client.list_panes(context::current()).await {
+                Ok(Ok(s)) => s,
+                _ => break 'live None,
+            };
+            let Some(slot_idx) = slots.into_iter().next() else {
+                break 'live None;
+            };
+            match ctrl_client.pane_cwd(context::current(), slot_idx).await {
+                Ok(Ok(Some(path_str))) => Some(PathBuf::from(path_str)),
+                _ => None,
+            }
+        };
+
+        // Fall back to the spawn cwd so there is always a path to run git in.
+        let cwd = if live_cwd.is_some() {
+            live_cwd
+        } else {
+            self.spawn_cwds
+                .lock()
+                .await
+                .get(&session_id_str)
+                .cloned()
+        };
         let Some(cwd) = cwd else {
             return Ok(None);
         };

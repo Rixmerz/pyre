@@ -759,6 +759,32 @@ impl WorkerControl for WorkerControlImpl {
             .await
             .map_err(|e| RpcError::Internal(e.to_string()))
     }
+
+    async fn pane_cwd(
+        self,
+        _ctx: context::Context,
+        slot_idx: u32,
+    ) -> Result<Option<String>, RpcError> {
+        let child_pid = {
+            let panes = self.state.panes.read().await;
+            match panes.get(&slot_idx) {
+                Some(h) => h.child_pid,
+                None => return Ok(None),
+            }
+        }; // panes read guard dropped here
+        #[cfg(unix)]
+        {
+            match std::fs::read_link(format!("/proc/{child_pid}/cwd")) {
+                Ok(p) => Ok(Some(p.to_string_lossy().into_owned())),
+                Err(_) => Ok(None),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = child_pid;
+            Ok(None)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
