@@ -55,9 +55,9 @@
      focus / split. Ambient loops (tab-dot-pulse, heat-pulse, spin) and the
      informational heat colour fade keep their own longer timings and are NOT
      tokenized to these interaction durations. */
-  --dur-fast: 120ms; /* hover, pressed, focus glow, small feedback */
-  --dur-base: 180ms; /* tabs, panels, overlays, focus move */
-  --dur-slow: 240ms; /* large entrances (palette) */
+  --dur-fast:  90ms; /* hover, pressed, focus glow, small feedback */
+  --dur-base: 140ms; /* tabs, panels, overlays, focus move */
+  --dur-slow: 200ms; /* large entrances (palette) */
   --dur-heat: 0.4s; /* informational agent-state colour fade (value unchanged) */
   --ease-standard: cubic-bezier(0.2, 0, 0, 1);
   --ease-emphasized: cubic-bezier(0.3, 0, 0, 1); /* signature: focus / split */
