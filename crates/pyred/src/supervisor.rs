@@ -507,6 +507,13 @@ pub struct SupervisorImpl {
     /// pane close. Shared with `SupervisorWorkerImpl` so `pane_closed` can prune
     /// ghost leaves without re-querying the window store.
     pub pane_window_map: Arc<Mutex<HashMap<PaneId, WindowId>>>,
+    /// Spawn cwd per session — recorded at `spawn()` time so `git_status` can
+    /// fall back to it in hybrid mode where the worker PIDs are not available.
+    ///
+    /// ponytail: in hybrid mode we cannot follow `cd` within the pane; the
+    /// chip reflects the directory the session was started in until we add
+    /// live-cwd forwarding from the worker over WorkerControl.
+    pub spawn_cwds: Arc<Mutex<HashMap<String, PathBuf>>>,
 }
 
 impl SupervisorImpl {
@@ -602,6 +609,9 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
         // first stream connection returns "pane not found slot_idx=0" and the
         // worker immediately exits (all panes closed), causing a respawn loop.
         let shell = req.shell.clone().unwrap_or_default();
+        // Capture spawn cwd before consuming req.cwd — used as the git_status
+        // fallback in hybrid mode (worker PIDs are not visible to the supervisor).
+        let spawn_cwd_pb: Option<PathBuf> = req.cwd.clone();
         let cwd = req
             .cwd
             .map(|p| p.to_string_lossy().into_owned())
@@ -620,6 +630,14 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
             .await
             .map_err(|e| PyreError::SpawnFailed(e.to_string()))?
             .map_err(|e| PyreError::SpawnFailed(e.to_string()))?;
+
+        // Store the spawn cwd so git_status can fall back to it in hybrid mode.
+        if let Some(pb) = spawn_cwd_pb {
+            self.spawn_cwds
+                .lock()
+                .await
+                .insert(session_id_str.clone(), pb);
+        }
 
         let pane_id = PaneId(pane_uuid);
 
@@ -1974,16 +1992,31 @@ impl pyre_proto::service::PyreDaemon for SupervisorImpl {
         self.window_single_leaf_fallback(session_id, &id_str).await
     }
 
-    /// In hybrid mode the pane child PIDs live inside worker processes and are
-    /// not forwarded to the supervisor over the WorkerControl protocol. We
-    /// therefore cannot resolve `/proc/<pid>/cwd` here. Return `None` so the
-    /// caller hides the git chip rather than showing an error.
+    /// Resolve git status for a session in hybrid mode.
+    ///
+    /// Worker pane child PIDs are not forwarded to the supervisor over the
+    /// WorkerControl protocol, so `/proc/<pid>/cwd` is unavailable here.
+    /// Fall back to the session's spawn cwd recorded at `spawn()` time.
+    ///
+    /// ponytail: the spawn-cwd fallback does not track `cd` within the pane;
+    /// the chip reflects the session's starting directory until live-cwd
+    /// forwarding from the worker is implemented (future work).
     async fn git_status(
         self,
         _ctx: context::Context,
-        _session: SessionId,
+        session: SessionId,
     ) -> Result<Option<GitInfo>, PyreError> {
-        Ok(None)
+        let session_id_str = session.0.to_string();
+        let cwd = self
+            .spawn_cwds
+            .lock()
+            .await
+            .get(&session_id_str)
+            .cloned();
+        let Some(cwd) = cwd else {
+            return Ok(None);
+        };
+        Ok(crate::git::git_info(&cwd).await)
     }
 }
 
@@ -2652,6 +2685,8 @@ pub async fn run(
     let pane_window_map: Arc<Mutex<HashMap<PaneId, WindowId>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
+    let spawn_cwds: Arc<Mutex<HashMap<String, PathBuf>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     let supervisor_impl = SupervisorImpl {
         registry: registry.clone(),
         store: store.clone(),
@@ -2665,6 +2700,7 @@ pub async fn run(
         window_store: window_store.clone(),
         session_windows: session_windows.clone(),
         pane_window_map: pane_window_map.clone(),
+        spawn_cwds: spawn_cwds.clone(),
     };
 
     // Bind the supervisor callback socket (workers dial here to register).
