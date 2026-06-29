@@ -16,6 +16,7 @@ import { disposePaneTerminal, mountedPanes } from "./terminals";
 import { maybeNotifyTransition, forgetPane } from "./notify";
 import { dlog } from "./debug";
 import { paneStatesEqual } from "./pane-state-eq";
+import { blocksStableEqual, hasRunningBlock } from "./blocks-eq";
 import type {
   LayoutNode,
   LifecycleEvent,
@@ -261,17 +262,36 @@ function stateLabel(state: string): string {
   }
 }
 
-/** Poll the focused pane's blocks into the store (drives the inspector). */
+/** Poll the focused pane's blocks into the store (drives the inspector).
+ *
+ *  CHANGE-GATED like `reloadPaneStates`: this runs every 750 ms, and an
+ *  unconditional `setState({ blocks })` was the single biggest idle re-render
+ *  driver (every tick → notify → renderAll → every region). We now notify ONLY
+ *  when:
+ *    (a) a STABLE block field moved (block added/removed/finished, command
+ *        changed, …) — `!blocksStableEqual`, OR
+ *    (b) ANY block is currently running — `hasRunningBlock`. A running block's
+ *        elapsed clock is NOT in the list fingerprint (it's patched in place by
+ *        `applyBlockElapsedInPlace`, which only runs inside `renderAll`), so we
+ *        MUST keep notifying every tick while one runs or the counter freezes.
+ *  When blocks are unchanged AND none is running, we skip `setState` entirely —
+ *  no notify, no renderAll, no rebuild. */
 export async function reloadFocusedBlocks(): Promise<void> {
   const pane = getState().focusedPane;
   if (!pane) {
-    setState({ blocks: [] });
+    // Gate the empty case too: only notify if blocks weren't already empty.
+    if (getState().blocks.length > 0) setState({ blocks: [] });
     return;
   }
   try {
     const blocks = await listBlocks(pane);
     // Newest-first: the daemon returns ascending; reverse for display.
     blocks.sort((a, b) => b.started_at.localeCompare(a.started_at));
+
+    const current = getState().blocks;
+    if (blocksStableEqual(current, blocks) && !hasRunningBlock(blocks)) {
+      return; // idle: identical blocks, nothing running — no re-render
+    }
     setState({ blocks });
   } catch (err) {
     console.error(`list_blocks(${pane}) failed:`, err);

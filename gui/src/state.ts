@@ -26,6 +26,27 @@ export interface GithubState {
   status: "idle" | "linking" | "authorized" | "error";
 }
 
+/**
+ * What the status bar's process line currently SHOWS for the focused pane — a
+ * distilled projection of `inspect_pid` (the daemon exposes process-tree metadata
+ * only: no CPU/mem). Null ⇒ no readout (no focus, disconnected, or the command
+ * degraded). Owned by the 2 s PID poll in `render/statusbar.ts`, which writes it
+ * CHANGE-GATED (mirrors `setSessionGit`): only when this projection actually moves
+ * does it call `setState`, so an idle poll tick on an unchanged process fires no
+ * `notify()` / `renderAll()`. The statusbar fingerprint reads exactly these fields
+ * — keep them in sync with what `processGroup()` renders.
+ */
+export interface PidReadout {
+  /** Pane the readout describes — a focus change invalidates a stale readout. */
+  pane: string;
+  /** Foreground process pid (shown as the proc group's title). */
+  pid: number;
+  /** Full process name; the line shows its basename, the title shows it whole. */
+  comm: string;
+  /** Number of child processes (the "N child/children" metric; 0 ⇒ omitted). */
+  childCount: number;
+}
+
 export interface AppState {
   // Connectivity
   connected: boolean;
@@ -57,6 +78,12 @@ export interface AppState {
   activeWindow: Map<string, string>;
   blocks: Block[]; // blocks for the focused pane, newest-first
   blocksLoading: boolean;
+
+  /**
+   * Distilled process readout for the focused pane (status bar process line).
+   * Written change-gated by the PID poll; null ⇒ no line. See `PidReadout`.
+   */
+  pidReadout: PidReadout | null;
 
   /**
    * Per-session git status, keyed by session id. Kept SEPARATE from `sessions`
@@ -107,6 +134,7 @@ const state: AppState = {
   activeWindow: new Map(),
   blocks: [],
   blocksLoading: false,
+  pidReadout: null,
   gitBySession: new Map(),
   blockQuery: "",
   searchResults: null,
