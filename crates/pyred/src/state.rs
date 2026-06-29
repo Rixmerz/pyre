@@ -37,6 +37,17 @@ pub enum Osc133Marker {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Tunable constants
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// How long a known agent must be silent before we declare it WaitingInput.
+///
+/// Claude Code emits spinner redraws every ~100 ms while thinking, so 15 s of
+/// silence is a reliable indicator that it has printed a prompt and stopped.
+/// Adjust upward if legitimate long-silent thinking causes false positives.
+const AGENT_IDLE_SECS: u64 = 15;
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Known sets
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -187,6 +198,31 @@ impl PaneStateTracker {
                     "shell prompt, idle > 2s".to_string(),
                 );
             }
+        }
+
+        // 3b. Known agent (not Unknown, not Shell) + idle > AGENT_IDLE_SECS → WaitingInput.
+        //
+        // This is the key heuristic for coding agents that don't emit OSC 133.
+        // Claude Code (and similar tools) continuously redraw a spinner/progress
+        // line while thinking — output flows at ~100 ms granularity.  Once they
+        // have printed a prompt and are waiting for the user to type, output stops
+        // entirely.  A 15-second silence is therefore a reliable "waiting" signal.
+        //
+        // Empirical note: Claude Code DOES keep emitting output while thinking
+        // (spinner redraws every ~100 ms), and goes fully silent only when it has
+        // printed the input prompt.  The AGENT_IDLE_SECS threshold therefore cleanly
+        // separates Running (thinking / tool-calling) from WaitingInput (idle at
+        // prompt).  If the threshold fires during a rare long silent computation,
+        // the next output byte immediately resets last_output_at, and the state
+        // returns to Running on the next tick — so false positives self-heal.
+        if self.agent != AgentKind::Unknown
+            && self.agent != AgentKind::Shell
+            && self.last_output_at.elapsed() > std::time::Duration::from_secs(AGENT_IDLE_SECS)
+        {
+            return self.apply(
+                PaneStateKind::WaitingInput,
+                format!("agent idle >{}s", AGENT_IDLE_SECS),
+            );
         }
 
         // 4. OSC 133 D > 5s ago with no new output → Idle.
@@ -453,6 +489,72 @@ mod tests {
         // That classified as Unknown — the bug we fixed by switching to direct_child.
         let kind = crate::agent_detect::classify_foreground("node");
         assert_eq!(kind, pyre_proto::AgentKind::Unknown);
+    }
+
+    // ── Fix (b): agent-aware idle → WaitingInput ──────────────────────────
+
+    #[test]
+    fn known_agent_idle_transitions_to_waiting_input() {
+        let mut t = make_tracker();
+        t.agent = pyre_proto::AgentKind::ClaudeCode;
+        // Simulate output that stopped AGENT_IDLE_SECS + 1 seconds ago.
+        t.last_output_at =
+            Instant::now() - std::time::Duration::from_secs(AGENT_IDLE_SECS + 1);
+        t.evaluate();
+        assert_eq!(
+            t.state,
+            PaneStateKind::WaitingInput,
+            "ClaudeCode idle >{AGENT_IDLE_SECS}s must transition to WaitingInput"
+        );
+    }
+
+    #[test]
+    fn unknown_agent_idle_stays_running() {
+        // AgentKind::Unknown must NOT trigger the agent idle rule — the pane
+        // might just be a plain shell or an unrecognized process.
+        let mut t = make_tracker();
+        t.agent = pyre_proto::AgentKind::Unknown;
+        t.last_output_at =
+            Instant::now() - std::time::Duration::from_secs(AGENT_IDLE_SECS + 1);
+        t.evaluate();
+        assert_eq!(
+            t.state,
+            PaneStateKind::Running,
+            "Unknown agent must not trigger agent idle rule"
+        );
+    }
+
+    #[test]
+    fn shell_agent_idle_stays_running_without_osc133() {
+        // AgentKind::Shell must NOT trigger the agent idle rule — shell idle
+        // detection uses OSC 133 A/B markers (rule 3), not the output-silence
+        // heuristic (rule 3b).
+        let mut t = make_tracker();
+        t.agent = pyre_proto::AgentKind::Shell;
+        t.foreground_cmd = Some("bash".to_string());
+        t.last_output_at =
+            Instant::now() - std::time::Duration::from_secs(AGENT_IDLE_SECS + 1);
+        // No OSC 133 marker — rule 3 won't fire either.
+        t.evaluate();
+        assert_eq!(
+            t.state,
+            PaneStateKind::Running,
+            "Shell agent without OSC 133 must not trigger agent idle rule"
+        );
+    }
+
+    #[test]
+    fn known_agent_recent_output_stays_running() {
+        // If output arrived less than AGENT_IDLE_SECS ago the rule must not fire.
+        let mut t = make_tracker();
+        t.agent = pyre_proto::AgentKind::ClaudeCode;
+        // last_output_at defaults to Instant::now() in new().
+        t.evaluate();
+        assert_eq!(
+            t.state,
+            PaneStateKind::Running,
+            "ClaudeCode with recent output must stay Running"
+        );
     }
 
     /// A `Mutex<PaneStateTracker>` whose guard was held by a panicking thread
