@@ -11,6 +11,7 @@
 #[path = "common.rs"]
 mod common;
 
+use std::os::unix::process::CommandExt as _;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
@@ -117,7 +118,10 @@ async fn run_cross_session_search() -> anyhow::Result<()> {
             .env("XDG_STATE_HOME", &state_dir)
             .env("XDG_CONFIG_HOME", tmpdir.path().join("config"))
             .env("PYRE_DATA_DIR", &state_dir)
-            .stderr(std::process::Stdio::piped())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
             .spawn()?,
     );
 
@@ -253,7 +257,10 @@ async fn run_worker_respawn() -> anyhow::Result<()> {
             .env("XDG_STATE_HOME", &state_dir)
             .env("XDG_CONFIG_HOME", tmpdir.path().join("config"))
             .env("PYRE_DATA_DIR", &state_dir)
-            .stderr(std::process::Stdio::piped())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
             .spawn()?,
     );
 
@@ -424,7 +431,10 @@ async fn run_close_pane_eviction() -> anyhow::Result<()> {
             .env("XDG_STATE_HOME", &state_dir)
             .env("XDG_CONFIG_HOME", tmpdir.path().join("config"))
             .env("PYRE_DATA_DIR", &state_dir)
-            .stderr(std::process::Stdio::piped())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
             .spawn()?,
     );
 
@@ -558,7 +568,10 @@ async fn run_hybrid_wait_pane() -> anyhow::Result<()> {
             .env("XDG_STATE_HOME", &state_dir)
             .env("XDG_CONFIG_HOME", tmpdir.path().join("config"))
             .env("PYRE_DATA_DIR", &state_dir)
-            .stderr(std::process::Stdio::piped())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
             .spawn()?,
     );
 
@@ -651,7 +664,10 @@ async fn run_hybrid_replay() -> anyhow::Result<()> {
             .env("XDG_STATE_HOME", &state_dir)
             .env("XDG_CONFIG_HOME", tmpdir.path().join("config"))
             .env("PYRE_DATA_DIR", &state_dir)
-            .stderr(std::process::Stdio::piped())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
             .spawn()?,
     );
 

@@ -9,6 +9,7 @@
 #[path = "common.rs"]
 mod common;
 
+use std::os::unix::process::CommandExt as _;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -79,8 +80,10 @@ async fn run_tantivy_test() -> anyhow::Result<()> {
         std::process::Command::new(env!("CARGO_BIN_EXE_pyred"))
             .env("XDG_RUNTIME_DIR", xdg_dir.path())
             .env("PYRE_DATA_DIR", data_dir.path())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
             .spawn()?,
     );
 

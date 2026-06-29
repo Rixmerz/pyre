@@ -3,12 +3,13 @@
 //! Each test spawns a fresh pyred process with isolated TempDir state.
 //! All tests have a 30-second outer timeout to prevent CI hangs.
 
+use std::os::unix::process::CommandExt as _;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
-use nix::sys::signal::{kill, Signal};
+use nix::sys::signal::{killpg, Signal};
 use nix::unistd::Pid;
 use pyre_proto::{
     write_control_client, InputFrame, OpenPaneReq, OutputFrame, PyreDaemonClient, SpawnReq,
@@ -34,8 +35,10 @@ struct PyredHandle {
 
 impl Drop for PyredHandle {
     fn drop(&mut self) {
-        let pid = Pid::from_raw(self.child.id() as i32);
-        kill(pid, Signal::SIGTERM).ok();
+        // Kill the entire process group (PGID == child PID when spawned with
+        // `.process_group(0)`) so worker descendants die with the supervisor.
+        let pgid = Pid::from_raw(self.child.id() as i32);
+        killpg(pgid, Signal::SIGTERM).ok();
         let _ = self.child.wait();
     }
 }
@@ -48,7 +51,10 @@ async fn spawn_pyred() -> anyhow::Result<(PyredHandle, PyreDaemonClient)> {
     let child = std::process::Command::new(env!("CARGO_BIN_EXE_pyred"))
         .env("XDG_RUNTIME_DIR", xdg_dir.path())
         .env("PYRE_DATA_DIR", data_dir.path())
-        .stderr(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
         .spawn()?;
 
     // Poll up to 3 s for socket.

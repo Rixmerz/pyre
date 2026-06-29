@@ -5,6 +5,7 @@
 #[path = "common.rs"]
 mod common;
 
+use std::os::unix::process::CommandExt as _;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -42,7 +43,10 @@ async fn run_smoke() -> anyhow::Result<()> {
         std::process::Command::new(env!("CARGO_BIN_EXE_pyred"))
             .env("XDG_RUNTIME_DIR", tmpdir.path())
             .env("PYRE_DATA_DIR", tmpdir.path())
-            .stderr(std::process::Stdio::piped())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
             .spawn()?,
     );
 
