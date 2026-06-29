@@ -63,7 +63,10 @@ fn read_env(pid: u32) -> Vec<(String, String)> {
             let key = parts.next()?.to_owned();
             let val_full = parts.next().unwrap_or("").to_owned();
             let val = if val_full.len() > 80 {
-                val_full[..80].to_owned()
+                // Use floor_char_boundary so we never split a multibyte
+                // codepoint (a byte-index slice would panic in that case).
+                let end = val_full.floor_char_boundary(80);
+                val_full[..end].to_owned()
             } else {
                 val_full
             };
@@ -133,6 +136,27 @@ mod tests {
         for (_k, v) in &info.env {
             assert!(v.len() <= 80, "env value exceeds 80 chars");
         }
+    }
+
+    /// Env value where a 3-byte UTF-8 codepoint (€ = 0xE2 0x82 0xAC) straddles
+    /// byte index 80 must not panic and must produce valid UTF-8.
+    #[test]
+    fn env_value_multibyte_at_boundary_does_not_panic() {
+        // Build a string: 78 ASCII 'a' chars followed by '€' (3 bytes).
+        // Total len = 81 bytes — boundary at 80 falls inside the 3-byte char.
+        let mut val = "a".repeat(78);
+        val.push('€'); // 3-byte char; bytes 78-80 inclusive
+        assert_eq!(val.len(), 81);
+
+        // Simulate what read_env does.
+        let end = val.floor_char_boundary(80);
+        let truncated = val[..end].to_owned();
+
+        // Must not have panicked, must be valid UTF-8, and must be <= 80 bytes.
+        assert!(truncated.len() <= 80, "truncated value exceeds 80 bytes");
+        assert!(std::str::from_utf8(truncated.as_bytes()).is_ok(), "truncated value is not valid UTF-8");
+        // The '€' must have been excluded (byte 78 is where it starts, < 80).
+        assert!(!truncated.contains('€'), "multibyte char crossing boundary must be excluded");
     }
 
     #[test]
