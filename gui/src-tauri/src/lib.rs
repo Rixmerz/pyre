@@ -162,6 +162,10 @@ pub struct GitInfoDto {
     pub ahead: u32,
     pub behind: u32,
     pub upstream: Option<String>,
+    /// Absolute working directory used to run `git status` (proto v7). `None`
+    /// when the cwd could not be resolved. The PR/CI poller reads this instead
+    /// of deriving cwd via `inspect_pid` → env → PWD.
+    pub cwd: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -483,6 +487,7 @@ async fn git_status(
         ahead: g.ahead,
         behind: g.behind,
         upstream: g.upstream,
+        cwd: g.cwd,
     }))
 }
 
